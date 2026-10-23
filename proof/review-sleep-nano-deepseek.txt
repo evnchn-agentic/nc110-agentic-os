@@ -1,0 +1,128 @@
+nano-ask: model=deepseek/deepseek-v4.1-flash quota_tokens=8235 out=6000
+# S3 / wake-stub / RTC / WoL review — NC110, unattended overnight
+
+Short version: the design (vector → 0xCF9 hard reset → POST) is the right shape, and several details (`wbinvd`, `SLP_TYP=5`, `_PTS(3)` mailbox+EC-trap, `(vec+24)=0` for the X-vector) are correct. But there are real defects in (a) the `_PTS(3)` replication vs. the DSDT quoted, (b) the FADT-offset/flag gating (it would silently refuse to sleep on the very table quoted below — fine, but it hides the alarm bits you were asked about), (c) the RTC alarm arithmetic, and (d) WoL `Config3` semantics. One of these is a "never wakes on the RTC backstop" class bug.
+
+---
+
+## MUST-FIX
+
+### M1. `_PTS(3)` — `SMIC` is written *before* `BCMD`, and the SNVS EC paths are done in the wrong order/width
+DSDT:
+```
+If ((Arg0 == 0x03))
+{
+    \_SB.BCMD = 0x4C
+    \_SB.SMIC = Zero
+    \_SB.SECS (0xA4)
+}
+```
+Code:
+```
+write_volatile(0x3F5C_2EBD as *mut u8, 0x4C);   // BCMD
+outb(0xFE00, 0);                                 // SMIC
+write_volatile(0x3F5C_0C7D as *mut u8, 0xA4);   // SECI (left set!)
+outb(0x5000, 0);                                 // TRPS = 0
+```
+Two concrete problems:
+
+1. **Ordering.** The AML writes `BCMD` first, then `SMIC`. You do the same here — *but* `_SB.SECS(0xA4)` in AML is `MSEC`-mutex-serialised and runs *after* `SMIC=0` has had a chance to be consumed by the SMI. On this SCI_EN path the SMI at `SMIC=0` is what latches BCMD for the SMM handler. If the SMM is still busy (it is: it's the one programming EC power state) when you drop `SECI=0xA4`, you can race. **Match the AML exactly**: `BCMD=0x4C; SMIC=0; SECS(0xA4)`. You already do — keep it, but see (2).
+2. **`SECI` is left holding `0xA4`.** `SECS` leaves `SECI = Arg0` (AML: `SECI = Arg0; TRPS = Zero` — `SECI` is *not* cleared). On the resume/fresh-boot path the firmware `_WAK(3)` does **not** clear `SECI` before `SECS(0xB3)`, so a stale `0xA4` is harmless there. **But** `_SB.SVM`/SMM startup on the fresh POST will see `SECI=0xA4` unless something clears it. The safe fix: after the `_PTS` sequence, `TRPS = 0` is not enough — set `SECI = 0` too (or don't touch SNVS at all and let `_PTS` be done by the SMI). **Missing `SECI = 0` after `SECS(0xA4)`** is the concrete risk. Fix:
+   ```
+   write_volatile(0x3F5C_0C7D, 0xA4);
+   outb(0x5000, 0);                       // TRPS = 0 (handshake)
+   // then:
+   write_volatile(0x3F5C_0C7D, 0x00);     // SECI = 0  (AML doesn't, but fresh-boot SMM expects it)
+   ```
+   Better still: don't hand-write SNVS; call the SMI by writing `SMIC=0` with `BCMD` and let SMM run the EC sequence. You are already touching SNVS directly which the EC-owned `MSEC` mutex protects; you bypass it.
+
+**Scenario:** overnight sleep, RTC wakes, fresh boot, EC SMM sees stale `SECI=0xA4` recorded as the "last EC command" and you either get a spurious EC reset or the P-notify path misfires. Nothing recovers → human power-cycle. **Fix: clear `SECI` after the handshake, or move the whole `_PTS(3)` into the SMI by only writing `BCMD=0x4C`+`SMIC=0` and dropping the SNVS writes.**
+
+### M2. RTC alarm is computed from a **racing, non-latched** snapshot of `h:m:s`
+```
+let (s, m, h) = (dec(rtc(0x00)), dec(rtc(0x02)), dec(rtc(0x04)));
+let total = (h as u32 * 60 + m as u32 + minutes) % (24 * 60);
+```
+Three defects:
+
+- **No second-level latch.** You read `h`, `m`, `s` with three separate `outb(0x70,r)/inb(0x71)` pairs. Even with `SET=0` you can cross a minute boundary between the `m` read and the `h` read → `ah:am` off by one minute. Not fatal for a backstop, but combined with (b) below it can put you in the *past* or *now*:
+- **You add `minutes` to `h*60+m`, ignoring seconds.** If it's 23:59:58 and you ask for 2 min, you compute `total = (23*60+59 + 2) % 1440 = 0:01`. But `s = 58`, so the alarm at 00:01:00 fires ~62 s later — fine. The real bug is the opposite: if `s` is small and you set the alarm to `mm:ss = now`, the alarm is *already true* and **never fires** (no edge). With `minutes≥2` this is rare but reachable when `s` is near 60 and RTC is mid-tick.
+- **`h` read during update is the classic bug.** The `UIP` gate at the top only guards *write*, not the *read* below (`rtc(0x00..0x04)`). Re-read with the loop: `while rtc(0x0A) & 0x80 { } ; read; re-read; if changed retry`. **Missing on the read side.**
+
+**Fix:**
+```rust
+let (mut s0,m0,h0, mut s1,m1,h1);
+loop {
+  while rtc(0x0A) & 0x80 != 0 {}
+  (s0,m0,h0) = (dec(rtc(0)),dec(rtc(2)),dec(rtc(4)));
+  while rtc(0x0A) & 0x80 != 0 {}
+  (s1,m1,h1) = (dec(rtc(0)),dec(rtc(2)),dec(rtc(4)));
+  if (s0,m0,h0)==(s1,m1,h1) { break }
+}
+// round UP to the next minute, then add minutes, then add 1 safety minute
+let total = ((h1 as u32*60+m1 as u32) + 1 + minutes) % 1440;
+```
+And require `minutes >= 2`.
+
+### M3. `arm_rtc_alarm` leaves `Set` (0x0B bit 7) and `DM`/`24h` unchecked on write, and doesn't disarm day/month explicitly
+`rtc_w(0x0B, b | 0x20)` only sets AIE. On Intel ICH7 the "binary" bit (`DM`, 0x0B bit 2) and `24h` bit are **read-only on the RTC** on some chipsets — but on others writeable. You *read* them and encode accordingly; that's fine. The bug:
+
+- **`rtc_w(0x0B, b | 0x20)` may set `SET` if a previous BIOS left it, and your write drops the `PIE`/`UIE` bits that were previously set — fine — but critically `b` can have `0x80` unknown.** More concrete: **you never write the day (`0x07`) or month (`0x08`) alarm, nor clear `0x09` (year).** On the FADT below, `RTC Month Alarm Index = 0x00`, which per ACPI 4.0 §4.8.2.4 **means the register does not exist** — a **day-of-month alarm register exists (0x0D)** and you should treat all three: `0x0D` (day), `0x07` (day-of-month alarm — actually FADT `RTC Day Alarm Index = 0x0D` is the *day-of-month* register at CMOS `0x0D`? — see M4). Without populating them, an alarm armed for "next minute at :00 seconds" without setting day-of-month can be interpreted as "any day" on many RTCs but **not on this one if the BIOS POSTed the RTC with day-of-month alarm = 0 and the `AIE` set** → it can fire immediately and re-arm forever, which is harmless, OR it can never fire, which is the hang. **The safe fix is: set `0x07`/`0x08`/`0x09` (alarm day/month/year) to `0xFF`/`0xFF`/`0xFF`?** — no, that's what other firmwares do but on this FADT (`Month Alarm Index=0`) you must **not** program `0x08`. Do **not** program `0x08` if FADT says 0. Program `0x07` (day-of-month alarm) to the computed day **and** `0x0D` if FADT says `0x0D` — which it does. Two registers for the same thing on this table is legal.
+
+**Concrete scenario:** `AIE=1` with month alarm `0x08` never written and `0x0B`'s `DM` bit read as 0 (BCD) while `0x03`/`0x05`/`0x01` are BCD — OK; but **if the BIOS's `Month Alarm Index = 0` means "no month alarm register" and the RTC still has a `0x08` that was left `0xFF` from POST (BCD invalid), the alarm comparator on ICH7 latches "match" on `0x08=0xFF` if the actual month is `0x12` → never.** Your alarm never fires and RTC_EN never asserts. **Fix: follow FADT fields:** day alarm `0x0D` present → write it; month `0x00` → skip. And explicitly `rtc_w(0x0B, b | 0x20 | (b & 0x04))` — don't rely on `b` having bit 2 stable across a write (some chipsets reset `DM` to 0 on write unless `SET=0`).
+
+### M4. PM1_EN / status-clear order is **wrong for `PWRBTN_EN` + `RTC_EN` ordering and for the `PCIEXP_WAKE_DIS` bit**
+```
+outw(pm1a_evt, 0xFFFF);                       // clear status (all bits)
+outw(pm1a_evt + 2, (1 << 10) | (1 << 8));      // PM1_EN
+outl(gpe0, 0xFFFF_FFFF);
+```
+Issues:
+- **`outw(pm1a_evt, 0xFFFF)` also clears `PWRBTN_STS` (bit 8) and `RTC_STS` (bit 10).** Good — but the sequence should be: (1) write `PM1_EN` to disable wake bits you don't want first, (2) clear status last. Writing enables *after* clearing status is correct (you did that). **But you never clear `PCIEXP_WAKE_STS`** (PM1_STS bit 14). On ICH7 the PCIe wake path shares bit 14 in PM1_STS; leaving it set means if a stray PCIe wake (WoL, if it uses PCIe PME, which RTL8105E does *not* here — it uses PME#) fires while in S3, you wake on a non-WoL event. **Fix: `outw(pm1a_evt, 0xFFFF)` is fine (it clears 14 too)** — but the FADT below says **`PCIEXP_WAK Bits Supported = 0`**, so bit 14 has no meaning; the `| (1<<14)` you intended to clear is a no-op and harmless. OK, no fix needed here — but **remove the comment claim "PCIEXP_WAKE_DIS (14) clear"**; the code does not touch bit 14 of PM1_EN.
+- **`PM1_EN` write is `outw`, length 2.** FADT `PM1 Control Block Length = 02` — correct. `PM1 Event Block Length = 04` — correct.
+- **`PWRBTN_EN` (bit 8) without `PWRBTN` in the "Control Method Power Button = 0" FADT.** Below: `Control Method Power Button (V1) = 0` — the power button is *fixed-hardware*, so `PWRBTN_EN` wakes the machine but does **not** run `_PTS`/`_WAK` (fixed). On a fresh POST this is fine. OK.
+
+### M5. GPE9 enable: **advertised** as PCIe wake, but RTL8105E does not wake via GPE — it wakes via PME# → `PM1_EN`? No: on ICH7 PME# from PCIe devices is routed to GPE0, *not* PM1_EN.
+```
+self.bus.w8(0x56, self.bus.r8(0x56) | 0x02); // Config5: LanWake
+```
+and
+```
+outl(gpe0 + gpe_len, inl(gpe0 + gpe_len) | (1 << 9));
+```
+`gpe_len = ((rd(92) & 0xFF) / 2) as u16` — `rd(92) = 0x08`, so `gpe_len = 4`. **GPE0 block is 8 bytes = 4 registers (2 status + 2 enable? no: 8 bytes = 2 statuses (16 bits) + 2 enables (16 bits) — enable bank starts at GPE0 + 4, which is exactly `gpe0 + gpe_len`.)** Correct offset. **But bit 9** — is PCIe PME on this board GPE9? On ICH7, **GPE0 register bits map to `GPE0_STS[0..15]`; PCIe root port PME is typically GPE `n` where `n` is wired by BIOS**. The DSDT you have (not fully quoted) would tell you. **Concrete risk:** you assume GPE9. If it's wrong, **WoL never wakes** — silent, no log, and you fall back to RTC. That's the design working (RTC backstop), so **not a MUST**, but **you have no verification** and this DSDT could be checked: grep the DSDT for `Notify (PEX0` or `_PRW` of the RTL's PCI device. **Do that before running overnight.**
+
+### M6. **`0x6000` does not survive the firmware's resume path as written** — you copy 12 bytes but do not protect the page
+```
+if !mb::ram_contains(STUB_AT, 0x1000) { ... }
+```
+You check 0000–6000 is RAM (good, E820 probe?). **But after S3 entry the firmware's resume path does `_WAK` and POST-lite, which on Intel laptops often writes the ACPI wake vector to `0x6000` only if the FACS says so** — that's you. **The actual hazard is that the firmware may `memset` the low 1 MB (`0–0x9FC00`) during resume**. Many AMI/Insyde S3 resume paths *do* zero-write conventional memory, especially the wake vector page, to defend against the S3 "bootkit". The NC110 BIOS is **not** known to do so, but you are gambling. **The design that survives this is: put the stub in the ACPI NVS region (or a page marked reserved in E820) that POST preserves**, not at `0x6000`. If `0x6000` is marked "usable RAM" in E820, the BIOS may not preserve it. **Fix:** in `mb::ram_contains`, verify the E820 entry covering `0x6000` has type 2 (Reserved) or type 4 (ACPI NVS). If type 1 (usable), the page is not guaranteed to survive resume — move the stub to a reserved region or add `MemoryMap` entry type 2 for `0x6000–0x7000` early in boot.
+
+**Scenario:** RTC alarm fires, firmware resumes, firmware's S3 path clears `0x6000–0x60FF`, control returns to `0x6000` which is now `0x00` (or partially zero). CPU executes `AS add [bx+si], al` repeatedly or `add [bx+si],al` → runs off into whatever follows. Nothing resets the machine; it hangs in a non-recoverable state. This is **exactly** the "human must power-cycle" scenario. **Highest priority.**
+
+### M7. `wbinvd` is not enough — **no `WBINVD` before writing `SLP_EN`, and no cache-flush of the FACS write / stub write**
+You do `wbinvd` right before `SLP_TYP`. **But the writes to `FACS+12` and `FACS+24` and to `0x6000` are done in step 1, and cached.** If those writes only exist in cache when `wbinvd` runs, they *are* flushed — good. **But between step 1 and step 6, step 4-5 write memory-mapped registers and the SNVS regions; the `BCMD/SECI/TRPS` writes are MMIO (uncacheable) on Intel PCH but `BCMD` at `0x3F5C2EBD` might be cached depending on MTRR. If the SNVS page is WB (it is a RAM page, `0x3F5C_2EBD`), the SMM handler on S3 entry reads **stale RAM** from `BCMD` unless you `wbinvd`/`clflush` after step 4. You `wbinvd` at step 6, **after** step 4 — good. **But** `wbinvd` doesn't flush **other CPUs'** caches unless FADT `WBINVD flushes all caches = 1` — FADT says **0** (below), i.e., **`wbinvd` flushes only the *calling* CPU's caches on this platform.** You have a multi-core (2-thread) Atom. **The stub/FACS writes might only be in CPU1's cache and never reach memory.** **Fix:** before `wbinvd`, park/send `CLFLUSH`+`WBINVD` on the other core, or use MTRR/UC for the FACS+stub pages during this window. Given FADT `WBINVD flushes all caches (V1) = 0`, this is a **real correctness bug**, not a nit.
+
+### M8. RTL8105E `Config3` bit for MagicPacket is `0x20`? — **verify register 0x54 bit 5 means "Magic Packet wake"**
+```
+self.bus.w8(0x54, self.bus.r8(0x54) | 0x20); // Config3: MagicPacket
+```
+Realtek RTL8105E/8111 datasheet: `Config3` (offset `0x54`): bit 0 = `Beep`, bit 1 = `WOL`/`LANWake`? — the usual is:
+- `Config1 (0x52)` bit 0 = `PMEnable`.
+- `Config3 (0x54)` bit 0 = `Magic`, bit 1 = `LinkChg`, bit 2 = `WakeUp`, bit 3 = `LED`, bit 5 = `Jumbo`? — **this varies by die and the `RTL_VER_29` vs. `30` matters.** The `0x20` bit you set might be `LinkChg` or `Not used`, not `Magic`. On 8105E the standard magic-packet wake also needs **`Config5 (0x56)` bit 1 = `LanWake`** — you set that, good. **Fix:** verify against the actual silicon: dump `0x54` after POST and compare with Linux `r8169.c` `rtl8168_set_wol` for the `RTL_GIGA_8125/8105` chipset where `MagicPacket = 0x20` in `Config3` for `ver=0x29`, and `0x04` for `ver=0x30` (the register mapping changed). **Since you gate on `ver == 29 || ver == 30`, you must handle both — you don't.** **Scenario:** if the machine is `ver=30`, `0x20` in Config3 is *not* MagicPacket and WoL never fires; you rely solely on RTC. Not a hang, but the WoL path is dead — verify.
+
+### M9. **PCI PMCSR write does not set `D3`** — you leave the device in `D0`
+```
+write32(pci, cap+4, (pmcsr & !0x3) | (1 << 8) | (1 << 15)); // D0, PME_En, clear status
+```
+`PMCSR` power-state bits [1:0] = `00` = `D0`. **For the RTL8105E to wake, it must be in `D3hot` at the time S3 is entered** — the device only asserts `PME#` in `D3hot` (or `D3cold`) per PCI PM spec. The ICH7 also transitions all PCI devices to `D3hot` at S3 entry via the PM controller, **but** if the chipset honors the PMCSR as-is, it might leave the NIC in `D0` and the magic packet path is disabled. **Fix:** after programming `PME_En`, explicitly set `PMCSR` state to `D3hot` (`bits[1:0] = 3`) before `SLP_EN`. Most OSes do `pci_set_power_state(dev, D3hot)` before S3. **Scenario:** WoL never wakes (RTC still works — backstop OK, so **SHOULD** not **MUST**).
+
+Actually — check: Linux `r8169 suspend` does set D3hot; I'll downgrade to **SHOULD**.
+
+---
+
+## SHOULD
+
+### S1. `0x0CF9` write `0x02` (SRST) then `0x06` (SRST|SYS_RST) from S3-resume context: **the write of `0x02` alone is not a full reset** — it's a "soft" reset of the ICH7 southbridge only. The second write `0x06` does a warm reset. **This is correct** for "cold-boot into POST" on ICH7 because `SYS_RST` re-runs POST. **But** if the firmware's S3 resume path has already re-mapped something (e.g. `_WAK` was skipped, or the S3 resume has already reprogrammed PCI BARs), the `0x02` write can hang in the `0x02` state. **Fix:** write `0x06` first, directly. The `0x02` intermediate is specified but not useful; a single `0x06` write is what most BIOSes do on hard reset. Not a MUST because you're in real mode with a fresh memory map; **but verify that the `0x02`→`0x06` sequence actually resets** — the *first* write may trigger a warm reset on ICH7 and you never get to `0x06`, which is the *intended* outcome, but the code is redundant.
+
+### S2. `STUB_AT` = `0x6000` real-mode segment `0x600`; **CS:IP at resume is `FACS.Vector[31:4]:Vector[3:0]`?** — yes, per ACPI: `RealModeStart = Vector >> 4` (CS), `RealModeEntry = Vector & 0xF` (IP). **The ACPI spec says the wake vector must be 4-byte aligned** (low 4 bits are scratch). You write `payload[12..16] = 0x6000`; `0x6000 & 0xF = 0`. Good. **But** `STUB` is 12 bytes and your jump map says last 2 bytes are `EB FD` (jmp $-1). With `IP=0` and `CS=0x6000>>4=0x600`, IP wraps at 0xFFF? — `EB FD` is `jmp short -3` which re-enters the `hlt` (0xF4) at offset 9, infinite `hlt` loop. **`hlt` without interrupts is a halt; with interrupts it wakes on IRQ, re-executes `hlt`, loops forever** — the CPU is *not* consuming the `0x0CF9` write because `hlt` is *after* the two `out` instructions. **This is correct** — the `out` writes reset before `hlt`. **But** the first `out` write `0x02` to `0x0CF9` may reset immediately (SRST), so the `0x06` write never executes. That's fine (SRST → warm reset → POST). The `hlt` never executes if `SRST` works. **Verify `SRST=0x02`

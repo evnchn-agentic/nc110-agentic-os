@@ -1,0 +1,1908 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a14791-444c-7390-a1e8-77ca79c767be
+--------
+user
+You are a sharp peer reviewer who WANTS this work to succeed. Review the staged diff in this repo (run `git diff --cached -- src tools/term_test.rs tools/term-vs-pyte.py run-m45.py`). Context: bare-metal Rust x86_64 kernel, SSH client (sunset 0.6.0) whose channel output is drawn by src/term.rs, a VGA text terminal (80x25, xterm subset, TERM=xterm). M4.5 adds: (1) replies to DSR 6n/5n, DA1 (CSI c -> CSI ?6c) and DA2 (CSI > c -> CSI >0;10;0c), queued in Term and sent back over the channel through the keyboard queue in src/ssh.rs; (2) UTF-8 decoding to CP437 where a glyph exists, '?' otherwise, East Asian wide chars as two '?' cells, combining marks zero-width; (3) bright backgrounds: SGR 100-107 and 48;5;8-15 set VGA bg 8-15, with the Attribute Controller mode-control blink bit cleared in hw init (read back and logged); reverse video now swaps all 4 bg bits; (4) one SSH window-change 80x25 after the shell request. Host tests (29) pass and 58/58 mutants are killed; QEMU proof: vim echoed v:termresponse = our DA2, a shell read back all four replies with od, htop and vim grids match pyte at 0 cells. Look for real bugs: panics/out-of-bounds reachable from a hostile remote byte stream (a panic here = kernel abort), reply-injection risks (can the remote make us type arbitrary bytes back into its own shell?), UTF-8 decoder errors, wide-char edge cases at the right margin / with insert mode / autowrap off, the VGA attribute-controller register sequence (flip-flop, PAS bit) being wrong for real hardware, and xterm semantics that would misdraw ncurses apps. Rules: SIGNAL OVER VOLUME; quote exact lines; rank MUST-FIX / WORTH-IMPROVING / COSMETIC-SKIP; one line why + concrete fix each; distinguish flaws from defensible choices; most-is-sound is a valid outcome. End with a 0-10 score and the single highest-leverage fix.
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll read the staged diff, then check the parser and rendering paths for reachable failures and terminal behavior that could break applications.
+exec
+/bin/zsh -lc 'git diff --cached -- src tools/term_test.rs tools/term-vs-pyte.py run-m45.py' in ~/nc110-baremetal
+ succeeded in 0ms:
+diff --git a/run-m45.py b/run-m45.py
+new file mode 100644
+index 0000000..f270144
+--- /dev/null
++++ b/run-m45.py
+@@ -0,0 +1,158 @@
++#!/usr/bin/env python3
++"""M4.5 proof: terminal replies, UTF-8, bright backgrounds, window-change (QEMU, throwaway sshd on 127.0.0.1:2223,
++tools/sshd_config.m45 = m4 at LogLevel DEBUG1 so the window-change request is logged). Typed with the monitor's `sendkey`
++(which cannot type non-ASCII, so the UTF-8 goes in as printf octal escapes; the bytes reaching the terminal are the same):
++printf 'box: ─│┌┐ deg: ° cjk: 中\n', a second line with 中文| and SGR 42 vs 102 backgrounds,
++`LANG=en_US.UTF-8 /opt/homebrew/bin/htop` (~3 s, F10), and `/usr/bin/vi /tmp/nc110-m45.txt` with the user's normal
++startup (no -u NONE): insert a line, echo v:termresponse (= our DA2) / v:termu7resp / &ambiwidth, :wq. The shell also
++reads the four replies back itself (`stty raw; printf 6n 5n c >c; head -c 25 | od -c`).
++Writes proof/m45-serial.log, m45-sshd.log, m45-net.pcap and m45-{printf,replies,htop,vi,vi-exit}.png.
++One QEMU (-m 256) and one sshd at a time; both are always killed on exit.
++"""
++import os, socket, subprocess, sys, time
++
++ROOT = os.path.dirname(os.path.abspath(__file__))
++PROOF = os.path.join(ROOT, "proof")
++KERNEL = os.path.join(ROOT, "target/x86_64-unknown-none/release/nc110-kernel")
++SERIAL, SSHD_LOG, PCAP, PNG_PRINTF, PNG_REPLIES, PNG_HTOP, PNG_VI, PNG_VI_EXIT = (os.path.join(PROOF, "m45-" + n) for n in
++    ("serial.log", "sshd.log", "net.pcap", "printf.png", "replies.png", "htop.png", "vi.png", "vi-exit.png"))
++OUT = "/tmp/nc110-m45.txt"
++MON = os.path.join(PROOF, ".monitor.sock")
++SSHD_CFG = os.path.join(ROOT, "tools/sshd_config.m45")
++PIDFILE = os.path.join(ROOT, "test-keys/sshd-m45.pid")
++
++KEYS = {" ": "spc", "-": "minus", "\n": "ret", "\b": "backspace", "$": "shift-4", "(": "shift-9", ")": "shift-0", "*": "shift-8", "%": "shift-5",
++        "'": "apostrophe", "\\": "backslash", "[": "bracket_left", ":": "shift-semicolon", "/": "slash", ".": "dot",
++        "=": "equal", '"': "shift-apostrophe", "&": "shift-7", "+": "shift-equal", "_": "shift-minus", ";": "semicolon", "|": "shift-backslash", ">": "shift-dot",
++        "<": "shift-comma", "]": "bracket_right"}
++
++
++def serial():
++    try:
++        return open(SERIAL, "rb").read().decode(errors="replace")
++    except FileNotFoundError:
++        return ""
++
++
++def wait_for(pred, what, timeout):
++    t0 = time.time()
++    while time.time() - t0 < timeout:
++        if pred(serial()):
++            print(f"  ok: {what} ({time.time() - t0:.1f}s)")
++            return True
++        time.sleep(0.2)
++    print(f"  TIMEOUT waiting for {what}")
++    return False
++
++
++for p in (SERIAL, SSHD_LOG, PCAP, PNG_PRINTF, PNG_REPLIES, PNG_HTOP, PNG_VI, PNG_VI_EXIT, MON, OUT):
++    if os.path.exists(p):
++        os.unlink(p)
++
++os.makedirs("/tmp/nc110-m45-home", exist_ok=True)
++sshd = subprocess.Popen(["/usr/sbin/sshd", "-D", "-e", "-f", SSHD_CFG], stderr=open(SSHD_LOG, "wb"))
++time.sleep(1)
++cmd = ["qemu-system-x86_64", "-machine", "pc", "-cpu", "max", "-m", "256", "-no-reboot",
++       "-display", "none", "-vga", "std", "-serial", f"file:{SERIAL}", "-monitor", f"unix:{MON},server,nowait",
++       "-netdev", "user,id=n0", "-device", "rtl8139,netdev=n0,mac=52:54:00:4e:43:11",
++       "-object", f"filter-dump,id=f0,netdev=n0,file={PCAP}",
++       "-kernel", KERNEL, "-initrd", os.path.join(ROOT, "test-keys/client.key")]
++print("+", " ".join(cmd))
++q = subprocess.Popen(cmd)
++ok = False
++try:
++    time.sleep(1)
++    mon = socket.socket(socket.AF_UNIX)
++    mon.connect(MON)
++    mon.setblocking(False)
++
++    def hmp(line):
++        mon.sendall((line + "\n").encode())
++        time.sleep(0.08)
++        try:
++            mon.recv(65536)
++        except BlockingIOError:
++            pass
++
++    def typ(s):
++        print(f"  typing {s!r}")
++        for ch in s:
++            hmp("sendkey " + KEYS.get(ch, "shift-" + ch.lower() if ch.isupper() else ch))
++
++    prompts = lambda s: s.count("nc110$ ")
++    alt_on = lambda s: s.count("^[[?1049h")
++    # sh's line editor redraws the prompt when a long command line wraps, so count prompts only after a marker
++    prompt_after = lambda s, m, k=1: (lambda i: i >= 0 and s.find("nc110$ ", i) >= 0)(nth(s, m, k))
++    def nth(s, m, k):
++        i = -1
++        for _ in range(k):
++            i = s.find(m, i + 1)
++            if i < 0:
++                return -1
++        return i + len(m)
++    def shot(path):
++        time.sleep(0.6)
++        hmp(f"screendump {path} -f png")
++        time.sleep(0.4)
++        print(f"  screendump {os.path.relpath(path, ROOT)}")
++    def key(k, n=1):
++        for _ in range(n):
++            print(f"  key {k}")
++            hmp("sendkey " + k)
++    steps = [wait_for(lambda s: prompts(s) >= 1, "shell prompt", 60)]
++    if all(steps):
++        typ("echo TERM=$TERM\n")
++        steps.append(wait_for(lambda s: "\r\nTERM=xterm\r\n" in s and prompts(s) >= 2, "pty-req TERM reaches the shell", 20))
++        typ(r"printf 'box: \342\224\200\342\224\202\342\224\214\342\224\220 deg: \302\260 cjk: \344\270\255\n'" + "\n")
++        steps.append(wait_for(lambda s: prompt_after(s, "box: ─│┌┐ deg: ° cjk: 中\r\n"), "printf UTF-8 line", 20))
++        typ(r"printf '\344\270\255\346\226\207|\033[30;42m 42 \033[102m 102 \033[0m|\n'" + "\n")
++        steps.append(wait_for(lambda s: prompt_after(s, "中文|^[[30;42m 42 ^[[102m 102 ^[[0m|\r\n"), "printf wide + bright bg line", 20))
++        shot(PNG_PRINTF)
++        # the four replies, read back by the shell itself: raw tty, ask, read exactly 25 bytes, dump them
++        typ(r"stty raw -echo; printf '\033[3;7H\033[6n\033[5n\033[c\033[>c'; head -c 25 | od -c; stty sane" + "\n")
++        steps.append(wait_for(lambda s: prompt_after(s, "0000031"), "shell read back 25 reply bytes", 20))
++        shot(PNG_REPLIES)
++        typ("clear\n")
++        time.sleep(0.5)
++        typ("LANG=en_US.UTF-8 /opt/homebrew/bin/htop\n")
++        steps.append(wait_for(lambda s: alt_on(s) >= 1, "htop entered the alternate screen", 20))
++        time.sleep(3)
++        shot(PNG_HTOP)
++        key("f10")
++        if not wait_for(lambda s: prompt_after(s, "^[[?1049l", 1), "htop quit on F10", 8):
++            steps.append(False)
++            key("q")
++            wait_for(lambda s: prompt_after(s, "^[[?1049l", 1), "htop quit on q (fallback)", 8)
++        typ("/usr/bin/vi " + OUT + "\n")
++        steps.append(wait_for(lambda s: alt_on(s) >= 2, "vi entered the alternate screen", 20))
++        steps.append(wait_for(lambda s: s.rfind("[New]") > s.rfind("^[[?1049h"), "vi drew its status line", 20))
++        time.sleep(1.5)
++        typ("ihello from nc110 m45")
++        key("esc")
++        time.sleep(0.6)
++        typ(':echo "rv=" . v:termresponse . " u7=" . v:termu7resp . " aw=" . &ambiwidth\n')
++        # our reply is not mirrored to COM1, so the DA2 string in the log can only be vim echoing what it received
++        steps.append(wait_for(lambda s: "[>0;10;0c" in s[nth(s, "^[[?1049h", 2):], "vim echoes the DA2 reply it received", 10))
++        shot(PNG_VI)
++        typ(":wq\n")
++        steps.append(wait_for(lambda s: prompt_after(s, "^[[?1049l", 2), "vi :wq, prompt back", 20))
++        got = open(OUT).read() if os.path.exists(OUT) else None
++        print(f"  {OUT} = {got!r}")
++        steps.append(got == "hello from nc110 m45\n")
++        shot(PNG_VI_EXIT)
++        typ("exit\n")
++        steps.append(wait_for(lambda s: "DONE" in s, "session closed, DONE", 20))
++    ok = all(steps)
++    if q.poll() is None:
++        hmp("quit")
++        q.wait(timeout=10)
++finally:
++    if q.poll() is None:
++        q.kill()
++    sshd.terminate()
++    sshd.wait(timeout=5)
++    for p in (MON, PIDFILE):
++        if os.path.exists(p):
++            os.unlink(p)
++print("RESULT:", "PASS" if ok else "FAIL")
++sys.exit(0 if ok else 1)
+diff --git a/src/ssh.rs b/src/ssh.rs
+index 13a9e63..31ee71a 100644
+--- a/src/ssh.rs
++++ b/src/ssh.rs
+@@ -158,6 +158,7 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+     let mut got_output = false;
+     let mut finished = false;
+     let mut shell_open = false;
++    let mut winch = false; // window-change (80x25) still to send, once the session is up
+     let mut keys = [0u8; 64];
+     let mut nkeys = 0usize;
+     let mut last_pet = time::now_ms();
+@@ -309,6 +310,7 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+                         stop_all = true;
+                     } else {
+                         shell_open = true;
++                        winch = true;
+                         kbd::init();
+                         console::vga_log_off();
+                         term::init();
+@@ -347,6 +349,11 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+ 
+         // channel data -> VGA terminal (+ serial mirror)
+         if let Some(c) = &chan {
++            if winch {
++                winch = false;
++                let w = sunset::packets::WinChange { cols: 80, rows: 25, width: 0, height: 0 };
++                kprintln!("ssh: window-change 80x25 ({:?})", runner.term_window_change(c, &w).is_ok());
++            }
+             let mut drew = false;
+             while let Some((_num, dt, _len)) = runner.read_channel_ready() {
+                 let mut buf = [0u8; 512];
+@@ -374,6 +381,8 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+             if drew {
+                 term::flush();
+             }
++            // terminal replies (DSR/DA) go out ahead of keys typed later; they share the keyboard queue
++            nkeys += term::take_reply(&mut keys[nkeys..]);
+ 
+             // keyboard -> channel (whatever does not fit now stays queued; the i8042 holds the rest)
+             if shell_open && !finished {
+@@ -423,6 +432,8 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+     }
+     let (calls, reseeds, samples, failed) = rng::stats();
+     kprintln!("kbd: {} keys dropped while the channel was not taking input", kbd::dropped());
++    let rc = term::reply_counts();
++    kprintln!("term: replies sent: DSR 6n x{}, DSR 5n x{}, DA1 x{}, DA2 x{}; {} dropped (reply buffer full)", rc[0], rc[1], rc[2], rc[3], rc[4]);
+     kprintln!("rng: {} requests served, {} reseeds, {} raw samples health-tested, failure latched: {}", calls, reseeds, samples, failed);
+     if got_output {
+         kprintln!("ssh: M3 reached: interactive shell over SSH, drawn on VGA, typed on PS/2");
+diff --git a/src/term.rs b/src/term.rs
+index 94278fb..776264f 100644
+--- a/src/term.rs
++++ b/src/term.rs
+@@ -1,10 +1,13 @@
+ //! VGA text terminal (80x25 at 0xB8000), the xterm subset that ncurses uses with TERM=xterm (htop, vi):
+ //! CR LF BS TAB BEL SO SI, deferred autowrap (DECAWM), scroll region (CSI r) with LF/IND/RI/S/T/L/M inside it,
+ //! cursor CSI A B C D E F G ` d e a H f Z, erase J K X with the current background (bce), P @ (and IRM 4h),
+-//! REP (CSI b), SGR 0/1/2/22/7/27/30-37/39/40-47/49/90-97/100-107 (+38/48;5;n) -> VGA attributes,
++//! REP (CSI b), SGR 0/1/2/22/7/27/30-37/39/40-47/49/90-97/100-107 (+38/48;5;n) -> VGA attributes (16 fg and,
++//! with the blink bit turned off by `init`, 16 bg colours),
+ //! ESC 7/8 + CSI s/u + ?1048, alternate screen ?47/?1047/?1049, ?25 cursor, ?1 DECCKM (read by kbd),
+ //! DEC line drawing (ESC ( 0 / ESC ) 0 + SO/SI) -> CP437 box characters, DECSTR (CSI ! p), ESC c.
+-//! OSC/DCS/APC/PM/SOS strings are swallowed. UTF-8 multibyte characters show as one '?'. DSR gets no reply.
++//! OSC/DCS/APC/PM/SOS strings are swallowed. UTF-8 is decoded: CP437 glyph where one exists, else '?';
++//! East Asian wide characters take 2 cells ("??"), combining marks take none. Replies (DSR 5n/6n, DA1 CSI c,
++//! DA2 CSI > c) queue in `take_reply` for the caller to send back over the channel.
+ //! The grid lives in RAM (`Term`); `flush` copies it to VGA memory and moves the hardware cursor once per batch.
+ //! Host tests: `sh tools/test-term.sh`.
+ 
+@@ -51,9 +54,10 @@ pub struct Term {
+     p: [u16; 16],
+     np: usize,
+     private: bool,
++    lead: u8,  // CSI private marker byte (? > < =), 0 = none
+     inter: u8, // CSI intermediate byte (0 = none)
+     fg: u8,    // VGA colour 0..15
+-    bg: u8,    // VGA colour 0..7 (bit 7 of the attribute is blink)
++    bg: u8,    // VGA colour 0..15 (attribute bit 7 = bright background once `init` turns blink off)
+     bold: bool,
+     rev: bool,
+     g: [bool; 2], // G0/G1 designated as DEC special graphics
+@@ -61,7 +65,13 @@ pub struct Term {
+     top: usize,
+     bot: usize,
+     saved: [Saved; 2], // per screen (main, alternate), as xterm does
+-    last: u8, // last printable byte, for REP
++    last: u32, // last printed character (code point), for REP
++    utf: u32,  // UTF-8 decoder: code point so far
++    need: u8,  // continuation bytes still expected
++    min: u32,  // smallest code point the current sequence length may encode (overlong check)
++    reply: [u8; 64],
++    nreply: usize,
++    pub counts: [u32; 5], // replies sent: DSR 6n, DSR 5n, DA1, DA2, dropped (reply buffer full)
+     cursor_on: bool,
+     app_cursor: bool,
+     insert: bool,
+@@ -81,6 +91,7 @@ impl Term {
+             p: [0; 16],
+             np: 0,
+             private: false,
++            lead: 0,
+             inter: 0,
+             fg: DEF_FG,
+             bg: 0,
+@@ -91,7 +102,13 @@ impl Term {
+             top: 0,
+             bot: H - 1,
+             saved: [SAVED0; 2],
+-            last: b' ',
++            last: b' ' as u32,
++            utf: 0,
++            need: 0,
++            min: 0,
++            reply: [0; 64],
++            nreply: 0,
++            counts: [0; 5],
+             cursor_on: true,
+             app_cursor: false,
+             insert: false,
+@@ -114,11 +131,28 @@ impl Term {
+     pub fn app_cursor(&self) -> bool {
+         self.app_cursor
+     }
++    /// Move queued replies (terminal -> host) into `out`; returns how many bytes were moved.
++    pub fn take_reply(&mut self, out: &mut [u8]) -> usize {
++        let n = self.nreply.min(out.len());
++        out[..n].copy_from_slice(&self.reply[..n]);
++        self.reply.copy_within(n..self.nreply, 0);
++        self.nreply -= n;
++        n
++    }
++    fn send(&mut self, kind: usize, s: &[u8]) {
++        if self.nreply + s.len() > self.reply.len() {
++            self.counts[4] += 1; // a reply is all-or-nothing: a truncated CPR would be worse than none
++            return;
++        }
++        self.reply[self.nreply..self.nreply + s.len()].copy_from_slice(s);
++        self.nreply += s.len();
++        self.counts[kind] += 1;
++    }
+ 
+     fn attr(&self) -> u16 {
+         let (mut f, mut b) = (self.fg | if self.bold { 8 } else { 0 }, self.bg);
+         if self.rev {
+-            (f, b) = (b, f & 7);
++            (f, b) = (b, f);
+         }
+         ((b as u16) << 12) | ((f as u16) << 8)
+     }
+@@ -182,17 +216,35 @@ impl Term {
+         self.soft_reset();
+         self.fill(0, N);
+         self.other.fill(BLANK);
+-        (self.row, self.col, self.wrap, self.st, self.last) = (0, 0, false, St::Ground, b' ');
++        (self.row, self.col, self.wrap, self.st, self.last, self.need) = (0, 0, false, St::Ground, b' ' as u32, 0);
+     }
+ 
+-    fn print(&mut self, b: u8) {
+-        let ch = if self.g[self.gl] && (0x5F..=0x7E).contains(&b) {
+-            DEC_GRAPHICS[(b - 0x5F) as usize]
+-        } else if b >= 0x80 {
+-            b'?'
++    /// Print one character (code point): DEC graphics for ASCII when G0/G1 says so, else CP437 or '?';
++    /// wide characters take two cells, zero-width ones none.
++    fn print(&mut self, cp: u32) {
++        let w = width(cp);
++        if w == 0 {
++            return;
++        }
++        self.last = cp;
++        let ch = if cp < 0x80 && self.g[self.gl] && (0x5F..=0x7E).contains(&(cp as u8)) {
++            DEC_GRAPHICS[(cp - 0x5F) as usize]
+         } else {
+-            b
++            cp437(cp)
+         };
++        if w == 2 {
++            if self.wrap || (self.col >= W - 1 && self.autowrap) {
++                self.col = 0; // no room for both halves: wrap first, as xterm does
++                self.lf();
++                self.wrap = false;
++            }
++            self.put(b'?');
++            self.put(b'?');
++        } else {
++            self.put(ch);
++        }
++    }
++    fn put(&mut self, ch: u8) {
+         if self.wrap {
+             self.col = 0;
+             self.lf();
+@@ -203,7 +255,6 @@ impl Term {
+             self.cells.copy_within(s + self.col..s + W - 1, s + self.col + 1);
+         }
+         self.cells[s + self.col] = self.attr() | ch as u16;
+-        self.last = b;
+         if self.col == W - 1 {
+             self.wrap = self.autowrap;
+         } else {
+@@ -232,7 +283,7 @@ impl Term {
+                 40..=47 => self.bg = ANSI_TO_VGA[(v - 40) as usize],
+                 49 => self.bg = 0,
+                 90..=97 => self.fg = ANSI_TO_VGA[(v - 90) as usize] | 8,
+-                100..=107 => self.bg = ANSI_TO_VGA[(v - 100) as usize],
++                100..=107 => self.bg = ANSI_TO_VGA[(v - 100) as usize] | 8,
+                 38 | 48 => {
+                     let sub = if i + 1 < np { self.p[i + 1] } else { 0 };
+                     if sub == 5 && i + 2 < np {
+@@ -242,7 +293,7 @@ impl Term {
+                             if v == 38 {
+                                 self.fg = c | if n >= 8 { 8 } else { 0 };
+                             } else {
+-                                self.bg = c;
++                                self.bg = c | if n >= 8 { 8 } else { 0 };
+                             }
+                         }
+                         i += 2;
+@@ -290,6 +341,36 @@ impl Term {
+     }
+ 
+     fn csi(&mut self, f: u8) {
++        if f == b'c' && self.inter == 0 && self.arg(0, 0) == 0 {
++            match self.lead {
++                0 => self.send(2, b"\x1b[?6c"),         // DA1: VT102
++                b'>' => self.send(3, b"\x1b[>0;10;0c"), // DA2: VT100-class, version 10 (low: vim enables no xterm extras)
++                _ => {}
++            }
++            return;
++        }
++        if f == b'n' && self.inter == 0 && self.lead == 0 {
++            match self.arg(0, 0) {
++                5 => self.send(1, b"\x1b[0n"),
++                6 => {
++                    // CPR, 1-based; a pending wrap reports the last column, as xterm does
++                    let (mut b, mut n) = ([0u8; 8], 2);
++                    b[..2].copy_from_slice(b"\x1b[");
++                    for (i, v) in [self.row + 1, self.col.min(W - 1) + 1].into_iter().enumerate() {
++                        if v >= 10 {
++                            b[n] = b'0' + (v / 10) as u8;
++                            n += 1;
++                        }
++                        b[n] = b'0' + (v % 10) as u8;
++                        b[n + 1] = if i == 0 { b';' } else { b'R' };
++                        n += 2;
++                    }
++                    self.send(0, &b[..n]);
++                }
++                _ => {}
++            }
++            return;
++        }
+         if self.inter != 0 {
+             if self.inter == b'!' && f == b'p' {
+                 self.soft_reset();
+@@ -374,7 +455,7 @@ impl Term {
+             }
+             b's' => self.save(),
+             b'u' => self.restore(),
+-            _ => return, // 'n' (DSR: no reply), 't' (window ops), 'c' (DA), 'g' (tabs), ...: ignored, keep a pending wrap
++            _ => return, // 't' (window ops), 'g' (tabs), ...: ignored, keep a pending wrap
+         }
+         if f != b'u' {
+             self.wrap = false;
+@@ -385,6 +466,20 @@ impl Term {
+     }
+ 
+     pub fn feed(&mut self, b: u8) {
++        if self.need > 0 {
++            if b & 0xC0 == 0x80 {
++                self.utf = (self.utf << 6) | (b & 0x3F) as u32;
++                self.need -= 1;
++                if self.need == 0 {
++                    let cp = self.utf;
++                    let ok = cp >= self.min && !(0xD800..=0xDFFF).contains(&cp) && cp <= 0x10FFFF;
++                    self.print(if ok { cp } else { b'?' as u32 });
++                }
++                return;
++            }
++            self.need = 0; // sequence cut short (by a control, ESC, or a new lead byte): one '?', then this byte
++            self.print(b'?' as u32);
++        }
+         match self.st {
+             St::Ground => match b {
+                 0x1B => self.st = St::Esc,
+@@ -403,16 +498,24 @@ impl Term {
+                 b'\t' => self.col = ((self.col + 8) & !7).min(W - 1),
+                 0x0E => self.gl = 1,
+                 0x0F => self.gl = 0,
+-                0x80..=0xBF => {} // UTF-8 continuation byte
++                0xC2..=0xF4 => {
++                    let (need, min, mask) = match b {
++                        0xC2..=0xDF => (1, 0x80, 0x1F),
++                        0xE0..=0xEF => (2, 0x800, 0x0F),
++                        _ => (3, 0x10000, 0x07),
++                    };
++                    (self.utf, self.need, self.min) = ((b & mask) as u32, need, min);
++                }
++                0x80..=0xFF => self.print(b'?' as u32), // stray continuation or invalid lead byte (U+FFFD)
+                 _ if b < 0x20 || b == 0x7F => {} // BEL and other controls
+-                _ => self.print(b),
++                _ => self.print(b as u32),
+             },
+             St::Esc => {
+                 self.st = St::Ground;
+                 match b {
+                     b'[' => {
+                         self.st = St::Csi;
+-                        (self.p, self.np, self.private, self.inter) = ([0; 16], 0, false, 0);
++                        (self.p, self.np, self.private, self.lead, self.inter) = ([0; 16], 0, false, 0, 0);
+                     }
+                     b']' | b'P' | b'_' | b'^' | b'X' => self.st = St::Str,
+                     b'(' => self.st = St::Charset(0),
+@@ -450,7 +553,7 @@ impl Term {
+                 }
+                 b';' => self.np = self.np.max(1) + 1,
+                 b':' => self.inter = b':', // colon sub-parameters (38:2::r:g:b): sequence ignored, not misparsed
+-                b'?' | b'>' | b'<' | b'=' => self.private = true,
++                b'?' | b'>' | b'<' | b'=' => (self.private, self.lead) = (true, b),
+                 0x20..=0x2F => self.inter = b,
+                 0x40..=0x7E => {
+                     self.st = St::Ground;
+@@ -505,10 +608,203 @@ const DEC_GRAPHICS: [u8; 32] = [
+     0xFA, // ~ centred dot
+ ];
+ 
++/// Unicode -> CP437 for every glyph the VGA font has outside ASCII (0x01-0x1F, 0x7F, 0x80-0xFF), sorted by code point.
++/// No fallbacks: a character CP437 lacks (e.g. U+00D7 multiplication sign) shows as '?'.
++const CP437: [(u16, u8); 160] = [
++    (0x00A0, 0xFF),
++    (0x00A1, 0xAD),
++    (0x00A2, 0x9B),
++    (0x00A3, 0x9C),
++    (0x00A5, 0x9D),
++    (0x00A7, 0x15),
++    (0x00AA, 0xA6),
++    (0x00AB, 0xAE),
++    (0x00AC, 0xAA),
++    (0x00B0, 0xF8),
++    (0x00B1, 0xF1),
++    (0x00B2, 0xFD),
++    (0x00B5, 0xE6),
++    (0x00B6, 0x14),
++    (0x00B7, 0xFA),
++    (0x00BA, 0xA7),
++    (0x00BB, 0xAF),
++    (0x00BC, 0xAC),
++    (0x00BD, 0xAB),
++    (0x00BF, 0xA8),
++    (0x00C4, 0x8E),
++    (0x00C5, 0x8F),
++    (0x00C6, 0x92),
++    (0x00C7, 0x80),
++    (0x00C9, 0x90),
++    (0x00D1, 0xA5),
++    (0x00D6, 0x99),
++    (0x00DC, 0x9A),
++    (0x00DF, 0xE1),
++    (0x00E0, 0x85),
++    (0x00E1, 0xA0),
++    (0x00E2, 0x83),
++    (0x00E4, 0x84),
++    (0x00E5, 0x86),
++    (0x00E6, 0x91),
++    (0x00E7, 0x87),
++    (0x00E8, 0x8A),
++    (0x00E9, 0x82),
++    (0x00EA, 0x88),
++    (0x00EB, 0x89),
++    (0x00EC, 0x8D),
++    (0x00ED, 0xA1),
++    (0x00EE, 0x8C),
++    (0x00EF, 0x8B),
++    (0x00F1, 0xA4),
++    (0x00F2, 0x95),
++    (0x00F3, 0xA2),
++    (0x00F4, 0x93),
++    (0x00F6, 0x94),
++    (0x00F7, 0xF6),
++    (0x00F9, 0x97),
++    (0x00FA, 0xA3),
++    (0x00FB, 0x96),
++    (0x00FC, 0x81),
++    (0x00FF, 0x98),
++    (0x0192, 0x9F),
++    (0x0393, 0xE2),
++    (0x0398, 0xE9),
++    (0x03A3, 0xE4),
++    (0x03A6, 0xE8),
++    (0x03A9, 0xEA),
++    (0x03B1, 0xE0),
++    (0x03B4, 0xEB),
++    (0x03B5, 0xEE),
++    (0x03C0, 0xE3),
++    (0x03C3, 0xE5),
++    (0x03C4, 0xE7),
++    (0x03C6, 0xED),
++    (0x2022, 0x07),
++    (0x203C, 0x13),
++    (0x207F, 0xFC),
++    (0x20A7, 0x9E),
++    (0x2190, 0x1B),
++    (0x2191, 0x18),
++    (0x2192, 0x1A),
++    (0x2193, 0x19),
++    (0x2194, 0x1D),
++    (0x2195, 0x12),
++    (0x21A8, 0x17),
++    (0x2219, 0xF9),
++    (0x221A, 0xFB),
++    (0x221E, 0xEC),
++    (0x221F, 0x1C),
++    (0x2229, 0xEF),
++    (0x2248, 0xF7),
++    (0x2261, 0xF0),
++    (0x2264, 0xF3),
++    (0x2265, 0xF2),
++    (0x2302, 0x7F),
++    (0x2310, 0xA9),
++    (0x2320, 0xF4),
++    (0x2321, 0xF5),
++    (0x2500, 0xC4),
++    (0x2502, 0xB3),
++    (0x250C, 0xDA),
++    (0x2510, 0xBF),
++    (0x2514, 0xC0),
++    (0x2518, 0xD9),
++    (0x251C, 0xC3),
++    (0x2524, 0xB4),
++    (0x252C, 0xC2),
++    (0x2534, 0xC1),
++    (0x253C, 0xC5),
++    (0x2550, 0xCD),
++    (0x2551, 0xBA),
++    (0x2552, 0xD5),
++    (0x2553, 0xD6),
++    (0x2554, 0xC9),
++    (0x2555, 0xB8),
++    (0x2556, 0xB7),
++    (0x2557, 0xBB),
++    (0x2558, 0xD4),
++    (0x2559, 0xD3),
++    (0x255A, 0xC8),
++    (0x255B, 0xBE),
++    (0x255C, 0xBD),
++    (0x255D, 0xBC),
++    (0x255E, 0xC6),
++    (0x255F, 0xC7),
++    (0x2560, 0xCC),
++    (0x2561, 0xB5),
++    (0x2562, 0xB6),
++    (0x2563, 0xB9),
++    (0x2564, 0xD1),
++    (0x2565, 0xD2),
++    (0x2566, 0xCB),
++    (0x2567, 0xCF),
++    (0x2568, 0xD0),
++    (0x2569, 0xCA),
++    (0x256A, 0xD8),
++    (0x256B, 0xD7),
++    (0x256C, 0xCE),
++    (0x2580, 0xDF),
++    (0x2584, 0xDC),
++    (0x2588, 0xDB),
++    (0x258C, 0xDD),
++    (0x2590, 0xDE),
++    (0x2591, 0xB0),
++    (0x2592, 0xB1),
++    (0x2593, 0xB2),
++    (0x25A0, 0xFE),
++    (0x25AC, 0x16),
++    (0x25B2, 0x1E),
++    (0x25BA, 0x10),
++    (0x25BC, 0x1F),
++    (0x25C4, 0x11),
++    (0x25CB, 0x09),
++    (0x25D8, 0x08),
++    (0x25D9, 0x0A),
++    (0x263A, 0x01),
++    (0x263B, 0x02),
++    (0x263C, 0x0F),
++    (0x2640, 0x0C),
++    (0x2642, 0x0B),
++    (0x2660, 0x06),
++    (0x2663, 0x05),
++    (0x2665, 0x03),
++    (0x2666, 0x04),
++    (0x266A, 0x0D),
++    (0x266B, 0x0E),
++];
++
++fn cp437(cp: u32) -> u8 {
++    if (0x20..0x7F).contains(&cp) {
++        return cp as u8;
++    }
++    match CP437.binary_search_by_key(&cp, |&(u, _)| u as u32) {
++        Ok(i) => CP437[i].1,
++        Err(_) => b'?',
++    }
++}
++
++/// Cells a character takes, wcwidth-style: 0 for combining marks and zero-width characters, 2 for East Asian
++/// Wide/Fullwidth (CJK, Hangul, fullwidth forms, most emoji), else 1.
++fn width(cp: u32) -> usize {
++    const ZERO: [(u32, u32); 8] = [(0x0300, 0x036F), (0x0483, 0x0489), (0x0591, 0x05BD), (0x200B, 0x200F), (0x20D0, 0x20FF), (0xFE00, 0xFE0F), (0xFE20, 0xFE2F), (0xE0100, 0xE01EF)];
++    const WIDE: [(u32, u32); 13] = [
++        (0x1100, 0x115F), (0x2E80, 0x303E), (0x3041, 0x33FF), (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xA000, 0xA4CF),
++        (0xAC00, 0xD7A3), (0xF900, 0xFAFF), (0xFE30, 0xFE4F), (0xFF00, 0xFF60), (0xFFE0, 0xFFE6), (0x1F300, 0x1F64F),
++        (0x1F900, 0x1F9FF),
++    ];
++    if (0x80..0xA0).contains(&cp) || ZERO.iter().any(|&(a, b)| (a..=b).contains(&cp)) {
++        0 // C1 controls are not printed either
++    } else if WIDE.iter().any(|&(a, b)| (a..=b).contains(&cp)) || (0x20000..=0x3FFFD).contains(&cp) {
++        2
++    } else {
++        1
++    }
++}
++
+ #[cfg(not(test))]
+ mod hw {
+     use super::{Term, N, W};
+-    use crate::port::outb;
++    use crate::port::{inb, outb};
+ 
+     const VGA: *mut u16 = 0xB8000 as *mut u16;
+     static mut TERM: Term = Term::new();
+@@ -517,6 +813,23 @@ mod hw {
+         unsafe { &mut *core::ptr::addr_of_mut!(TERM) }
+     }
+ 
++    /// Attribute Controller index 0x10 (mode control) bit 3: 1 = attribute bit 7 blinks, 0 = it selects the bright
++    /// background colours 8..15. Returns (before, after). Index 0x30 keeps PAS (bit 5) set so the screen stays on.
++    pub fn blink_off() -> (u8, u8) {
++        unsafe {
++            inb(0x3DA); // reset the index/data flip-flop
++            outb(0x3C0, 0x30);
++            let old = inb(0x3C1);
++            outb(0x3C0, old & !0x08);
++            inb(0x3DA);
++            outb(0x3C0, 0x30);
++            let new = inb(0x3C1);
++            inb(0x3DA);
++            outb(0x3C0, 0x20); // leave the flip-flop at index with PAS set
++            (old, new)
++        }
++    }
++
+     pub fn flush() {
+         let t = t();
+         for i in 0..N {
+@@ -536,13 +849,27 @@ mod hw {
+     }
+ }
+ 
+-/// Take over the screen: reset the terminal, clear the screen, home the cursor.
++/// Take over the screen: bright backgrounds instead of blink, reset the terminal, clear the screen, home the cursor.
+ #[cfg(not(test))]
+ pub fn init() {
++    let (old, new) = hw::blink_off();
++    crate::kprintln!("term: VGA attribute mode control 0x{:02x} -> 0x{:02x} (bit 3 blink {})", old, new, if new & 8 == 0 { "off: bright backgrounds" } else { "STILL ON" });
+     hw::t().reset();
+     hw::flush();
+ }
+ 
++/// Replies the terminal owes the host (DSR, DA); the caller sends them on the channel.
++#[cfg(not(test))]
++pub fn take_reply(out: &mut [u8]) -> usize {
++    hw::t().take_reply(out)
++}
++
++/// Replies sent so far: DSR 6n, DSR 5n, DA1, DA2, dropped.
++#[cfg(not(test))]
++pub fn reply_counts() -> [u32; 5] {
++    hw::t().counts
++}
++
+ /// Feed one byte of the remote's output (drawn on the next `flush`).
+ #[cfg(not(test))]
+ pub fn feed(b: u8) {
+diff --git a/tools/term-vs-pyte.py b/tools/term-vs-pyte.py
+index c73a82a..770564f 100644
+--- a/tools/term-vs-pyte.py
++++ b/tools/term-vs-pyte.py
+@@ -1,10 +1,13 @@
+ #!/usr/bin/env python3
+-"""Compare src/term.rs with pyte (an independent VT/xterm emulator) on the shell output captured in an M4 serial log.
++"""Compare src/term.rs with pyte (an independent VT/xterm emulator) on the shell output captured in an M4/M4.5 serial log.
+ The kernel mirrors the channel to COM1 with ESC shown as '^['; we undo that, replay the stream up to each cut point
+ through term.rs (tools/term_replay.rs) and through pyte at 80x25, and diff characters, colours and reverse video.
+-Usage: <venv with pyte>/bin/python tools/term-vs-pyte.py proof/m4-serial.log"""
++Usage: <venv with pyte>/bin/python tools/term-vs-pyte.py proof/m45-serial.log
++M4.5: pyte's Unicode cells are mapped to CP437 with Python's cp437 codec (plus the glyphs CP437 has in 0x01-0x1F), a wide
++character's two cells to '??', and bright backgrounds (SGR 100-107) to VGA 8-15."""
+ import os, re, subprocess, sys, tempfile
+ import pyte
++from wcwidth import wcwidth
+ 
+ 
+ class Screen(pyte.Screen):  # pyte 0.8 crashes on CSI > 4;2 m (vim's modifyOtherKeys); xterm ignores private SGR
+@@ -12,6 +15,29 @@ class Screen(pyte.Screen):  # pyte 0.8 crashes on CSI > 4;2 m (vim's modifyOther
+         if not private:
+             super().select_graphic_rendition(*a, **kw)
+ 
++    # pyte 0.8.2 has no SU/SD (CSI S / CSI T); htop under a UTF-8 locale uses CSI 2 T inside a scroll region.
++    # xterm semantics: scroll the region by n, cursor unchanged. Built from pyte's own IND/RI at the margins.
++    def _scroll(self, n, up, private=False):
++        if private:
++            return
++        top, bot = self.margins or (0, self.lines - 1)
++        y = self.cursor.y
++        self.cursor.y = bot if up else top
++        for _ in range(max(n or 1, 1)):
++            self.index() if up else self.reverse_index()
++        self.cursor.y = y
++
++    def scroll_up(self, n=None, *rest, private=False):
++        self._scroll(n, True, private)
++
++    def scroll_down(self, n=None, *rest, private=False):
++        if not rest:  # CSI Ps ; ... T with several parameters is mouse tracking, not SD
++            self._scroll(n, False, private)
++
++
++class Stream(pyte.ByteStream):
++    csi = dict(pyte.ByteStream.csi, S="scroll_up", T="scroll_down")
++
+ 
+ def for_pyte(b):  # pyte has no REP (CSI b); ncurses' rep is always <char> ESC [ n-1 b, so expand it textually
+     return re.sub(rb"([\x20-\x7e])\x1b\[(\d+)b", lambda m: m.group(1) * (int(m.group(2)) + 1), b)
+@@ -30,24 +56,40 @@ tmp.close()
+ 
+ ANSI = {"black": 0, "red": 1, "green": 2, "brown": 3, "blue": 4, "magenta": 5, "cyan": 6, "white": 7, "default": None}
+ VGA = [0, 4, 2, 6, 1, 5, 3, 7]
+-DEC = {"┘": 0xD9, "┐": 0xBF, "┌": 0xDA, "└": 0xC0, "┼": 0xC5, "─": 0xC4, "├": 0xC3, "┤": 0xB4, "┴": 0xC1, "┬": 0xC2, "│": 0xB3}
++LOW = {c: i + 1 for i, c in enumerate("☺☻♥♦♣♠•◘○◙♂♀♪♫☼►◄↕‼¶§▬↨↑↓→←∟↔▲▼")}  # CP437 glyphs the codec calls controls
++LOW["⌂"] = 0x7F
++
++
++def colour(name, default):  # "red" -> VGA 4, "brightred" (pyte also spells one "bfightmagenta") -> VGA 12
++    bright = name.startswith("b") and name[2:].startswith("ight") and name not in ANSI
++    v = ANSI.get(name[6:] if bright else name, None)
++    return default if v is None else VGA[v] | (8 if bright else 0)
++
++
++def code(c):
++    if c == "":
++        return ord("?")  # right half of a wide character
++    if wcwidth(c) == 2:
++        return ord("?")
++    if c in LOW:
++        return LOW[c]
++    try:
++        return c.encode("cp437")[0]
++    except UnicodeEncodeError:
++        return ord("?")
++
+ 
+ def pyte_cell(ch):
+-    fg = ANSI.get(ch.fg, 7)
+-    fg = 7 if fg is None else VGA[fg]
+-    bg = ANSI.get(ch.bg, 0)
+-    bg = 0 if bg is None else VGA[bg]
++    fg, bg = colour(ch.fg, 7), colour(ch.bg, 0)
+     if ch.bold:
+         fg |= 8
+     if ch.reverse:
+-        fg, bg = bg, fg & 7
+-    c = ch.data
+-    code = DEC.get(c, ord(c) if len(c) == 1 and ord(c) < 0x80 else ord("?"))
+-    return (bg << 12) | (fg << 8) | code
++        fg, bg = bg, fg
++    return (bg << 12) | (fg << 8) | code(ch.data)
+ 
+ def compare(name, cut):
+     scr = Screen(80, 25)
+-    st = pyte.ByteStream(scr)
++    st = Stream(scr)
+     st.feed(for_pyte(stream[:cut]))
+     out = subprocess.run([exe, tmp.name, str(cut)], capture_output=True, text=True, check=True).stdout.splitlines()
+     ours = [[int(x, 16) for x in l.split()] for l in out[:25]]
+@@ -59,11 +101,16 @@ def compare(name, cut):
+     return len(diffs)
+ 
+ cuts = []
++h = stream.find(b"\x1b[?1049h")  # main screen before the first full-screen app; M4.5: before the reply probe moves
++p = stream.find(b"\x1b[3;7H", 0, h)  # the cursor and `clear` wipes the printf lines (UTF-8, wide, bright backgrounds)
++cuts.append(("shell (printf lines)", p if p > 0 else h))
+ i = stream.find(b"\x1b[?1049l")  # htop's rmcup: compare the last htop frame
+ cuts.append(("htop (last frame)", i))
+ j = stream.find(b"\x1b[?1049l", i + 1)
+ k = stream.rfind(b"\x1b[25;1H", 0, j)  # vi: just before the ':' command line is drawn
+-cuts.append(("vi (before :wq)", k))
++e = stream.find(b"\x1b[25;1H:", i, j)  # M4.5: before the `:echo`, whose output has a literal "^[" the mirror makes ESC
++k = e if e > 0 else k
++cuts.append(("vi (before the : command line)", k))
+ # No cut after a ?1049l: pyte 0.8 has no alternate screen, so it keeps the app residue that xterm (and we) restore.
+ bad = sum(compare(n, c) for n, c in cuts)
+ os.unlink(tmp.name)
+diff --git a/tools/term_test.rs b/tools/term_test.rs
+index 41c6620..e6c4447 100644
+--- a/tools/term_test.rs
++++ b/tools/term_test.rs
+@@ -42,9 +42,112 @@ fn sgr_colours_map_to_vga() {
+     assert_eq!(attr(&t, 0, 2), 0x17, "0;44 grey on blue");
+     assert_eq!(attr(&t, 0, 3), 0x1E, "93 bright yellow keeps bg");
+     assert_eq!(attr(&t, 0, 4), 0x07, "39;49 default");
+-    assert_eq!(attr(&t, 0, 5), 0x07, "100 folds onto bg 0 (black), never sets the blink bit");
++    assert_eq!(attr(&t, 0, 5), 0x87, "100 bright black (dark grey) bg: attribute bit 7, blink is off");
+ }
+ 
++fn reply(t: &mut Term) -> Vec<u8> {
++    let mut b = [0u8; 128];
++    let n = t.take_reply(&mut b);
++    b[..n].to_vec()
++}
++fn cells(t: &Term, r: usize, n: usize) -> Vec<u8> {
++    (0..n).map(|c| (t.cell(r, c) & 0xFF) as u8).collect()
++}
++
++#[test]
++fn bright_backgrounds_and_resets() {
++    let t = run(b"\x1b[102mA\x1b[48;5;12mB\x1b[44;7mC\x1b[0;1;101;7mD");
++    assert_eq!(attr(&t, 0, 0), 0xA7, "102 -> bright green bg (VGA 10)");
++    assert_eq!(attr(&t, 0, 1), 0x97, "48;5;12 -> bright blue bg (VGA 9)");
++    assert_eq!(attr(&t, 0, 2), 0x71, "reverse swaps grey/blue");
++    assert_eq!(attr(&t, 0, 3), 0xFC, "bold+bright-red bg reversed: bright red on bright white, no bit dropped");
++    let t = run(b"\x1b[1;31;102;7mA\x1b[22mB\x1b[27mC\x1b[39mD\x1b[49mE");
++    assert_eq!(attr(&t, 0, 0), 0xCA, "bold red on bright green, reversed");
++    assert_eq!(attr(&t, 0, 1), 0x4A, "22: bold off");
++    assert_eq!(attr(&t, 0, 2), 0xA4, "27: reverse off");
++    assert_eq!(attr(&t, 0, 3), 0xA7, "39: default fg, bg kept");
++    assert_eq!(attr(&t, 0, 4), 0x07, "49: default bg");
++}
++
++#[test]
++fn dsr_replies() {
++    let mut t = run(b"\x1b[5n");
++    assert_eq!(reply(&mut t), b"\x1b[0n");
++    let mut t = run(b"\x1b[12;34Hx\x1b[6n");
++    assert_eq!(reply(&mut t), b"\x1b[12;35R");
++    let mut t = run(b"\x1b[3;4H\x1b[6n");
++    assert_eq!(reply(&mut t), b"\x1b[3;4R", "single digits, no leading zero");
++    let mut t = run(&with(vec![b'a'; 80], b"\x1b[6n"));
++    assert_eq!(reply(&mut t), b"\x1b[1;80R", "pending wrap reports the last column");
++    let mut t = run(b"\x1b[25;80H\x1b[?6n\x1b[6 n");
++    assert_eq!(reply(&mut t), b"", "DECXCPR / intermediates: no plain CPR");
++    assert_eq!(t.counts, [0, 0, 0, 0, 0]);
++}
++
++#[test]
++fn device_attributes() {
++    let mut t = run(b"\x1b[c\x1b[0c");
++    assert_eq!(reply(&mut t), b"\x1b[?6c\x1b[?6c", "DA1: VT102");
++    let mut t = run(b"\x1b[>c\x1b[>0c");
++    assert_eq!(reply(&mut t), b"\x1b[>0;10;0c\x1b[>0;10;0c", "DA2");
++    let mut t = run(b"\x1b[=c\x1b[1c");
++    assert_eq!(reply(&mut t), b"", "DA3 and nonzero DA: no reply");
++    assert_eq!(row(&t, 0), "", "queries draw nothing");
++}
++
++#[test]
++fn reply_buffer_is_bounded_and_drains_partially() {
++    let mut v = Vec::new();
++    for _ in 0..20 {
++        v.extend(b"\x1b[5n");
++    }
++    let mut t = run(&v);
++    assert_eq!(t.counts[1], 16, "64-byte queue holds 16 four-byte replies");
++    assert_eq!(t.counts[4], 4, "the rest are counted as dropped, not truncated");
++    let mut b = [0u8; 6];
++    assert_eq!(t.take_reply(&mut b), 6);
++    assert_eq!(&b, b"\x1b[0n\x1b[");
++    assert_eq!(reply(&mut t)[..6], *b"0n\x1b[0n", "the rest moves to the front");
++    let mut v = Vec::new();
++    for _ in 0..15 {
++        v.extend(b"\x1b[5n");
++    }
++    let mut t = run(&with(v, b"\x1b[12;34H\x1b[6n\x1b[5n"));
++    assert_eq!((t.counts[0], t.counts[1], t.counts[4]), (0, 16, 1), "an 8-byte CPR that does not fit is dropped whole");
++    assert_eq!(reply(&mut t).len(), 64);
++}
++
++#[test]
++fn utf8_to_cp437() {
++    let t = run("box: ─│┌┐ deg: ° ±÷×é▀█░".as_bytes());
++    assert_eq!(cells(&t, 0, 22), [b'b', b'o', b'x', b':', b' ', 0xC4, 0xB3, 0xDA, 0xBF, b' ', b'd', b'e', b'g', b':', b' ', 0xF8, b' ', 0xF1, 0xF6, b'?', 0x82, 0xDF]);
++    assert_eq!(cells(&t, 0, 24)[22..], [0xDB, 0xB0]);
++    let t = run("→▲♥⌂".as_bytes());
++    assert_eq!(cells(&t, 0, 4), [0x1A, 0x1E, 0x03, 0x7F], "glyphs in CP437's control range");
++}
++
++#[test]
++fn utf8_invalid_and_interrupted() {
++    let t = run(b"a\xbdb\xe2\x94c\xc0\xafd\xed\xa0\x80e\xe0\x81\x81g\xe2\x94\x1b[1mf");
++    assert_eq!(row(&t, 0), "a?b?c??d?e?g?f", "stray continuation, cut-short, invalid lead, surrogate, overlong 'A', ESC mid-sequence");
++    assert_eq!(attr(&t, 0, 13), 0x0F, "the ESC that cut the sequence still starts the CSI");
++    let t = run(b"e\xcc\x81x\xc2\x85y");
++    assert_eq!(row(&t, 0), "exy", "combining mark and C1 take no cell");
++}
++
++#[test]
++fn wide_chars_take_two_cells() {
++    let t = run("cjk: 中文|".as_bytes());
++    assert_eq!(row(&t, 0), "cjk: ????|");
++    assert_eq!(t.cursor(), (0, 10));
++    let t = run(&with(vec![b'a'; 79], "中x".as_bytes()));
++    assert_eq!(row(&t, 0).len(), 79, "no room at the last column: the wide char wraps whole");
++    assert_eq!(row(&t, 1), "??x");
++    let t = run("\x1b[3;1H中\x1b[2b|".as_bytes());
++    assert_eq!(row(&t, 2), "??????|", "REP repeats a wide char as wide");
++}
++
++
+ #[test]
+ fn sgr_256_and_private_m_do_not_misparse() {
+     let t = run(b"\x1b[38;5;4mA\x1b[0m\x1b[>4;2mB\x1b[38;2;255;0;0;1mC");
+
+exec
+/bin/zsh -lc "git status --short; nl -ba src/term.rs | sed -n '120,580p'; cat Cargo.toml; cat tools/test-term.sh; nl -ba src/ssh.rs | sed -n '345,425p'" in ~/nc110-baremetal
+ succeeded in 0ms:
+A  run-m45.py
+M  src/ssh.rs
+M  src/term.rs
+A  tools/sshd_config.m45
+M  tools/term-mutants.py
+M  tools/term-vs-pyte.py
+M  tools/term_test.rs
+?? proof/codex-review-m45.txt
+?? proof/m45-htop.png
+?? proof/m45-net.pcap
+?? proof/m45-printf.png
+?? proof/m45-replies.png
+?? proof/m45-serial.log
+?? proof/m45-sshd.log
+?? proof/m45-term-vs-pyte.txt
+?? proof/m45-vi-exit.png
+?? proof/m45-vi.png
+   120	    pub fn cell(&self, r: usize, c: usize) -> u16 {
+   121	        self.cells[r * W + c]
+   122	    }
+   123	    #[cfg_attr(not(test), allow(dead_code))]
+   124	    pub fn cursor(&self) -> (usize, usize) {
+   125	        (self.row, self.col.min(W - 1))
+   126	    }
+   127	    #[cfg_attr(not(test), allow(dead_code))]
+   128	    pub fn cursor_visible(&self) -> bool {
+   129	        self.cursor_on
+   130	    }
+   131	    pub fn app_cursor(&self) -> bool {
+   132	        self.app_cursor
+   133	    }
+   134	    /// Move queued replies (terminal -> host) into `out`; returns how many bytes were moved.
+   135	    pub fn take_reply(&mut self, out: &mut [u8]) -> usize {
+   136	        let n = self.nreply.min(out.len());
+   137	        out[..n].copy_from_slice(&self.reply[..n]);
+   138	        self.reply.copy_within(n..self.nreply, 0);
+   139	        self.nreply -= n;
+   140	        n
+   141	    }
+   142	    fn send(&mut self, kind: usize, s: &[u8]) {
+   143	        if self.nreply + s.len() > self.reply.len() {
+   144	            self.counts[4] += 1; // a reply is all-or-nothing: a truncated CPR would be worse than none
+   145	            return;
+   146	        }
+   147	        self.reply[self.nreply..self.nreply + s.len()].copy_from_slice(s);
+   148	        self.nreply += s.len();
+   149	        self.counts[kind] += 1;
+   150	    }
+   151	
+   152	    fn attr(&self) -> u16 {
+   153	        let (mut f, mut b) = (self.fg | if self.bold { 8 } else { 0 }, self.bg);
+   154	        if self.rev {
+   155	            (f, b) = (b, f);
+   156	        }
+   157	        ((b as u16) << 12) | ((f as u16) << 8)
+   158	    }
+   159	    fn blank(&self) -> u16 {
+   160	        self.attr() | b' ' as u16 // bce: erased cells take the current background
+   161	    }
+   162	    fn fill(&mut self, from: usize, to: usize) {
+   163	        let b = self.blank();
+   164	        self.cells[from.min(N)..to.min(N)].fill(b);
+   165	    }
+   166	    /// Scroll rows top..=bot by n, up (content moves up, blank rows at the bottom) or down.
+   167	    fn scroll(&mut self, top: usize, bot: usize, n: usize, up: bool) {
+   168	        let n = n.min(bot + 1 - top);
+   169	        if up {
+   170	            self.cells.copy_within((top + n) * W..(bot + 1) * W, top * W);
+   171	            self.fill((bot + 1 - n) * W, (bot + 1) * W);
+   172	        } else {
+   173	            self.cells.copy_within(top * W..(bot + 1 - n) * W, (top + n) * W);
+   174	            self.fill(top * W, (top + n) * W);
+   175	        }
+   176	    }
+   177	    fn lf(&mut self) {
+   178	        if self.row == self.bot {
+   179	            self.scroll(self.top, self.bot, 1, true);
+   180	        } else if self.row < H - 1 {
+   181	            self.row += 1;
+   182	        }
+   183	    }
+   184	    fn ri(&mut self) {
+   185	        if self.row == self.top {
+   186	            self.scroll(self.top, self.bot, 1, false);
+   187	        } else if self.row > 0 {
+   188	            self.row -= 1;
+   189	        }
+   190	    }
+   191	    fn save(&mut self) {
+   192	        self.saved[self.alt as usize] = Saved { row: self.row, col: self.col, wrap: self.wrap, fg: self.fg, bg: self.bg, bold: self.bold, rev: self.rev, g: self.g, gl: self.gl };
+   193	    }
+   194	    fn restore(&mut self) {
+   195	        let s = self.saved[self.alt as usize];
+   196	        (self.row, self.col, self.wrap, self.fg, self.bg, self.bold, self.rev, self.g, self.gl) = (s.row, s.col, s.wrap, s.fg, s.bg, s.bold, s.rev, s.g, s.gl);
+   197	    }
+   198	    fn set_alt(&mut self, on: bool, clear: bool) {
+   199	        if on != self.alt {
+   200	            core::mem::swap(&mut self.cells, &mut self.other);
+   201	            self.alt = on;
+   202	            if on && clear {
+   203	                self.fill(0, N);
+   204	            }
+   205	        }
+   206	    }
+   207	    /// DECSTR soft reset: modes, attributes, margins and charsets; the screen is kept.
+   208	    fn soft_reset(&mut self) {
+   209	        (self.fg, self.bg, self.bold, self.rev, self.g, self.gl) = (DEF_FG, 0, false, false, [false; 2], 0);
+   210	        (self.top, self.bot, self.insert, self.autowrap, self.app_cursor, self.cursor_on) = (0, H - 1, false, true, false, true);
+   211	        self.saved = [SAVED0; 2];
+   212	    }
+   213	    /// RIS (ESC c), in place (no 8 KiB temporary on the kernel stack): main screen, cleared, cursor home.
+   214	    pub fn reset(&mut self) {
+   215	        self.set_alt(false, false);
+   216	        self.soft_reset();
+   217	        self.fill(0, N);
+   218	        self.other.fill(BLANK);
+   219	        (self.row, self.col, self.wrap, self.st, self.last, self.need) = (0, 0, false, St::Ground, b' ' as u32, 0);
+   220	    }
+   221	
+   222	    /// Print one character (code point): DEC graphics for ASCII when G0/G1 says so, else CP437 or '?';
+   223	    /// wide characters take two cells, zero-width ones none.
+   224	    fn print(&mut self, cp: u32) {
+   225	        let w = width(cp);
+   226	        if w == 0 {
+   227	            return;
+   228	        }
+   229	        self.last = cp;
+   230	        let ch = if cp < 0x80 && self.g[self.gl] && (0x5F..=0x7E).contains(&(cp as u8)) {
+   231	            DEC_GRAPHICS[(cp - 0x5F) as usize]
+   232	        } else {
+   233	            cp437(cp)
+   234	        };
+   235	        if w == 2 {
+   236	            if self.wrap || (self.col >= W - 1 && self.autowrap) {
+   237	                self.col = 0; // no room for both halves: wrap first, as xterm does
+   238	                self.lf();
+   239	                self.wrap = false;
+   240	            }
+   241	            self.put(b'?');
+   242	            self.put(b'?');
+   243	        } else {
+   244	            self.put(ch);
+   245	        }
+   246	    }
+   247	    fn put(&mut self, ch: u8) {
+   248	        if self.wrap {
+   249	            self.col = 0;
+   250	            self.lf();
+   251	            self.wrap = false;
+   252	        }
+   253	        let s = self.row * W;
+   254	        if self.insert {
+   255	            self.cells.copy_within(s + self.col..s + W - 1, s + self.col + 1);
+   256	        }
+   257	        self.cells[s + self.col] = self.attr() | ch as u16;
+   258	        if self.col == W - 1 {
+   259	            self.wrap = self.autowrap;
+   260	        } else {
+   261	            self.col += 1;
+   262	        }
+   263	    }
+   264	
+   265	    fn arg(&self, i: usize, def: u16) -> usize {
+   266	        let v = if i < self.np { self.p[i] } else { 0 };
+   267	        (if v == 0 { def } else { v }) as usize
+   268	    }
+   269	
+   270	    fn sgr(&mut self) {
+   271	        let np = self.np.max(1).min(self.p.len());
+   272	        let mut i = 0;
+   273	        while i < np {
+   274	            let v = self.p[i];
+   275	            match v {
+   276	                0 => (self.fg, self.bg, self.bold, self.rev) = (DEF_FG, 0, false, false),
+   277	                1 => self.bold = true,
+   278	                22 => self.bold = false,
+   279	                7 => self.rev = true,
+   280	                27 => self.rev = false,
+   281	                30..=37 => self.fg = ANSI_TO_VGA[(v - 30) as usize],
+   282	                39 => self.fg = DEF_FG,
+   283	                40..=47 => self.bg = ANSI_TO_VGA[(v - 40) as usize],
+   284	                49 => self.bg = 0,
+   285	                90..=97 => self.fg = ANSI_TO_VGA[(v - 90) as usize] | 8,
+   286	                100..=107 => self.bg = ANSI_TO_VGA[(v - 100) as usize] | 8,
+   287	                38 | 48 => {
+   288	                    let sub = if i + 1 < np { self.p[i + 1] } else { 0 };
+   289	                    if sub == 5 && i + 2 < np {
+   290	                        let n = self.p[i + 2];
+   291	                        if n < 16 {
+   292	                            let c = ANSI_TO_VGA[(n & 7) as usize];
+   293	                            if v == 38 {
+   294	                                self.fg = c | if n >= 8 { 8 } else { 0 };
+   295	                            } else {
+   296	                                self.bg = c | if n >= 8 { 8 } else { 0 };
+   297	                            }
+   298	                        }
+   299	                        i += 2;
+   300	                    } else if sub == 2 {
+   301	                        i += 4; // truecolour: not representable, skipped
+   302	                    }
+   303	                }
+   304	                _ => {} // 2 dim, 4 underline, 5 blink, 8 invisible, 3/23 italic, ...: no VGA equivalent
+   305	            }
+   306	            i += 1;
+   307	        }
+   308	    }
+   309	
+   310	    fn mode(&mut self, on: bool) {
+   311	        for i in 0..self.np.min(self.p.len()) {
+   312	            match (self.private, self.p[i]) {
+   313	                (false, 4) => self.insert = on,
+   314	                (true, 1) => self.app_cursor = on,
+   315	                (true, 7) => {
+   316	                    self.autowrap = on;
+   317	                    self.wrap = false;
+   318	                }
+   319	                (true, 25) => self.cursor_on = on,
+   320	                (true, 47) => self.set_alt(on, false),
+   321	                (true, 1047) => self.set_alt(on, true),
+   322	                (true, 1048) => {
+   323	                    if on {
+   324	                        self.save()
+   325	                    } else {
+   326	                        self.restore()
+   327	                    }
+   328	                }
+   329	                (true, 1049) => {
+   330	                    if on {
+   331	                        self.save();
+   332	                        self.set_alt(true, true);
+   333	                    } else {
+   334	                        self.set_alt(false, false);
+   335	                        self.restore();
+   336	                    }
+   337	                }
+   338	                _ => {} // ?12 blink, ?1000.. mouse, ?2004 paste, 20 LNM, ...: not modelled
+   339	            }
+   340	        }
+   341	    }
+   342	
+   343	    fn csi(&mut self, f: u8) {
+   344	        if f == b'c' && self.inter == 0 && self.arg(0, 0) == 0 {
+   345	            match self.lead {
+   346	                0 => self.send(2, b"\x1b[?6c"),         // DA1: VT102
+   347	                b'>' => self.send(3, b"\x1b[>0;10;0c"), // DA2: VT100-class, version 10 (low: vim enables no xterm extras)
+   348	                _ => {}
+   349	            }
+   350	            return;
+   351	        }
+   352	        if f == b'n' && self.inter == 0 && self.lead == 0 {
+   353	            match self.arg(0, 0) {
+   354	                5 => self.send(1, b"\x1b[0n"),
+   355	                6 => {
+   356	                    // CPR, 1-based; a pending wrap reports the last column, as xterm does
+   357	                    let (mut b, mut n) = ([0u8; 8], 2);
+   358	                    b[..2].copy_from_slice(b"\x1b[");
+   359	                    for (i, v) in [self.row + 1, self.col.min(W - 1) + 1].into_iter().enumerate() {
+   360	                        if v >= 10 {
+   361	                            b[n] = b'0' + (v / 10) as u8;
+   362	                            n += 1;
+   363	                        }
+   364	                        b[n] = b'0' + (v % 10) as u8;
+   365	                        b[n + 1] = if i == 0 { b';' } else { b'R' };
+   366	                        n += 2;
+   367	                    }
+   368	                    self.send(0, &b[..n]);
+   369	                }
+   370	                _ => {}
+   371	            }
+   372	            return;
+   373	        }
+   374	        if self.inter != 0 {
+   375	            if self.inter == b'!' && f == b'p' {
+   376	                self.soft_reset();
+   377	            }
+   378	            return; // CSI SP q (cursor style), CSI " q, ...: ignored
+   379	        }
+   380	        if f == b'h' || f == b'l' {
+   381	            return self.mode(f == b'h');
+   382	        }
+   383	        if self.private {
+   384	            return; // CSI ? s/r (save/restore modes), CSI > c, CSI > 4;2 m, CSI ? u, ...
+   385	        }
+   386	        let n = self.arg(0, 1);
+   387	        let (row, col) = (self.row, self.col);
+   388	        match f {
+   389	            b'm' => return self.sgr(),
+   390	            b'b' => {
+   391	                for _ in 0..n.min(N) {
+   392	                    self.print(self.last);
+   393	                }
+   394	                return;
+   395	            }
+   396	            b'A' | b'F' => self.row = if row >= self.top { row.saturating_sub(n).max(self.top) } else { row.saturating_sub(n) },
+   397	            b'B' | b'e' | b'E' => self.row = if row <= self.bot { (row + n).min(self.bot) } else { (row + n).min(H - 1) },
+   398	            b'C' | b'a' => self.col = (col + n).min(W - 1),
+   399	            b'D' => self.col = col.min(W - 1).saturating_sub(n),
+   400	            b'G' | b'`' => self.col = (n - 1).min(W - 1),
+   401	            b'd' => self.row = (n - 1).min(H - 1),
+   402	            b'H' | b'f' => {
+   403	                self.row = (self.arg(0, 1) - 1).min(H - 1);
+   404	                self.col = (self.arg(1, 1) - 1).min(W - 1);
+   405	            }
+   406	            b'Z' => {
+   407	                for _ in 0..n.min(W) {
+   408	                    self.col = self.col.min(W - 1).saturating_sub(1) & !7;
+   409	                }
+   410	            }
+   411	            b'J' => {
+   412	                let cur = row * W + col.min(W - 1);
+   413	                match self.arg(0, 0) {
+   414	                    0 => self.fill(cur, N),
+   415	                    1 => self.fill(0, cur + 1),
+   416	                    _ => self.fill(0, N),
+   417	                }
+   418	            }
+   419	            b'K' => {
+   420	                let (s, c) = (row * W, col.min(W - 1));
+   421	                match self.arg(0, 0) {
+   422	                    0 => self.fill(s + c, s + W),
+   423	                    1 => self.fill(s, s + c + 1),
+   424	                    _ => self.fill(s, s + W),
+   425	                }
+   426	            }
+   427	            b'P' | b'@' | b'X' => {
+   428	                let (s, c) = (row * W, col.min(W - 1));
+   429	                let n = n.min(W - c);
+   430	                match f {
+   431	                    b'P' => {
+   432	                        self.cells.copy_within(s + c + n..s + W, s + c);
+   433	                        self.fill(s + W - n, s + W);
+   434	                    }
+   435	                    b'@' => {
+   436	                        self.cells.copy_within(s + c..s + W - n, s + c + n);
+   437	                        self.fill(s + c, s + c + n);
+   438	                    }
+   439	                    _ => self.fill(s + c, s + c + n),
+   440	                }
+   441	            }
+   442	            b'L' | b'M' => {
+   443	                if row >= self.top && row <= self.bot {
+   444	                    self.scroll(row, self.bot, n, f == b'M');
+   445	                    self.col = 0;
+   446	                }
+   447	            }
+   448	            b'S' => self.scroll(self.top, self.bot, n, true),
+   449	            b'T' if self.np <= 1 => self.scroll(self.top, self.bot, n, false),
+   450	            b'r' => {
+   451	                let (t, b) = (self.arg(0, 1) - 1, self.arg(1, H as u16).min(H) - 1);
+   452	                if t < b {
+   453	                    (self.top, self.bot, self.row, self.col) = (t, b, 0, 0);
+   454	                }
+   455	            }
+   456	            b's' => self.save(),
+   457	            b'u' => self.restore(),
+   458	            _ => return, // 't' (window ops), 'g' (tabs), ...: ignored, keep a pending wrap
+   459	        }
+   460	        if f != b'u' {
+   461	            self.wrap = false;
+   462	        }
+   463	        if matches!(f, b'E' | b'F') {
+   464	            self.col = 0;
+   465	        }
+   466	    }
+   467	
+   468	    pub fn feed(&mut self, b: u8) {
+   469	        if self.need > 0 {
+   470	            if b & 0xC0 == 0x80 {
+   471	                self.utf = (self.utf << 6) | (b & 0x3F) as u32;
+   472	                self.need -= 1;
+   473	                if self.need == 0 {
+   474	                    let cp = self.utf;
+   475	                    let ok = cp >= self.min && !(0xD800..=0xDFFF).contains(&cp) && cp <= 0x10FFFF;
+   476	                    self.print(if ok { cp } else { b'?' as u32 });
+   477	                }
+   478	                return;
+   479	            }
+   480	            self.need = 0; // sequence cut short (by a control, ESC, or a new lead byte): one '?', then this byte
+   481	            self.print(b'?' as u32);
+   482	        }
+   483	        match self.st {
+   484	            St::Ground => match b {
+   485	                0x1B => self.st = St::Esc,
+   486	                b'\r' => {
+   487	                    self.col = 0;
+   488	                    self.wrap = false;
+   489	                }
+   490	                b'\n' | 0x0B | 0x0C => {
+   491	                    self.lf();
+   492	                    self.wrap = false;
+   493	                }
+   494	                0x08 => {
+   495	                    self.col = self.col.min(W - 1).saturating_sub(1);
+   496	                    self.wrap = false;
+   497	                }
+   498	                b'\t' => self.col = ((self.col + 8) & !7).min(W - 1),
+   499	                0x0E => self.gl = 1,
+   500	                0x0F => self.gl = 0,
+   501	                0xC2..=0xF4 => {
+   502	                    let (need, min, mask) = match b {
+   503	                        0xC2..=0xDF => (1, 0x80, 0x1F),
+   504	                        0xE0..=0xEF => (2, 0x800, 0x0F),
+   505	                        _ => (3, 0x10000, 0x07),
+   506	                    };
+   507	                    (self.utf, self.need, self.min) = ((b & mask) as u32, need, min);
+   508	                }
+   509	                0x80..=0xFF => self.print(b'?' as u32), // stray continuation or invalid lead byte (U+FFFD)
+   510	                _ if b < 0x20 || b == 0x7F => {} // BEL and other controls
+   511	                _ => self.print(b as u32),
+   512	            },
+   513	            St::Esc => {
+   514	                self.st = St::Ground;
+   515	                match b {
+   516	                    b'[' => {
+   517	                        self.st = St::Csi;
+   518	                        (self.p, self.np, self.private, self.lead, self.inter) = ([0; 16], 0, false, 0, 0);
+   519	                    }
+   520	                    b']' | b'P' | b'_' | b'^' | b'X' => self.st = St::Str,
+   521	                    b'(' => self.st = St::Charset(0),
+   522	                    b')' => self.st = St::Charset(1),
+   523	                    b'*' | b'+' | b'-' | b'.' | b'/' | b'#' | b'%' | b' ' => self.st = St::EscSkip,
+   524	                    b'7' => self.save(),
+   525	                    b'8' => self.restore(),
+   526	                    b'D' => self.lf(),
+   527	                    b'E' => {
+   528	                        self.col = 0;
+   529	                        self.lf();
+   530	                    }
+   531	                    b'M' => self.ri(),
+   532	                    b'c' => self.reset(),
+   533	                    0x1B => self.st = St::Esc,
+   534	                    _ => {} // '=', '>' (keypad modes), 'H' (tab set), ...
+   535	                }
+   536	                if matches!(b, b'D' | b'E' | b'M') {
+   537	                    self.wrap = false;
+   538	                }
+   539	            }
+   540	            St::Charset(i) => {
+   541	                self.g[i as usize] = b == b'0';
+   542	                self.st = St::Ground;
+   543	            }
+   544	            St::EscSkip => self.st = St::Ground,
+   545	            St::Csi => match b {
+   546	                b'0'..=b'9' => {
+   547	                    if self.np == 0 {
+   548	                        self.np = 1;
+   549	                    }
+   550	                    if let Some(v) = self.p.get_mut(self.np - 1) {
+   551	                        *v = v.saturating_mul(10).saturating_add((b - b'0') as u16);
+   552	                    }
+   553	                }
+   554	                b';' => self.np = self.np.max(1) + 1,
+   555	                b':' => self.inter = b':', // colon sub-parameters (38:2::r:g:b): sequence ignored, not misparsed
+   556	                b'?' | b'>' | b'<' | b'=' => (self.private, self.lead) = (true, b),
+   557	                0x20..=0x2F => self.inter = b,
+   558	                0x40..=0x7E => {
+   559	                    self.st = St::Ground;
+   560	                    self.csi(b);
+   561	                }
+   562	                0x1B => self.st = St::Esc,
+   563	                _ => {} // controls inside CSI: ignored
+   564	            },
+   565	            St::Str => match b {
+   566	                0x07 => self.st = St::Ground,
+   567	                0x1B => self.st = St::StrEsc,
+   568	                _ => {}
+   569	            },
+   570	            St::StrEsc => self.st = if b == b'\\' { St::Ground } else { St::Str },
+   571	        }
+   572	    }
+   573	}
+   574	
+   575	/// DEC special graphics 0x5F..0x7E -> CP437. Glyphs CP437 lacks fall back to the nearest one.
+   576	const DEC_GRAPHICS: [u8; 32] = [
+   577	    b' ', // _ blank
+   578	    0x04, // ` diamond
+   579	    0xB1, // a checkerboard
+   580	    b' ', // b HT symbol
+[package]
+name = "nc110-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+neg-control = []
+grub-armed = []
+badpin = []  # negative control: flip one bit of the pinned host key
+badjitter = []  # negative control: constant TSC in the jitter source, startup health test must refuse SSH
+
+[dependencies]
+# M2: pinned exact versions (Cargo.lock is committed too).
+sunset = { version = "=0.6.0", default-features = false }
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-tcp", "socket-dhcpv4"] }
+getrandom = { version = "0.4", default-features = false }
+log = "0.4"
+heapless = { version = "=0.9.3", default-features = false }  # M3: sunset::Pty.term is a heapless::String
+sha2 = { version = "=0.11.1", default-features = false }
+
+[[bin]]
+name = "nc110-kernel"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+#!/bin/sh
+# Host unit tests for src/term.rs (the kernel's VGA terminal), then the mutant check (each feature stubbed -> red).
+set -e
+D=$(cd "$(dirname "$0")" && pwd)
+mkdir -p "$D/../target/host"
+rustc --edition 2021 --test "$D/term_test.rs" -o "$D/../target/host/term_test"
+"$D/../target/host/term_test" --test-threads 1
+python3 "$D/term-mutants.py"
+   345	                    }
+   346	                }
+   347	            }
+   348	        }
+   349	
+   350	        // channel data -> VGA terminal (+ serial mirror)
+   351	        if let Some(c) = &chan {
+   352	            if winch {
+   353	                winch = false;
+   354	                let w = sunset::packets::WinChange { cols: 80, rows: 25, width: 0, height: 0 };
+   355	                kprintln!("ssh: window-change 80x25 ({:?})", runner.term_window_change(c, &w).is_ok());
+   356	            }
+   357	            let mut drew = false;
+   358	            while let Some((_num, dt, _len)) = runner.read_channel_ready() {
+   359	                let mut buf = [0u8; 512];
+   360	                match runner.read_channel(c, dt, &mut buf) {
+   361	                    Ok(0) => break,
+   362	                    Ok(n) => {
+   363	                        if !got_output {
+   364	                            kprintln!("ssh(d): first shell output ({} bytes)", n);
+   365	                            got_output = true;
+   366	                        }
+   367	                        for &b in &buf[..n] {
+   368	                            term::feed(b);
+   369	                            if b == 0x1B {
+   370	                                console::serial_raw(b'^');
+   371	                                console::serial_raw(b'[');
+   372	                            } else {
+   373	                                console::serial_raw(b);
+   374	                            }
+   375	                        }
+   376	                        drew = true;
+   377	                    }
+   378	                    Err(_) => break,
+   379	                }
+   380	            }
+   381	            if drew {
+   382	                term::flush();
+   383	            }
+   384	            // terminal replies (DSR/DA) go out ahead of keys typed later; they share the keyboard queue
+   385	            nkeys += term::take_reply(&mut keys[nkeys..]);
+   386	
+   387	            // keyboard -> channel (whatever does not fit now stays queued; the i8042 holds the rest)
+   388	            if shell_open && !finished {
+   389	                if kbd::poll(&mut keys, &mut nkeys) {
+   390	                    kprintln!("\r\nkbd: Ctrl-Alt-Del -> hard reset");
+   391	                    wdt::hard_reset();
+   392	                }
+   393	                if nkeys > 0 {
+   394	                    match runner.write_channel(c, ChanData::Normal, &keys[..nkeys]) {
+   395	                        Ok(n) => {
+   396	                            keys.copy_within(n..nkeys, 0);
+   397	                            nkeys -= n;
+   398	                        }
+   399	                        Err(_) => nkeys = 0, // channel gone; the close check below ends the session
+   400	                    }
+   401	                }
+   402	            }
+   403	
+   404	            if runner.is_channel_eof(c) || runner.is_channel_closed(c) {
+   405	                if !finished {
+   406	                    finished = true;
+   407	                    kprintln!("\r\nssh: shell channel closed, disconnecting");
+   408	                    runner.close_output();
+   409	                }
+   410	            }
+   411	        }
+   412	
+   413	        // runner -> network
+   414	        let sock = sockets.get_mut::<tcp::Socket>(tcp_h);
+   415	        while sock.can_send() {
+   416	            let out = runner.output_buf();
+   417	            if out.is_empty() {
+   418	                break;
+   419	            }
+   420	            match sock.send_slice(out) {
+   421	                Ok(0) | Err(_) => break,
+   422	                Ok(n) => runner.consume_output(n),
+   423	            }
+   424	        }
+   425	        if finished {
+
+web search: 
+web search: site.x.org VGA Attribute Controller palette address source bit 5 mode control 0x10 ...
+exec
+/bin/zsh -lc "rg -n 'term_window_change|fn poll|nkeys|overflow-checks' src/kbd.rs .cargo ~/.cargo/registry/src/*/sunset-0.6.0/src; rg --files -g AGENTS.md -g '*wcwidth*' -g '*term*' target/host tools | head -40" in ~/nc110-baremetal
+ succeeded in 0ms:
+src/kbd.rs:217:pub fn poll(buf: &mut [u8], len: &mut usize) -> bool {
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs:733:    pub fn term_window_change(
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs:740:            self.conn.channels.term_window_change(chan.0, winch, &mut s)
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/sign.rs:604:                trace!("Can't encode agent signkeys");
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/channel.rs:268:    pub(crate) fn term_window_change(
+target/host/term_test
+target/host/term_replay
+tools/term_test.rs
+tools/term-mutants.py
+tools/term_replay.rs
+tools/test-term.sh
+tools/term-vs-pyte.py
+
+codex
+The reply bytes are fixed strings or bounded cursor coordinates; I haven’t found a way to inject arbitrary text or overrun the CPR buffer. The main concern so far is the Unicode width table: it misses combining marks and some wide characters, which can shift application columns. I’m checking the margin behavior and VGA sequence before ranking the findings.
+web search: 
+exec
+/bin/zsh -lc "sed -n '260,290p' ~/.cargo/registry/src/*/sunset-0.6.0/src/channel.rs; sed -n '210,270p' src/kbd.rs; cat tools/term_replay.rs; nl -ba src/term.rs | sed -n '780,840p'; target/host/term_test --test-threads 1" in ~/nc110-baremetal
+ succeeded in 0ms:
+
+    /// Wake all ready output channels
+    pub fn wake_write(&mut self, is_client: bool) {
+        for ch in self.ch.iter_mut().filter_map(|c| c.as_mut()) {
+            ch.wake_write(is_client)
+        }
+    }
+
+    pub(crate) fn term_window_change(
+        &self,
+        num: ChanNum,
+        winch: &packets::WinChange,
+        s: &mut TrafSend,
+    ) -> Result<()> {
+        let ch = self.get(num)?;
+        match ch.ty {
+            ChanType::Session => Req::WinChange(winch.clone()).send(ch, s),
+            _ => error::BadChannelData.fail(),
+        }
+    }
+
+    pub(crate) fn term_break(
+        &self,
+        num: ChanNum,
+        length: u32,
+        s: &mut TrafSend,
+    ) -> Result<()> {
+        let ch = self.get(num)?;
+        let br = packets::Break {
+            length: if length == 0 { 0 } else { length.clamp(500, 3000) },
+        };
+    }
+}
+
+/// Poll the controller and append the bytes typed so far to `buf[*len..]`. Mouse (AUX) bytes are dropped.
+/// Always drains the controller so modifier releases are never missed; if `buf` is full (the SSH channel is not
+/// taking input), the key's bytes are dropped and counted rather than left to overflow the controller.
+/// Returns true on Ctrl-Alt-Del.
+pub fn poll(buf: &mut [u8], len: &mut usize) -> bool {
+    unsafe {
+        if !ENABLED {
+            drain();
+            return false;
+        }
+        for _ in 0..64 {
+            let st = inb(STATUS);
+            if st & 1 == 0 {
+                break;
+            }
+            let sc = inb(DATA);
+            if st & 0x20 != 0 {
+                continue; // AUX (touchpad) byte
+            }
+            if E0 && sc == 0x53 && (CTRL_L || CTRL_R) && (ALT_L || ALT_R) {
+                return true;
+            }
+            let mut tmp = [0u8; 8];
+            let n = translate(sc, &mut tmp);
+            if buf.len() - *len >= n {
+                buf[*len..*len + n].copy_from_slice(&tmp[..n]);
+                *len += n;
+            } else {
+                DROPPED = DROPPED.wrapping_add(1);
+            }
+        }
+        false
+    }
+}
+
+/// Keys dropped because the channel was not taking input.
+pub fn dropped() -> u32 {
+    unsafe { DROPPED }
+}
+//! Replay a byte stream through src/term.rs on the host and print the grid as hex cells (one row per line).
+//! Usage: term_replay <file> [<byte offset to stop at>]. Used by tools/term-vs-pyte.py.
+#[path = "../src/term.rs"]
+#[allow(dead_code)]
+mod term;
+
+fn main() {
+    let a: Vec<String> = std::env::args().collect();
+    let data = std::fs::read(&a[1]).unwrap();
+    let end = a.get(2).map(|s| s.parse().unwrap()).unwrap_or(data.len());
+    let mut t = Box::new(term::Term::new());
+    for &b in &data[..end] {
+        t.feed(b);
+    }
+    for r in 0..term::H {
+        println!("{}", (0..term::W).map(|c| format!("{:04x}", t.cell(r, c))).collect::<Vec<_>>().join(" "));
+    }
+    let (r, c) = t.cursor();
+    println!("cursor {r} {c} {}", t.cursor_visible());
+}
+   780	    match CP437.binary_search_by_key(&cp, |&(u, _)| u as u32) {
+   781	        Ok(i) => CP437[i].1,
+   782	        Err(_) => b'?',
+   783	    }
+   784	}
+   785	
+   786	/// Cells a character takes, wcwidth-style: 0 for combining marks and zero-width characters, 2 for East Asian
+   787	/// Wide/Fullwidth (CJK, Hangul, fullwidth forms, most emoji), else 1.
+   788	fn width(cp: u32) -> usize {
+   789	    const ZERO: [(u32, u32); 8] = [(0x0300, 0x036F), (0x0483, 0x0489), (0x0591, 0x05BD), (0x200B, 0x200F), (0x20D0, 0x20FF), (0xFE00, 0xFE0F), (0xFE20, 0xFE2F), (0xE0100, 0xE01EF)];
+   790	    const WIDE: [(u32, u32); 13] = [
+   791	        (0x1100, 0x115F), (0x2E80, 0x303E), (0x3041, 0x33FF), (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xA000, 0xA4CF),
+   792	        (0xAC00, 0xD7A3), (0xF900, 0xFAFF), (0xFE30, 0xFE4F), (0xFF00, 0xFF60), (0xFFE0, 0xFFE6), (0x1F300, 0x1F64F),
+   793	        (0x1F900, 0x1F9FF),
+   794	    ];
+   795	    if (0x80..0xA0).contains(&cp) || ZERO.iter().any(|&(a, b)| (a..=b).contains(&cp)) {
+   796	        0 // C1 controls are not printed either
+   797	    } else if WIDE.iter().any(|&(a, b)| (a..=b).contains(&cp)) || (0x20000..=0x3FFFD).contains(&cp) {
+   798	        2
+   799	    } else {
+   800	        1
+   801	    }
+   802	}
+   803	
+   804	#[cfg(not(test))]
+   805	mod hw {
+   806	    use super::{Term, N, W};
+   807	    use crate::port::{inb, outb};
+   808	
+   809	    const VGA: *mut u16 = 0xB8000 as *mut u16;
+   810	    static mut TERM: Term = Term::new();
+   811	
+   812	    pub fn t() -> &'static mut Term {
+   813	        unsafe { &mut *core::ptr::addr_of_mut!(TERM) }
+   814	    }
+   815	
+   816	    /// Attribute Controller index 0x10 (mode control) bit 3: 1 = attribute bit 7 blinks, 0 = it selects the bright
+   817	    /// background colours 8..15. Returns (before, after). Index 0x30 keeps PAS (bit 5) set so the screen stays on.
+   818	    pub fn blink_off() -> (u8, u8) {
+   819	        unsafe {
+   820	            inb(0x3DA); // reset the index/data flip-flop
+   821	            outb(0x3C0, 0x30);
+   822	            let old = inb(0x3C1);
+   823	            outb(0x3C0, old & !0x08);
+   824	            inb(0x3DA);
+   825	            outb(0x3C0, 0x30);
+   826	            let new = inb(0x3C1);
+   827	            inb(0x3DA);
+   828	            outb(0x3C0, 0x20); // leave the flip-flop at index with PAS set
+   829	            (old, new)
+   830	        }
+   831	    }
+   832	
+   833	    pub fn flush() {
+   834	        let t = t();
+   835	        for i in 0..N {
+   836	            unsafe { VGA.add(i).write_volatile(t.cells[i]) }
+   837	        }
+   838	        let pos = (t.row * W + t.col.min(W - 1)) as u16;
+   839	        unsafe {
+   840	            outb(0x3D4, 0x0A);
+
+running 29 tests
+test alternate_screen_1049_restores_main_grid_and_cursor ... ok
+test autowrap_off_overwrites_last_column ... ok
+test bright_backgrounds_and_resets ... ok
+test cursor_visibility ... ok
+test dcs_and_osc_are_swallowed ... ok
+test dec_line_drawing_to_cp437 ... ok
+test decckm_for_the_keyboard ... ok
+test decstbm_homes_the_cursor ... ok
+test deferred_wrap_survives_sgr ... ok
+test device_attributes ... ok
+test dsr_replies ... ok
+test erase_uses_current_background_bce ... ok
+test full_screen_scroll_still_works ... ok
+test insert_delete_char ... ok
+test insert_delete_line_stay_inside_region ... ok
+test intermediate_csi_is_not_misread ... ok
+test rep_repeats_last_char ... ok
+test reply_buffer_is_bounded_and_drains_partially ... ok
+test reverse_index_at_region_top_scrolls_region_down ... ok
+test reverse_video ... ok
+test save_restore_cursor_and_attributes ... ok
+test scroll_region_lf_scrolls_only_the_region ... ok
+test scroll_up_down_su_sd ... ok
+test sgr_256_and_private_m_do_not_misparse ... ok
+test sgr_colours_map_to_vga ... ok
+test soft_and_hard_reset ... ok
+test utf8_invalid_and_interrupted ... ok
+test utf8_to_cp437 ... ok
+test wide_chars_take_two_cells ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+web search: https://raw.githubusercontent.com/ThomasDickey/xterm-snapshots/master/charproc.c
+web search: 
+web search: 'width == 2'
+exec
+/bin/zsh -lc "python3 -c 'import subprocess; cases = {\"kana combining\": \"\\u304b\\u3099X\", \"arabic combining\": \"\\u0628\\u064eX\", \"wide rocket\": \"\\U0001f680X\", \"wide no wrap\": \"\\x1b[?7l\\x1b[1;80H中\", \"wide insert\": \"abcdef\\r\\x1b[4h中\"}; [(print(label, repr(bytes(int(c,16)&255 for c in (out:=subprocess.run([\"target/host/term_replay\",\"/dev/stdin\"],input=data.encode(),capture_output=True,check=True).stdout.decode().splitlines())[0].split()).rstrip()), out[-1])) for label,data in cases.items()]'" in ~/nc110-baremetal
+ exited 1 in 0ms:
+  File "<string>", line 1
+SyntaxError: assignment expression cannot be used in a comprehension iterable expression
+
+web search: 
+web search: 
+exec
+/bin/zsh -lc "python3 -c 'import subprocess, tempfile
+with tempfile.TemporaryDirectory(prefix=\"m45-review-\") as d:
+ subprocess.run([\"rustc\", \"--edition\", \"2021\", \"--test\", \"tools/term_test.rs\", \"-o\", d+\"/tests\"], check=True)
+ subprocess.run([d+\"/tests\", \"--test-threads\", \"1\"], check=True)
+ subprocess.run([\"rustc\", \"--edition\", \"2021\", \"--cfg\", \"test\", \"tools/term_replay.rs\", \"-o\", d+\"/replay\"], check=True)
+ cases = {\"kana combining\": \"\\u304b\\u3099X\", \"arabic combining\": \"\\u0628\\u064eX\", \"wide rocket\": \"\\U0001f680X\", \"wide no wrap\": \"\\x1b[?7l\\x1b[1;80H中\", \"wide insert\": \"abcdef\\r\\x1b[4h中\"}
+ for label,data in cases.items():
+  out=subprocess.run([d+\"/replay\",\"/dev/stdin\"],input=data.encode(),capture_output=True,check=True).stdout.decode().splitlines()
+  print(label, repr(bytes(int(c,16)&255 for c in out[0].split()).rstrip()), out[-1])
+'" in ~/nc110-baremetal
+ succeeded in 1420ms:
+
+running 29 tests
+test alternate_screen_1049_restores_main_grid_and_cursor ... ok
+test autowrap_off_overwrites_last_column ... ok
+test bright_backgrounds_and_resets ... ok
+test cursor_visibility ... ok
+test dcs_and_osc_are_swallowed ... ok
+test dec_line_drawing_to_cp437 ... ok
+test decckm_for_the_keyboard ... ok
+test decstbm_homes_the_cursor ... ok
+test deferred_wrap_survives_sgr ... ok
+test device_attributes ... ok
+test dsr_replies ... ok
+test erase_uses_current_background_bce ... ok
+test full_screen_scroll_still_works ... ok
+test insert_delete_char ... ok
+test insert_delete_line_stay_inside_region ... ok
+test intermediate_csi_is_not_misread ... ok
+test rep_repeats_last_char ... ok
+test reply_buffer_is_bounded_and_drains_partially ... ok
+test reverse_index_at_region_top_scrolls_region_down ... ok
+test reverse_video ... ok
+test save_restore_cursor_and_attributes ... ok
+test scroll_region_lf_scrolls_only_the_region ... ok
+test scroll_up_down_su_sd ... ok
+test sgr_256_and_private_m_do_not_misparse ... ok
+test sgr_colours_map_to_vga ... ok
+test soft_and_hard_reset ... ok
+test utf8_invalid_and_interrupted ... ok
+test utf8_to_cp437 ... ok
+test wide_chars_take_two_cells ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+kana combining b'????X' cursor 0 5 true
+arabic combining b'??X' cursor 0 3 true
+wide rocket b'?X' cursor 0 2 true
+wide no wrap b'                                                                               ?' cursor 0 79 true
+wide insert b'??abcdef' cursor 0 2 true
+
+codex
+Most is sound. I rebuilt and ran all 29 host tests successfully, and reproduced two rendering issues. I found no new release-build panic/OOB or arbitrary-byte reply injection.
+
+- **MUST-FIX — Incomplete width tables desynchronize application columns.** [src/term.rs:789](~/nc110-baremetal/src/term.rs:789) declares `const ZERO: [(u32, u32); 8]`; line 791 classifies all `(0x3041, 0x33FF)` as wide. Consequently, `か\u3099X` renders `????X` instead of `??X`: the combining dakuten consumes two cells. Arabic U+064E similarly consumes one, while 🚀 incorrectly consumes one instead of two. These are ordinary text cases, supported by [Unicode’s combining categories](https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedGeneralCategory.txt) and [width data](https://www.unicode.org/Public/17.0.0/ucd/EastAsianWidth.txt). **Fix:** generate compact interval tables from a pinned Unicode/wcwidth version, checking zero-width before wide; add these three regression cases.
+
+- **WORTH-IMPROVING — Wide characters overwrite the last column with autowrap disabled.** [src/term.rs:241](~/nc110-baremetal/src/term.rs:241): `self.put(b'?'); self.put(b'?');`. With `CSI ?7l`, column 80, then `中`, both writes hit the same cell. This destroys existing content even though the character cannot fit; [xterm’s write path](https://raw.githubusercontent.com/ThomasDickey/xterm-snapshots/master/charproc.c) skips that unfit character. **Fix:** explicitly handle width-two/no-room/autowrap-off before either write; preserve the cell and cursor. Test with a sentinel at column 80, including insert mode.
+
+The bounded reply buffer and eight-byte CPR construction look sound: cursor coordinates remain within 25×80, and replies contain fixed protocol bytes plus bounded decimal coordinates. The UTF-8 decoder rejects overlong encodings, surrogates and out-of-range scalars, and correctly reprocesses an interrupting ESC. Two successive insertions work when both wide-character cells fit. The CP437 fallback and dropping whole replies under pressure are defensible choices.
+
+The VGA mode-control sequence looks correct for the existing color-text-mode setup; PAS does not prohibit accessing mode-control register 0x10. [Register documentation](https://web.eecs.umich.edu/~ryanph/jhu/cs318/fall19/project/specs/freevga/vga/attrreg.htm). **COSMETIC-SKIP:** line 828’s “leave the flip-flop at index” comment is inaccurate—the final address write leaves it expecting data. Correct the comment; this does not invalidate the blink change.
+
+**Score: 8/10. Highest-leverage fix: replace the handwritten Unicode width ranges with generated, versioned tables.**
+tokens used
+54,959
+Most is sound. I rebuilt and ran all 29 host tests successfully, and reproduced two rendering issues. I found no new release-build panic/OOB or arbitrary-byte reply injection.
+
+- **MUST-FIX — Incomplete width tables desynchronize application columns.** [src/term.rs:789](~/nc110-baremetal/src/term.rs:789) declares `const ZERO: [(u32, u32); 8]`; line 791 classifies all `(0x3041, 0x33FF)` as wide. Consequently, `か\u3099X` renders `????X` instead of `??X`: the combining dakuten consumes two cells. Arabic U+064E similarly consumes one, while 🚀 incorrectly consumes one instead of two. These are ordinary text cases, supported by [Unicode’s combining categories](https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedGeneralCategory.txt) and [width data](https://www.unicode.org/Public/17.0.0/ucd/EastAsianWidth.txt). **Fix:** generate compact interval tables from a pinned Unicode/wcwidth version, checking zero-width before wide; add these three regression cases.
+
+- **WORTH-IMPROVING — Wide characters overwrite the last column with autowrap disabled.** [src/term.rs:241](~/nc110-baremetal/src/term.rs:241): `self.put(b'?'); self.put(b'?');`. With `CSI ?7l`, column 80, then `中`, both writes hit the same cell. This destroys existing content even though the character cannot fit; [xterm’s write path](https://raw.githubusercontent.com/ThomasDickey/xterm-snapshots/master/charproc.c) skips that unfit character. **Fix:** explicitly handle width-two/no-room/autowrap-off before either write; preserve the cell and cursor. Test with a sentinel at column 80, including insert mode.
+
+The bounded reply buffer and eight-byte CPR construction look sound: cursor coordinates remain within 25×80, and replies contain fixed protocol bytes plus bounded decimal coordinates. The UTF-8 decoder rejects overlong encodings, surrogates and out-of-range scalars, and correctly reprocesses an interrupting ESC. Two successive insertions work when both wide-character cells fit. The CP437 fallback and dropping whole replies under pressure are defensible choices.
+
+The VGA mode-control sequence looks correct for the existing color-text-mode setup; PAS does not prohibit accessing mode-control register 0x10. [Register documentation](https://web.eecs.umich.edu/~ryanph/jhu/cs318/fall19/project/specs/freevga/vga/attrreg.htm). **COSMETIC-SKIP:** line 828’s “leave the flip-flop at index” comment is inaccurate—the final address write leaves it expecting data. Correct the comment; this does not invalidate the blink change.
+
+**Score: 8/10. Highest-leverage fix: replace the handwritten Unicode width ranges with generated, versioned tables.**

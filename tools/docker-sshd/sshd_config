@@ -1,0 +1,16 @@
+# Throwaway sshd for the real-NC110 SSH test (container only; test keys from the repo, never homelab keys).
+Port 22
+HostKey /keys/host_ed25519
+HostKeyAlgorithms ssh-ed25519
+KexAlgorithms curve25519-sha256
+Ciphers chacha20-poly1305@openssh.com
+PubkeyAcceptedAlgorithms ssh-ed25519
+AuthorizedKeysFile /keys/authorized_keys
+AuthenticationMethods publickey
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+StrictModes no
+PermitRootLogin no
+AllowUsers evnchn
+ForceCommand /bin/sh -c 'echo "nc110-ssh-ok from container $(hostname) at $(date -u +%H:%M:%S)"; uname -sm; sleep 2; exit 0'
+LogLevel DEBUG1

@@ -1,0 +1,2327 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a14cc5-b8b5-7092-a88a-6be7b3551d4e
+--------
+user
+Follow-up: your review proof/codex-review-peek.txt (5/10, MUST-FIX io overflow and NM10 LV2-4 C-state reads). Fix commit HEAD (git show HEAD). Verify both MUST-FIX closed (check each allowlisted PM/TCO offset/width against the NM10 datasheet for read side effects; is TCO DAT_IN 0x62/1 safe to read?), and the test cases now fail properly. Brief, tiered, end 0-10. Do not edit.
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll review HEAD and the prior findings, verify the allowlisted reads against the NM10 datasheet, and check that the regression tests catch both issues without editing files.
+exec
+/bin/zsh -lc 'git show HEAD --stat && git status --short && cat proof/codex-review-peek.txt' in ~/nc110-baremetal
+ succeeded in 0ms:
+commit 97a82b4d9eeb8f61957ad0a45f31de029e423279
+Author: evnchn <user1@example.invalid>
+Date:   Sun Oct 18 10:09:45 2026 +0800
+
+    bmctl peek: explicit PM/TCO register+width allowlist (LV2-4 C-state registers excluded), checked port math; stricter q35 peek cases incl. C2 register, wraps, straddles, 4 GiB (Codex peek MUST-FIX x2)
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+ src/bmctl.rs            | 18 ++++++++++++++----
+ tools/bmctl-q35-test.sh | 14 +++++++++++---
+ 2 files changed, 25 insertions(+), 7 deletions(-)
+?? grub-test/wdt-locked-accept.iso
+?? grub-test/wdt-locked-refuse.iso
+?? proof/codex-review-bmctl-followup.txt
+?? proof/codex-review-bmctl-followup2.txt
+?? proof/codex-review-bmctl.txt
+?? proof/codex-review-overnight2.txt
+?? proof/codex-review-peek-followup.txt
+?? proof/codex-review-peek.txt
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a14cc3-5502-7d91-9e3e-4ebfa2f102b7
+--------
+user
+Calibrated security review of commit cde7343 (git show cde7343): an allowlisted read-only 'peek' command added to the authenticated bmctl channel (src/bmctl.rs, src/mb.rs ram_contains, linker.ld symbols __load_start/__bss_end, boot.s .bss stack/page tables). Policy: RAM only fully inside one multiboot available range and below 4 GiB (identity-mapped 2 MiB pages), never overlapping the kernel image [__load_start,__bss_end); NIC MMIO window dword reads inside 0..0x100 of the RTL8105E/8139 BAR; port reads only PMBASE..+0x80 (NM10 ACPI PM + TCO). Real target: Samsung NC110 (NM10, RTL8105E). Attack: secrets outside the kernel image (multiboot info/cmdline, the wiped key module region, GRUB leftovers in RAM like the key file it read or grub.cfg, the multiboot memory map entries themselves), address arithmetic, reads that can fault or hang (holes, MMIO mis-typed as RAM by firmware), side-effecting NIC or PM/TCO register reads (any read-to-clear in that window on RTL8105E or NM10 PM?), and the q35 test (tools/bmctl-q35-test.sh) coverage. Tier MUST-FIX/SHOULD-FIX/NIT, brief. Do not edit. End 0-10.
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll inspect the commit and test coverage, then check the chipset register documentation for read side effects.
+exec
+/bin/zsh -lc 'git show cde7343 --stat && git show cde7343' in ~/nc110-baremetal
+ succeeded in 0ms:
+commit cde73438da0818d07b9906703adb7eaeba414dc0
+Author: evnchn <user1@example.invalid>
+Date:   Sun Oct 18 10:07:02 2026 +0800
+
+    bmctl peek: allowlisted read-only mem (multiboot RAM, never the kernel image), NIC MMIO window (aligned dwords), PM/TCO ports; q35 cases p1-p9 incl. refusals
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+ src/bmctl.rs            | 70 +++++++++++++++++++++++++++++++++++++++++++++++--
+ src/mb.rs               |  9 +++++++
+ src/wdt.rs              |  2 +-
+ tools/bmctl-q35-test.sh | 12 ++++++++-
+ 4 files changed, 89 insertions(+), 4 deletions(-)
+commit cde73438da0818d07b9906703adb7eaeba414dc0
+Author: evnchn <user1@example.invalid>
+Date:   Sun Oct 18 10:07:02 2026 +0800
+
+    bmctl peek: allowlisted read-only mem (multiboot RAM, never the kernel image), NIC MMIO window (aligned dwords), PM/TCO ports; q35 cases p1-p9 incl. refusals
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/src/bmctl.rs b/src/bmctl.rs
+index 283e4ec..0bb6b80 100644
+--- a/src/bmctl.rs
++++ b/src/bmctl.rs
+@@ -9,8 +9,12 @@
+ //! kernel never reissues a session number in a boot. A session binds to the endpoint that asked `who`; pending and authenticated sessions live in separate tables.
+ //! A duplicate of the last accepted seq gets the cached reply bytes back (safe UDP retries, nothing re-executed).
+ //! The loop pets the watchdog; 10 minutes without a valid command -> 0xCF9 reset.
++//! `peek` is read-only and allowlisted (see `peek`): RAM only inside the multiboot map and never the kernel image
++//! (text, data, bss: stack, session table, keys), NIC registers only inside its 256-byte MMIO window as aligned
++//! dwords, ports only the ACPI PM block (PMBASE..+0x80, which contains the TCO); everything else is refused.
+ use crate::net::Nic;
+-use crate::nic::Rtl;
++use crate::nic::{Bus, Rtl};
++use crate::port::{inb, inl, inw};
+ use crate::{console, kprintln, rng, time, wdt};
+ use chacha20::cipher::{KeyIvInit, StreamCipher};
+ use chacha20::ChaCha20;
+@@ -129,7 +133,62 @@ fn hex(b: &[u8], out: &mut heapless::String<64>) {
+     }
+ }
+ 
++extern "C" {
++    static __load_start: u8;
++    static __bss_end: u8;
++}
++
++/// Allowlisted read. Returns Err(reason) for anything outside the policy; never touches refused addresses.
++fn peek(w: &mut Writer, nic_mmio: Option<u64>, what: &str, a: &str, b: &str) -> Result<(), &'static str> {
++    let addr = u64::from_str_radix(a.trim_start_matches("0x"), 16).map_err(|_| "addr: hex")?;
++    let n: u64 = b.parse().map_err(|_| "len/width: decimal")?;
++    match what {
++        "mem" => {
++            if n == 0 || n > 512 {
++                return Err("len 1..512");
++            }
++            let end = addr.checked_add(n).ok_or("overflow")?;
++            let (ks, ke) = (core::ptr::addr_of!(__load_start) as u64, core::ptr::addr_of!(__bss_end) as u64);
++            if addr < ke && ks < end {
++                return Err("refused: kernel image (code, stack, keys)");
++            }
++            if end > 0x1_0000_0000 || !crate::mb::ram_contains(addr, n) {
++                return Err("refused: not inside one multiboot RAM range below 4 GiB");
++            }
++            for i in 0..n {
++                let v = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
++                let _ = core::fmt::write(w, format_args!("{:02x}", v));
++            }
++        }
++        "nic" => {
++            let base = nic_mmio.ok_or("refused: NIC not on MMIO")?;
++            if addr % 4 != 0 || n % 4 != 0 || n == 0 || addr.checked_add(n).is_none_or(|e| e > 0x100) {
++                return Err("nic: dword-aligned offset/len inside 0..0x100");
++            }
++            for o in (addr..addr + n).step_by(4) {
++                let v = unsafe { core::ptr::read_volatile((base + o) as *const u32) };
++                let _ = core::fmt::write(w, format_args!("{:08x} ", v));
++            }
++        }
++        "io" => {
++            let pm = wdt::pmbase() as u64;
++            if pm == 0 || !matches!(n, 1 | 2 | 4) || addr % n != 0 || addr < pm || addr + n > pm + 0x80 {
++                return Err("io: width 1|2|4, aligned, inside PMBASE..PMBASE+0x80 only");
++            }
++            let p = addr as u16;
++            let v = unsafe { match n { 1 => inb(p) as u32, 2 => inw(p) as u32, _ => inl(p) } };
++            let _ = core::fmt::write(w, format_args!("{:#x}", v));
++        }
++        _ => return Err("peek mem <hexaddr> <len> | peek nic <hexoff> <len> | peek io <hexport> <1|2|4>"),
++    }
++    Ok(())
++}
++
+ pub fn run(nic: Rtl, seed: [u8; 32]) {
++    let nic_mmio = match nic.bus {
++        Bus::Mmio(b) => Some(b),
++        Bus::Pio(_) => None,
++    };
+     if rng::init(false).is_err() {
+         return;
+     }
+@@ -299,12 +358,19 @@ pub fn run(nic: Rtl, seed: [u8; 32]) {
+                     let s = &l[st..st.saturating_add(1200).min(l.len())];
+                     w.put(s);
+                 }
++                "peek" => {
++                    let (what, x, y) = (it.next().unwrap_or(""), it.next().unwrap_or(""), it.next().unwrap_or(""));
++                    if let Err(e) = peek(&mut w, nic_mmio, what, x, y) {
++                        w.n = 0;
++                        let _ = core::fmt::write(&mut w, format_args!("err {}", e));
++                    }
++                }
+                 "reboot" => {
+                     let _ = core::fmt::write(&mut w, format_args!("rebooting in 500 ms"));
+                     reboot_at = Some(t + 500);
+                 }
+                 _ => {
+-                    let _ = core::fmt::write(&mut w, format_args!("err unknown command (ping|stats|log <off>|reboot)"));
++                    let _ = core::fmt::write(&mut w, format_args!("err unknown command (ping|stats|log <off>|peek ...|reboot)"));
+                 }
+             }
+             w.n
+diff --git a/src/mb.rs b/src/mb.rs
+index 1d4da83..420cefd 100644
+--- a/src/mb.rs
++++ b/src/mb.rs
+@@ -62,6 +62,15 @@ pub fn ram_overlaps(base: u64, len: u64) -> bool {
+     }
+ }
+ 
++/// True only if [base, base+len) lies entirely inside ONE available-RAM range of the multiboot map.
++pub fn ram_contains(base: u64, len: u64) -> bool {
++    let Some(end) = base.checked_add(len) else { return false };
++    unsafe {
++        let ram = &*core::ptr::addr_of!(RAM);
++        HAVE_MAP && ram[..NRAM].iter().any(|&(b, l)| base >= b && end <= b.saturating_add(l))
++    }
++}
++
+ pub fn cmdline(info: u64) -> &'static str {
+     unsafe {
+         if info == 0 || rd32(info) & 4 == 0 {
+diff --git a/src/wdt.rs b/src/wdt.rs
+index 9a508ea..af5f14d 100644
+--- a/src/wdt.rs
++++ b/src/wdt.rs
+@@ -34,7 +34,7 @@ pub fn armed() -> bool {
+     matches!(rd(addr_of!(tco_result)), 0 | 4 | 5)
+ }
+ 
+-fn pmbase() -> u16 {
++pub fn pmbase() -> u16 {
+     (pci::read32(pci::b0(31, 0), 0x40) & 0xFF80) as u16
+ }
+ 
+diff --git a/tools/bmctl-q35-test.sh b/tools/bmctl-q35-test.sh
+index 0c136f5..eb1eccd 100755
+--- a/tools/bmctl-q35-test.sh
++++ b/tools/bmctl-q35-test.sh
+@@ -2,7 +2,7 @@
+ # q35 check of bmctl: positive path + wrong key + replay + tamper + other-boot + retry cache. Exit 1 on any failure.
+ K=target/attended/x86_64-unknown-none/release/nc110-kernel; P=tools/.venv/bin/python; fail=0
+ qemu-system-x86_64 -machine q35 -m 128 -display none -no-reboot -global ICH9-LPC.noreboot=false -serial file:/tmp/bmctl-q35.log \
+-  -kernel $K -initrd test-keys/client.key -append "bmctl" -netdev user,id=n0,hostfwd=udp:127.0.0.1:15515-:5515 -device rtl8139,netdev=n0 &
++  -kernel $K -initrd test-keys/client.key -append "bmctl nic=mmio" -netdev user,id=n0,hostfwd=udp:127.0.0.1:15515-:5515 -device rtl8139,netdev=n0 &
+ Q=$!; trap 'kill $Q 2>/dev/null' EXIT
+ for i in $(seq 40); do grep -q 'bmctl: listening' /tmp/bmctl-q35.log 2>/dev/null && break; sleep 0.5; done
+ B="$P tools/bmctl.py --host 127.0.0.1 --port 15515"
+@@ -47,6 +47,16 @@ try: s.recvfrom(2048); print("ok   9 live session survives a who flood")
+ except socket.timeout: print("FAIL 9 live session evicted by who flood"); bad = 1
+ sys.exit(bad)
+ PY
++chk() { r=$($B $2); echo "$1: $r"; case "$r" in $3) ;; *) echo "   ^ FAIL (want $3)"; fail=1;; esac; }
++chk "p1 mem BIOS data area" "peek mem 0x400 16"        "[0-9a-f]*"
++chk "p2 mem kernel image"   "peek mem 0x100000 16"     "err refused: kernel image*"
++chk "p3 mem LAPIC (not RAM)" "peek mem 0xfee00000 4"   "err refused: not inside*"
++chk "p4 mem len too big"    "peek mem 0x400 4096"      "err len*"
++chk "p5 mem wraps"          "peek mem 0xffffffffffffffff 16" "err *"
++chk "p6 nic regs 0..8"      "peek nic 0x0 8"           "[0-9a-f]* [0-9a-f]* "
++chk "p7 nic past window"    "peek nic 0xfc 8"          "err nic*"
++chk "p8 io TCO1_CNT"        "peek io 0x668 2"          "0x*"
++chk "p9 io i8042 data"      "peek io 0x60 1"           "err io*"
+ r=$($B stats); echo "8 stats:   $r"
+ r=$($B logall | grep -c .); echo "9 log:     $r lines"; [ "$r" -gt 5 ] || fail=1
+ echo "10 reboot: $($B reboot)"; sleep 2
+
+web search: 
+exec
+/bin/zsh -lc "git status --short; rg --files -g AGENTS.md -g '*8139*' -g '*NM10*' -g '*8105*'; git show cde7343:src/mb.rs; git show cde7343:linker.ld; git show cde7343:src/boot.s" in ~/nc110-baremetal
+ succeeded in 0ms:
+?? grub-test/wdt-locked-accept.iso
+?? grub-test/wdt-locked-refuse.iso
+?? proof/codex-review-bmctl-followup.txt
+?? proof/codex-review-bmctl-followup2.txt
+?? proof/codex-review-bmctl.txt
+?? proof/codex-review-overnight2.txt
+?? proof/codex-review-peek.txt
+third_party/linux-v6.12/8139cp.c
+//! Multiboot v1 info: cmdline, memory map, and the client-key module (M2.5).
+//!
+//! The SSH client key is NOT compiled into the ELF. GRUB loads it with `module /baremetal/<file>` (QEMU:
+//! `-initrd <file>`), so the key lives on /boot and can be rotated without a rebuild.
+//! Module format (72 bytes): b"NC110K1\n" | ed25519 seed (32) | ed25519 public key (32).
+//! The kernel derives the public key from the seed and refuses on mismatch (truncation / corruption / wrong
+//! file), copies the seed into a static, then zeroes the module bytes in RAM.
+use crate::kprintln;
+use core::ptr::{read_volatile, write_volatile};
+
+const MAGIC: &[u8; 8] = b"NC110K1\n";
+const KEYMOD_LEN: u64 = 72;
+
+static mut RAM: [(u64, u64); 32] = [(0, 0); 32];
+static mut NRAM: usize = 0;
+static mut HAVE_MAP: bool = false;
+
+unsafe fn rd32(a: u64) -> u32 {
+    read_volatile(a as *const u32)
+}
+
+/// Record available-RAM ranges (mmap type 1, or mem_lower/mem_upper as a fallback).
+pub fn parse_memory(info: u64) {
+    unsafe {
+        if info == 0 {
+            return;
+        }
+        let flags = rd32(info);
+        if flags & (1 << 6) != 0 {
+            let len = rd32(info + 44) as u64;
+            let mut p = rd32(info + 48) as u64;
+            let end = p + len;
+            while p + 24 <= end && NRAM < 32 {
+                let size = rd32(p) as u64;
+                let base = read_volatile((p + 4) as *const u64);
+                let l = read_volatile((p + 12) as *const u64);
+                let ty = rd32(p + 20);
+                if ty == 1 && l > 0 {
+                    RAM[NRAM] = (base, l);
+                    NRAM += 1;
+                }
+                p += size + 4;
+            }
+            HAVE_MAP = true;
+        } else if flags & 1 != 0 {
+            RAM[0] = (0, rd32(info + 4) as u64 * 1024);
+            RAM[1] = (0x10_0000, rd32(info + 8) as u64 * 1024);
+            NRAM = 2;
+            HAVE_MAP = true;
+        }
+    }
+}
+
+/// True if [base, base+len) touches available RAM, or if no memory map was given (fail closed).
+pub fn ram_overlaps(base: u64, len: u64) -> bool {
+    unsafe {
+        if !HAVE_MAP {
+            return true;
+        }
+        let ram = &*core::ptr::addr_of!(RAM);
+        ram[..NRAM].iter().any(|&(b, l)| base < b + l && b < base + len)
+    }
+}
+
+/// True only if [base, base+len) lies entirely inside ONE available-RAM range of the multiboot map.
+pub fn ram_contains(base: u64, len: u64) -> bool {
+    let Some(end) = base.checked_add(len) else { return false };
+    unsafe {
+        let ram = &*core::ptr::addr_of!(RAM);
+        HAVE_MAP && ram[..NRAM].iter().any(|&(b, l)| base >= b && end <= b.saturating_add(l))
+    }
+}
+
+pub fn cmdline(info: u64) -> &'static str {
+    unsafe {
+        if info == 0 || rd32(info) & 4 == 0 {
+            return "";
+        }
+        let p = rd32(info + 16) as *const u8;
+        let mut n = 0;
+        while n < 256 && *p.add(n) != 0 {
+            n += 1;
+        }
+        core::str::from_utf8(core::slice::from_raw_parts(p, n)).unwrap_or("")
+    }
+}
+
+/// Find the key module, validate it, copy the seed out, wipe the module. None (with a log line) if absent/bad.
+pub fn take_client_key(info: u64) -> Option<[u8; 32]> {
+    unsafe {
+        if info == 0 || rd32(info) & (1 << 3) == 0 || rd32(info + 20) == 0 {
+            kprintln!("keymod: no multiboot module");
+            return None;
+        }
+        let count = rd32(info + 20).min(16) as u64;
+        let mods = rd32(info + 24) as u64;
+        for i in 0..count {
+            let e = mods + 16 * i;
+            let (start, end) = (rd32(e) as u64, rd32(e + 4) as u64);
+            if end <= start || end - start != KEYMOD_LEN {
+                continue;
+            }
+            let m = core::slice::from_raw_parts(start as *const u8, KEYMOD_LEN as usize);
+            if &m[..8] != MAGIC {
+                continue;
+            }
+            let mut seed = [0u8; 32];
+            let mut publ = [0u8; 32];
+            seed.copy_from_slice(&m[8..40]);
+            publ.copy_from_slice(&m[40..72]);
+            for j in 0..KEYMOD_LEN {
+                write_volatile((start + j) as *mut u8, 0);
+            }
+            let derived = sunset::ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+            if derived != publ {
+                kprintln!("keymod: module {} public key does not match its seed -> ignored (wiped)", i);
+                return None;
+            }
+            kprintln!("keymod: client key from module {} at {:#x} (72 B), public key verified, module wiped", i, start);
+            return Some(seed);
+        }
+        kprintln!("keymod: {} module(s), none is a 72-byte NC110K1 key", count);
+        None
+    }
+}
+ENTRY(_start32)
+SECTIONS {
+    . = 0x100000;
+    __load_start = .;
+    .all : {
+        KEEP(*(.multiboot_header))
+        *(.text.boot)
+        *(.text .text.*)
+        *(.rodata .rodata.*)
+        *(.data .data.*)
+        *(.got .got.*)
+    }
+    __load_end = .;
+    .bss (NOLOAD) : ALIGN(4096) {
+        __bss_start = .;
+        *(.bss .bss.*)
+        *(COMMON)
+        . = ALIGN(4096);
+        __bss_end = .;
+    }
+    /DISCARD/ : { *(.eh_frame*) *(.comment) }
+}
+/* Multiboot v1 entry: 32-bit protected mode -> long mode -> kmain (Rust).
+   AT&T syntax. Header uses the a.out kludge (flag bit 16) so QEMU -kernel,
+   GRUB `multiboot` and iPXE all load this ELF64 file by raw addresses. */
+
+.set MB_MAGIC, 0x1BADB002
+.set MB_FLAGS, 0x00010003          /* page-align | mem info | address kludge */
+.set TCO_TICKS, 5                  /* 5 x 0.6 s = 3 s per stage; reset on 2nd expiry, about 6 s */
+
+.section .multiboot_header, "a"
+.align 4
+mb_header:
+    .long MB_MAGIC
+    .long MB_FLAGS
+    .long -(MB_MAGIC + MB_FLAGS)
+    .long mb_header                 /* header_addr   */
+    .long __load_start              /* load_addr     */
+    .long __load_end                /* load_end_addr */
+    .long __bss_end                 /* bss_end_addr  */
+    .long _start32                  /* entry_addr    */
+
+.section .text.boot, "ax"
+.code32
+.global _start32
+_start32:
+    cli
+    cld
+    mov %eax, %ebp                  /* multiboot magic */
+    mov %ebx, %esi                  /* multiboot info ptr */
+
+    /* ---- Arm the TCO watchdog FIRST (safety rule 5 rehearsal). No stack, no paging. ----
+       Self-arming happens ONLY on LPC 00:1f.0 = ICH9 8086:2918 (QEMU q35). On NM10 8086:27bc (NC110)
+       GRUB owns the watchdog: this code never writes TCO/GCS there, Rust only verifies it live.
+       Sequence mirrors Linux iTCO_wdt v2: clear GCS.NO_REBOOT, clear SMI_EN.TCO_EN,
+       clear stale TCO status, program TCO_TMR, reload, clear TCO1_CNT.TCO_TMR_HLT (RMW only). */
+    mov $0x8000F800, %eax           /* bus 0, dev 31, fn 0, off 0x00: vendor/device */
+    mov $0xCF8, %dx
+    outl %eax, %dx
+    mov $0xCFC, %dx
+    inl %dx, %eax
+    cmp $0x29188086, %eax
+    je 4f
+    cmp $0x27BC8086, %eax
+    jne 1f
+    movl $5, tco_result             /* 5 = NM10: GRUB armed it, hands off */
+    jmp 9f
+1:  movl $1, tco_result             /* 1 = skipped, no ICH9/NM10 LPC */
+    jmp 9f
+4:  cmpb $0, TCO_GRUB_ARMED
+    je 3f
+    movl $4, tco_result             /* 4 = left to GRUB (build feature grub-armed) */
+    jmp 9f
+3:  mov $0x8000F840, %eax           /* PMBASE (ABASE) */
+    mov $0xCF8, %dx
+    outl %eax, %dx
+    mov $0xCFC, %dx
+    inl %dx, %eax
+    and $0xFF80, %eax
+    jz 7f
+    mov %eax, %ebx                  /* ebx = PMBASE */
+    mov $0x8000F8F0, %eax           /* RCBA */
+    mov $0xCF8, %dx
+    outl %eax, %dx
+    mov $0xCFC, %dx
+    inl %dx, %eax
+    test $1, %eax
+    jz 8f
+    and $0xFFFFC000, %eax
+    mov %eax, %edi                  /* edi = RCBA (physical, paging is off) */
+    mov 0x3410(%edi), %eax
+    mov %eax, tco_gcs_pre
+    cmpb $0, TCO_NEG_CONTROL
+    jne 6f
+    andl $0xFFFFFFDF, 0x3410(%edi)  /* GCS: clear NO_REBOOT (bit 5) */
+    jmp 5f
+6:  orl $0x20, 0x3410(%edi)         /* negative control: SET NO_REBOOT, as firmware leaves it */
+5:  mov 0x3410(%edi), %eax
+    mov %eax, tco_gcs
+    lea 0x60(%ebx), %ecx            /* ecx = TCOBASE = PMBASE + 0x60 */
+    mov %ecx, tco_base
+    lea 4(%ecx), %edx
+    inw %dx, %ax
+    mov %ax, tco_sts1_pre
+    lea 6(%ecx), %edx
+    inw %dx, %ax
+    mov %ax, tco_sts2_pre
+    lea 0x30(%ebx), %edx            /* SMI_EN: clear TCO_EN (bit 13) so SMM can't eat timeout 1 */
+    inl %dx, %eax
+    and $0xFFFFDFFF, %eax
+    outl %eax, %dx
+    lea 4(%ecx), %edx
+    mov $0x0008, %ax                /* TCO1_STS: clear TIMEOUT (RW1C) */
+    outw %ax, %dx
+    lea 6(%ecx), %edx
+    mov $0x0002, %ax                /* TCO2_STS: clear SECOND_TO_STS first, then BOOT_STS (RW1C) */
+    outw %ax, %dx
+    mov $0x0004, %ax
+    outw %ax, %dx
+    lea 0x12(%ecx), %edx            /* TCO_TMR: keep 15:10, ticks of 0.6 s in 9:0 */
+    inw %dx, %ax
+    and $0xFC00, %ax
+    or $TCO_TICKS, %ax
+    outw %ax, %dx
+    mov %ecx, %edx                  /* TCO_RLD: any write reloads */
+    mov $1, %ax
+    outw %ax, %dx
+    lea 8(%ecx), %edx               /* TCO1_CNT: clear TCO_TMR_HLT (bit 11), RMW, never touch TCO_LOCK */
+    inw %dx, %ax
+    and $0xF7FF, %ax
+    outw %ax, %dx
+    inw %dx, %ax
+    mov %ax, tco_cnt
+    movl $0, tco_result             /* 0 = arm sequence ran (Rust verifies live) */
+    jmp 9f
+7:  movl $2, tco_result             /* 2 = PMBASE unset */
+    jmp 9f
+8:  movl $3, tco_result             /* 3 = RCBA disabled */
+9:
+
+    /* zero .bss (page tables + stack live there) */
+    mov $__bss_start, %edi
+    mov $__bss_end, %ecx
+    sub %edi, %ecx
+    shr $2, %ecx
+    xor %eax, %eax
+    rep stosl
+
+    mov $stack_top, %esp
+
+    /* PML4[0] -> PDPT ; PDPT[0..3] -> PD0..PD3 ; identity map 4 GiB, 2 MiB pages */
+    mov $pdpt, %eax
+    or $0x3, %eax
+    mov %eax, pml4
+    xor %ecx, %ecx
+1:  mov %ecx, %eax
+    shl $12, %eax
+    add $pd, %eax
+    or $0x3, %eax
+    mov %eax, pdpt(,%ecx,8)
+    inc %ecx
+    cmp $4, %ecx
+    jne 1b
+    xor %ecx, %ecx
+2:  mov %ecx, %eax
+    shl $21, %eax
+    or $0x83, %eax                  /* present | rw | 2MiB */
+    mov %eax, pd(,%ecx,8)
+    inc %ecx
+    cmp $2048, %ecx
+    jne 2b
+
+    mov $pml4, %eax
+    mov %eax, %cr3
+    mov %cr4, %eax
+    or $0x20, %eax                  /* PAE */
+    mov %eax, %cr4
+    mov $0xC0000080, %ecx           /* EFER */
+    rdmsr
+    or $0x100, %eax                 /* LME */
+    wrmsr
+    mov %cr0, %eax
+    or $0x80000001, %eax            /* PG | PE */
+    mov %eax, %cr0
+
+    lgdt gdt_ptr
+    ljmp $0x08, $start64
+
+.code64
+start64:
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %ss
+    xor %ax, %ax
+    mov %ax, %fs
+    mov %ax, %gs
+    mov $stack_top, %rsp
+    mov %ebp, %edi                  /* arg0: magic */
+    mov %esi, %esi                  /* arg1: info ptr (zero-extended) */
+    call kmain
+3:  cli
+    hlt
+    jmp 3b
+
+.section .data
+.align 4
+.global tco_result, tco_gcs_pre, tco_gcs, tco_base, tco_sts1_pre, tco_sts2_pre, tco_cnt
+tco_result:   .long 0xFFFFFFFF
+tco_gcs_pre:  .long 0
+tco_gcs:      .long 0
+tco_base:     .long 0
+tco_sts1_pre: .word 0
+tco_sts2_pre: .word 0
+tco_cnt:      .word 0
+
+.section .rodata
+.align 8
+gdt:
+    .quad 0
+    .quad 0x00AF9A000000FFFF        /* 0x08: 64-bit code */
+    .quad 0x00CF92000000FFFF        /* 0x10: data */
+gdt_end:
+gdt_ptr:
+    .word gdt_end - gdt - 1
+    .long gdt
+
+.section .bss
+.align 4096
+pml4: .skip 4096
+pdpt: .skip 4096
+.global pd
+pd:   .skip 4096 * 4
+.align 16
+stack_bottom: .skip 2097152
+stack_top:
+
+web search: Intel NM10 datasheet TCO read clear TCO_RLD PMBASE ...
+web search: 
+exec
+/bin/zsh -lc "git show cde7343:src/nic.rs; git show cde7343:src/bmctl.rs; git show cde7343:Cargo.toml; rg -n 'parse_memory|take_client_key|bmctl::run|alloc|heap|MMIO|ram_overlaps' src/main.rs src/nic.rs; rg --files | rg -i 'pdf|datasheet|nm10|8105'" in ~/nc110-baremetal
+ exited 1 in 0ms:
+//! Realtek C+ descriptor-ring NIC driver, two chips behind a PCI device-id match (M2.5):
+//!   10ec:8136 RTL8101E family (the NC110's wired NIC): MMIO only, r8169-style init. NOT RUNNABLE IN QEMU.
+//!   10ec:8139 rtl8139 in C+ mode (QEMU stand-in): port I/O BAR0, or MMIO BAR1 with cmdline `nic=mmio`.
+//! Both use the same 16-byte descriptors and ring registers; the per-chip deltas live in nic_regs.rs and are
+//! checked against pinned Linux v6.12 sources on the host (tools/test-nic-regs.sh).
+//!
+//! Safety rules this file keeps (spec rule 4: no disk access, ever):
+//! - The only PCI config write is to the matched NIC's command register (low 16 bits; status written as 0).
+//! - MMIO base must be a 32-bit-reachable memory BAR, 256-byte aligned, outside multiboot RAM, and unable to
+//!   overlap any mass-storage (class 01h, e.g. SATA/AHCI) BAR (span bounded by its alignment, read-only).
+//!   Otherwise the NIC is refused.
+//! - Bus mastering is OFF across the chip reset and ring programming (iPXE leaves the NIC DMAing), and only
+//!   turned on after the rings point at our buffers.
+use crate::nic_regs::{self as R, Regs};
+use crate::pci::{self, Bdf};
+use crate::port::{inb, inl, inw, outb, outl, outw, rdtsc};
+use crate::{kprintln, time};
+use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
+use core::sync::atomic::{fence, Ordering};
+
+const NRX: usize = 16;
+const BUFSZ: usize = 1536;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Desc {
+    opts1: u32,
+    opts2: u32,
+    addr: u64,
+}
+
+#[repr(C, align(256))]
+struct Ring<const N: usize>([Desc; N]);
+
+#[repr(C, align(16))]
+struct Bufs<const N: usize>([[u8; BUFSZ]; N]);
+
+const Z: Desc = Desc { opts1: 0, opts2: 0, addr: 0 };
+static mut TX_DESC: Ring<1> = Ring([Z; 1]);
+static mut RX_DESC: Ring<NRX> = Ring([Z; NRX]);
+static mut TX_BUF: Bufs<1> = Bufs([[0; BUFSZ]; 1]);
+static mut RX_BUF: Bufs<NRX> = Bufs([[0; BUFSZ]; NRX]);
+
+#[derive(Clone, Copy)]
+pub enum Bus {
+    Pio(u16),
+    Mmio(u64),
+}
+
+impl Bus {
+    unsafe fn r8(self, o: u16) -> u8 {
+        match self {
+            Bus::Pio(p) => inb(p + o),
+            Bus::Mmio(m) => read_volatile((m + o as u64) as *const u8),
+        }
+    }
+    unsafe fn r16(self, o: u16) -> u16 {
+        match self {
+            Bus::Pio(p) => inw(p + o),
+            Bus::Mmio(m) => read_volatile((m + o as u64) as *const u16),
+        }
+    }
+    unsafe fn r32(self, o: u16) -> u32 {
+        match self {
+            Bus::Pio(p) => inl(p + o),
+            Bus::Mmio(m) => read_volatile((m + o as u64) as *const u32),
+        }
+    }
+    unsafe fn w8(self, o: u16, v: u8) {
+        match self {
+            Bus::Pio(p) => outb(p + o, v),
+            Bus::Mmio(m) => write_volatile((m + o as u64) as *mut u8, v),
+        }
+    }
+    unsafe fn w16(self, o: u16, v: u16) {
+        match self {
+            Bus::Pio(p) => outw(p + o, v),
+            Bus::Mmio(m) => write_volatile((m + o as u64) as *mut u16, v),
+        }
+    }
+    unsafe fn w32(self, o: u16, v: u32) {
+        match self {
+            Bus::Pio(p) => outl(p + o, v),
+            Bus::Mmio(m) => write_volatile((m + o as u64) as *mut u32, v),
+        }
+    }
+}
+
+impl core::fmt::Display for Bus {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            Bus::Pio(p) => write!(f, "io={:#x}", p),
+            Bus::Mmio(m) => write!(f, "mmio={:#x} (UC)", m),
+        }
+    }
+}
+
+pub struct Rtl {
+    pub bus: Bus,
+    pub regs: &'static Regs,
+    pub bdf: Bdf,
+    pub mac: [u8; 6],
+    rx_next: usize,
+    rx_cfg: u32,
+    ver: u8, // r8169 RTL_GIGA_MAC_VER_xx (0 = rtl8139 C+)
+}
+
+const PCI_CMD_IO: u32 = 1 << 0;
+const PCI_CMD_MEM: u32 = 1 << 1;
+const PCI_CMD_BM: u32 = 1 << 2;
+
+/// The one PCI config write: the NIC's command register. Upper half (status, RW1C) written as 0.
+fn set_pci_cmd(b: Bdf, set: u32, clear: u32) {
+    let cmd = pci::read32(b, 0x04) & 0xFFFF;
+    pci::write32(b, 0x04, (cmd & !clear) | set);
+}
+
+extern "C" {
+    static mut pd: [u64; 2048]; // boot.s: 4 x 512 2-MiB identity entries covering 0..4 GiB
+}
+
+#[repr(C, align(4096))]
+struct Pt([u64; 512]);
+static mut UC_PT: Pt = Pt([0; 512]);
+
+/// Make ONLY the 4 KiB page holding the NIC registers uncached (PCD|PWT): split the 2 MiB identity PDE that
+/// covers it into 512 identity 4 KiB entries with the PDE's own flags, so nothing else in that 2 MiB (on the
+/// NM10 possibly the AHCI ABAR) changes attributes. Review fix (GLM-5.2 B1): previously the whole 2 MiB went UC.
+fn map_uc_4k(base: u64) {
+    unsafe {
+        let pde = addr_of_mut!(pd[(base >> 21) as usize]);
+        let old = read_volatile(pde);
+        let region = base & !0x1F_FFFF;
+        let flags = old & 0x1F & !(1 << 7); // P, RW, US, PWT, PCD from the PDE; PS dropped for a PTE
+        let pt = &mut *addr_of_mut!(UC_PT);
+        for (i, e) in pt.0.iter_mut().enumerate() {
+            *e = (region + (i as u64) * 4096) | flags;
+        }
+        pt.0[((base >> 12) & 0x1FF) as usize] |= (1 << 4) | (1 << 3);
+        fence(Ordering::SeqCst);
+        write_volatile(pde, (addr_of!(UC_PT) as u64) | 0x3); // present | rw, points at UC_PT
+        core::arch::asm!("mov {t}, cr3", "mov cr3, {t}", t = out(reg) _, options(nostack)); // flush incl. the 2 MiB entry
+    }
+}
+
+/// Validate a memory BAR for use as the NIC register window, then map its 2 MiB page uncached (PCD|PWT).
+fn mmio_window(b: Bdf) -> Result<u64, &'static str> {
+    let (base, _is64) = pci::first_mem_bar(b).ok_or("no memory BAR")?;
+    if base == 0 {
+        return Err("memory BAR unassigned (0)");
+    }
+    if base & 0xFF != 0 || base + 0x100 > 0x1_0000_0000 {
+        return Err("memory BAR not 256-byte aligned or not below 4 GiB");
+    }
+    if crate::ram_overlaps(base, 0x100) {
+        return Err("memory BAR overlaps RAM in the multiboot memory map");
+    }
+    let mut st = [0u64; 16];
+    let n = pci::storage_mem_bars(&mut st);
+    for &x in &st[..n] {
+        kprintln!("nic: mass-storage memory BAR {:#x} (max span {:#x}), NIC window {:#x}+0x100", x, 1u64 << x.trailing_zeros().min(32), base);
+    }
+    if !R::clear_of_storage(base, &st[..n]) {
+        return Err("NIC register window could overlap a storage controller BAR");
+    }
+    map_uc_4k(base);
+    Ok(base)
+}
+
+/// Subset of rtl8169_get_mac_version (r8169_main.c:2318-2325, first match wins): the 8101E/8102E/8103E
+/// versions whose init this file implements, plus the 8105E (VER_29/30) found in the real NC110 (same generic path;
+/// plus rtl_hw_start_8105e_*, see hw_start_8105e). Anything else (8106E, 8402, ...) is refused.
+fn xid_version(xid: u32) -> Option<u8> {
+    const T: [(u32, u32, u8); 10] = [
+        (0x7cf, 0x409, 29), // RTL8105E (r8169_main.c:2316-2317); the real NC110 is XID 0x40a -> VER_30
+        (0x7c8, 0x408, 30),
+        (0x7cf, 0x349, 8),
+        (0x7cf, 0x249, 8),
+        (0x7cf, 0x348, 7),
+        (0x7cf, 0x248, 7),
+        (0x7cf, 0x240, 14), // RTL8401: listed only so it is NOT mistaken for VER_09 below
+        (0x7c8, 0x348, 9),
+        (0x7c8, 0x248, 9),
+        (0x7c8, 0x340, 10),
+    ];
+    T.iter().find(|&&(m, v, _)| xid & m == v).map(|t| t.2).filter(|&v| v != 14)
+}
+
+pub fn probe(prefer_mmio: bool) -> Result<Rtl, &'static str> {
+    if let Some(b) = pci::find(0x10EC, 0x8136) {
+        return probe_8101e(b);
+    }
+    if let Some(b) = pci::find(0x10EC, 0x8139) {
+        return probe_8139cp(b, prefer_mmio);
+    }
+    Err("no 10ec:8136 or 10ec:8139 found (bridges walked)")
+}
+
+fn probe_8139cp(b: Bdf, mmio: bool) -> Result<Rtl, &'static str> {
+    let bus = if mmio {
+        set_pci_cmd(b, 0, PCI_CMD_BM);
+        let m = mmio_window(b)?;
+        set_pci_cmd(b, PCI_CMD_MEM, PCI_CMD_BM);
+        Bus::Mmio(m)
+    } else {
+        set_pci_cmd(b, PCI_CMD_IO, PCI_CMD_BM);
+        let bar0 = pci::read32(b, 0x10);
+        if bar0 & 1 == 0 {
+            return Err("rtl8139 BAR0 is not I/O");
+        }
+        Bus::Pio((bar0 & !0x3) as u16)
+    };
+    let mut mac = [0u8; 6];
+    for (i, m) in mac.iter_mut().enumerate() {
+        *m = unsafe { bus.r8(R::RTL8139CP.mac0 + i as u16) };
+    }
+    Ok(Rtl { bus, regs: &R::RTL8139CP, bdf: b, mac, rx_next: 0, rx_cfg: 0x0000_E70A, ver: 0 })
+}
+
+fn probe_8101e(b: Bdf) -> Result<Rtl, &'static str> {
+    set_pci_cmd(b, 0, PCI_CMD_BM | PCI_CMD_IO); // stop any DMA left running by iPXE before anything else
+    let m = mmio_window(b)?;
+    set_pci_cmd(b, PCI_CMD_MEM, PCI_CMD_BM | PCI_CMD_IO);
+    let bus = Bus::Mmio(m);
+    let r = &R::RTL8101E;
+    let txc = unsafe { bus.r32(r.tx_config) };
+    if txc == 0xFFFF_FFFF {
+        return Err("TxConfig reads all-ones (PCI read failed, r8169_main.c:5419)");
+    }
+    let xid = (txc >> 20) & 0xFCF; // r8169_main.c:5422
+    let ver = match xid_version(xid) {
+        Some(v) => v,
+        None => {
+            kprintln!("nic: 10ec:8136 XID {:#05x} is not RTL8101E/8102E/8103E/8105E (VER_07..10, 29, 30): refusing", xid);
+            return Err("unsupported 10ec:8136 chip version");
+        }
+    };
+    kprintln!("nic: 10ec:8136 XID {:#05x} -> r8169 RTL_GIGA_MAC_VER_{:02}", xid, ver);
+    // rtl_init_rxcfg (r8169_main.c:2486-2490 and default 2510): VER_10 FIFO_THRESH|DMA_BURST, VER_07..09 default.
+    let rx_cfg = if ver == 10 { R::RX_FIFO_THRESH | R::RX_DMA_BURST } else { R::RX128_INT_EN | R::RX_DMA_BURST };
+    let mut mac = [0u8; 6];
+    for (i, x) in mac.iter_mut().enumerate() {
+        *x = unsafe { bus.r8(r.mac0 + i as u16) };
+    }
+    Ok(Rtl { bus, regs: r, bdf: b, mac, rx_next: 0, rx_cfg: rx_cfg | R::ACCEPT_BROADCAST | R::ACCEPT_MY_PHYS, ver })
+}
+
+impl Rtl {
+    pub fn name(&self) -> &'static str {
+        self.regs.name
+    }
+
+    fn mdio_write(&self, reg: u32, val: u16) -> Result<(), &'static str> {
+        // r8169_mdio_write, r8169_main.c:1154-1164: flag set, wait for it to clear (25 x 20 us), then 20 us.
+        unsafe { self.bus.w32(self.regs.phyar, R::PHYAR_FLAG | (reg & 0x1F) << 16 | val as u32) };
+        for _ in 0..25 {
+            time::delay_us(20);
+            if unsafe { self.bus.r32(self.regs.phyar) } & R::PHYAR_FLAG == 0 {
+                time::delay_us(20);
+                return Ok(());
+            }
+        }
+        Err("PHYAR write timeout")
+    }
+
+    fn mdio_read(&self, reg: u32) -> Result<u16, &'static str> {
+        // r8169_mdio_read, r8169_main.c:1166-1180: flag clear, wait for it to SET, data in 15:0, then 20 us.
+        unsafe { self.bus.w32(self.regs.phyar, (reg & 0x1F) << 16) };
+        for _ in 0..25 {
+            time::delay_us(20);
+            let v = unsafe { self.bus.r32(self.regs.phyar) };
+            if v & R::PHYAR_FLAG != 0 {
+                time::delay_us(20);
+                return Ok(v as u16);
+            }
+        }
+        Err("PHYAR read timeout")
+    }
+
+    pub fn skip_8105e(&mut self) {
+        if self.ver == 29 || self.ver == 30 {
+            kprintln!("nic: nic=no8105e: skipping rtl_hw_start_8105e (generic 810x path only)");
+            self.ver += 100;
+        }
+    }
+
+    /// rtl_ephy_write / rtl_ephy_read (r8169_main.c:1261-1277): EPHYAR 0x80, flag bit 31, reg 20:16, data 15:0.
+    fn ephy_write(&self, reg: u32, val: u16) -> Result<(), &'static str> {
+        unsafe { self.bus.w32(0x80, 0x8000_0000 | val as u32 | (reg & 0x1F) << 16) };
+        for _ in 0..100 {
+            time::delay_us(10);
+            if unsafe { self.bus.r32(0x80) } & 0x8000_0000 == 0 {
+                time::delay_us(10);
+                return Ok(());
+            }
+        }
+        Err("EPHYAR write timeout")
+    }
+
+    fn ephy_read(&self, reg: u32) -> Result<u16, &'static str> {
+        unsafe { self.bus.w32(0x80, (reg & 0x1F) << 16) };
+        for _ in 0..100 {
+            time::delay_us(10);
+            let v = unsafe { self.bus.r32(0x80) };
+            if v & 0x8000_0000 != 0 {
+                return Ok(v as u16);
+            }
+        }
+        Err("EPHYAR read timeout")
+    }
+
+    /// rtl_hw_start_8105e_1 / _2 (r8169_main.c:3619-3650), VER_29/30 only. Called with Cfg9346 unlocked.
+    fn hw_start_8105e(&self) -> Result<(), &'static str> {
+        const E: [(u32, u16, u16); 8] =
+            [(0x07, 0, 0x4000), (0x19, 0, 0x0200), (0x19, 0, 0x0020), (0x1e, 0, 0x2000), (0x03, 0, 0x0001), (0x19, 0, 0x0100), (0x19, 0, 0x0004), (0x0a, 0, 0x0020)];
+        unsafe {
+            let fe = self.bus.r32(0xF0); // FuncEvent: force LAN exit from ASPM if Rx/Tx not idle; no early tally
+            self.bus.w32(0xF0, (fe | 0x0000_2800) & !0x0001_0000);
+            self.bus.w8(0xD3, self.bus.r8(0xD3) | (1 << 3) | (1 << 2)); // MCU: EN_NDP | EN_OOB_RESET
+            self.bus.w8(0xD0, self.bus.r8(0xD0) | (1 << 6)); // DLLPR: PFM_EN
+        }
+        for (reg, mask, bits) in E {
+            let w = (self.ephy_read(reg)? & !mask) | bits;
+            self.ephy_write(reg, w)?;
+        }
+        unsafe { self.bus.w8(0x54, self.bus.r8(0x54) & !(1 << 1)) }; // Config3: clear Rdy_to_L23 (l2l3 disable)
+        if self.ver == 30 {
+            let w = self.ephy_read(0x1e)? | 0x8000;
+            self.ephy_write(0x1e, w)?;
+        }
+        kprintln!("nic: rtl_hw_start_8105e_{} applied (FuncEvent, MCU, DLLPR, 8 ephy writes, L2/L3 off)", self.ver - 28);
+        Ok(())
+    }
+
+    fn reset(&self) -> Result<(), &'static str> {
+        let r = self.regs;
+        unsafe {
+            self.bus.w8(r.chip_cmd, r.cmd_reset);
+            for _ in 0..1000 {
+                if self.bus.r8(r.chip_cmd) & r.cmd_reset == 0 {
+                    return Ok(());
+                }
+                time::delay_us(100);
+            }
+        }
+        Err("chip reset did not complete in 100 ms")
+    }
+
+    fn program_rings(&self) {
+        let r = self.regs;
+        unsafe {
+            for i in 0..NRX {
+                let d = addr_of_mut!(RX_DESC.0[i]);
+                let mut o = r.desc_own | BUFSZ as u32;
+                if i == NRX - 1 {
+                    o |= r.ring_end;
+                }
+                write_volatile(d, Desc { opts1: o, opts2: 0, addr: addr_of!(RX_BUF.0[i]) as u64 });
+            }
+            write_volatile(addr_of_mut!(TX_DESC.0[0]), Desc { opts1: r.ring_end, opts2: 0, addr: 0 });
+            fence(Ordering::SeqCst);
+            let tx = addr_of!(TX_DESC) as u64;
+            let rx = addr_of!(RX_DESC) as u64;
+            // high dword first (r8169_main.c:2758-2767 "magic spell")
+            self.bus.w32(r.tx_ring + 4, (tx >> 32) as u32);
+            self.bus.w32(r.tx_ring, tx as u32);
+            self.bus.w32(r.rx_ring + 4, (rx >> 32) as u32);
+            self.bus.w32(r.rx_ring, rx as u32);
+        }
+    }
+
+    /// Reset and bring up the NIC. Every Err path leaves bus mastering OFF.
+    pub fn init(&mut self) -> Result<(), &'static str> {
+        if self.regs.device == 0x8136 {
+            self.init_8101e()
+        } else {
+            self.init_8139cp()
+        }
+    }
+
+    fn init_8139cp(&mut self) -> Result<(), &'static str> {
+        let r = self.regs;
+        self.reset()?;
+        unsafe {
+            self.bus.w16(r.cplus_cmd, 0x0003); // C+ mode: CpTxOn | CpRxOn (8139cp only)
+            self.program_rings();
+            self.bus.w16(r.rx_max_size, BUFSZ as u16);
+            self.bus.w16(r.intr_mask, 0); // polled
+        }
+        set_pci_cmd(self.bdf, PCI_CMD_BM, 0);
+        unsafe {
+            self.bus.w8(r.chip_cmd, r.cmd_rx_enb | r.cmd_tx_enb);
+            self.bus.w32(r.tx_config, 0x0300_0700); // IFG normal, max DMA burst
+            self.bus.w32(r.rx_config, self.rx_cfg); // accept broadcast + my phys, unlimited DMA burst
+        }
+        Ok(())
+    }
+
+    /// rtl_hw_start (r8169_main.c:3930-3961) reduced to the generic part, plus a PHY reset like iPXE's
+    /// realtek_phy_reset. NOT done (documented gap): the per-version hw_config tables (rtl_hw_start_8102e_*,
+    /// r8169_main.c:3562-3603: Config1/Config3/ephy writes) and rtl8102e_hw_phy_config. VER_10 has none.
+    fn init_8101e(&mut self) -> Result<(), &'static str> {
+        let r = self.regs;
+        self.reset()?;
+        unsafe {
+            self.bus.w8(r.cfg9346, R::CFG9346_UNLOCK);
+            let cp = self.bus.r16(r.cplus_cmd) & R::CPCMD_MASK & !(R::CPCMD_RXVLAN | R::CPCMD_RXCHKSUM);
+            self.bus.w16(r.cplus_cmd, cp);
+            self.bus.w8(r.max_tx_packet_size, R::TX_PACKET_MAX); // rtl_hw_start_8168 (r8169_main.c:3903)
+            self.bus.w16(r.intr_mitigate, 0);
+            self.bus.w16(r.rx_max_size, BUFSZ as u16); // Linux uses 16 KiB buffers; ours are 1536 B
+            self.program_rings();
+        }
+        if self.ver == 29 || self.ver == 30 {
+            if let Err(e) = self.hw_start_8105e() {
+                unsafe { self.bus.w8(r.cfg9346, R::CFG9346_LOCK) };
+                return Err(e); // bus mastering is still off here
+            }
+        }
+        unsafe {
+            self.bus.w8(r.cfg9346, R::CFG9346_LOCK);
+            self.bus.w16(r.intr_mask, 0);
+            self.bus.w16(r.intr_status, 0xFFFF);
+        }
+        // PHY: BMCR reset, wait for self-clear, then autoneg enable + restart (no 1000BASE-T on this PHY).
+        self.mdio_write(0, 0x8000)?;
+        let t = time::now_ms();
+        while self.mdio_read(0)? & 0x8000 != 0 {
+            if time::now_ms() - t > 500 {
+                return Err("PHY reset did not self-clear in 500 ms");
+            }
+        }
+        self.mdio_write(0, 0x1200)?;
+        set_pci_cmd(self.bdf, PCI_CMD_BM, 0);
+        unsafe {
+            self.bus.w8(r.chip_cmd, r.cmd_tx_enb | r.cmd_rx_enb); // r8169_main.c:3957, before Rx/TxConfig
+            self.bus.w32(r.rx_config, self.rx_cfg);
+            self.bus.w32(r.tx_config, R::TX_DMA_BURST << 8 | R::INTER_FRAME_GAP << 24);
+        }
+        let t = time::now_ms();
+        while unsafe { self.bus.r8(r.phystatus) } & R::LINK_STATUS == 0 && time::now_ms() - t < 5000 {}
+        let st = unsafe { self.bus.r8(r.phystatus) };
+        kprintln!("nic: PHYstatus {:#04x} link {}", st, if st & R::LINK_STATUS != 0 { "up" } else { "DOWN after 5 s" });
+        if st & R::LINK_STATUS == 0 {
+            // Review fix (GLM-5.2 C3): no link -> stop the chip and bus mastering instead of running SSH blind.
+            unsafe { self.bus.w8(r.chip_cmd, 0) };
+            set_pci_cmd(self.bdf, 0, PCI_CMD_BM);
+            return Err("no link after 5 s (Rx/Tx and bus mastering turned off again)");
+        }
+        Ok(())
+    }
+
+    /// Non-blocking: if the next RX descriptor is ours, return (index, frame length without FCS).
+    /// The caller must hand the descriptor back with `rx_release(index)`.
+    pub fn rx_poll(&mut self) -> Option<(usize, usize)> {
+        let r = self.regs;
+        let i = self.rx_next;
+        unsafe {
+            let o = read_volatile(addr_of!(RX_DESC.0[i].opts1));
+            if o & r.desc_own != 0 {
+                return None;
+            }
+            fence(Ordering::SeqCst);
+            self.rx_next = (i + 1) % NRX;
+            if o & (r.rx_err | r.first_frag | r.last_frag) != (r.first_frag | r.last_frag) {
+                rx_release(r, i); // errored or multi-descriptor frame: drop it
+                return None;
+            }
+            Some((i, ((o & r.rx_len_mask) as usize).saturating_sub(4).min(BUFSZ)))
+        }
+    }
+}
+
+/// Only valid between `rx_poll` returning (i, len) and `rx_release(i)` (net::Rx enforces this).
+pub(crate) fn rx_buf(i: usize, len: usize) -> &'static [u8] {
+    assert!(i < NRX && len <= BUFSZ);
+    unsafe { core::slice::from_raw_parts(addr_of!(RX_BUF.0[i]) as *const u8, len) }
+}
+
+pub fn rx_release(r: &Regs, i: usize) {
+    let mut no = r.desc_own | BUFSZ as u32;
+    if i == NRX - 1 {
+        no |= r.ring_end;
+    }
+    fence(Ordering::SeqCst);
+    unsafe { write_volatile(addr_of_mut!(RX_DESC.0[i].opts1), no) };
+}
+
+/// Set once a TX descriptor fails to come back (OWN still set after the deadline). From then on the
+/// TX DMA buffer and descriptor are treated as owned by the NIC forever: nothing is written to them.
+static mut TX_WEDGED: bool = false;
+static mut TX_SCRATCH: [u8; BUFSZ] = [0; BUFSZ];
+
+/// Let `fill` build a `len`-byte frame directly in the DMA buffer, then send it.
+/// Never touches the buffer/descriptor unless the NIC has cleared OWN (Codex M2 MUST-FIX).
+pub fn tx_with<R2>(bus: Bus, r: &Regs, len: usize, fill: impl FnOnce(&mut [u8]) -> R2) -> R2 {
+    let len = len.min(BUFSZ);
+    unsafe {
+        let d = addr_of_mut!(TX_DESC.0[0]);
+        if TX_WEDGED || read_volatile(addr_of!((*d).opts1)) & r.desc_own != 0 {
+            TX_WEDGED = true;
+            // Frame is built into scratch and dropped: the NIC may still be DMAing the real buffer.
+            let scratch = &mut *core::ptr::addr_of_mut!(TX_SCRATCH);
+            return fill(&mut scratch[..len]);
+        }
+        let buf = core::slice::from_raw_parts_mut(addr_of_mut!(TX_BUF.0[0]) as *mut u8, BUFSZ);
+        let res = fill(&mut buf[..len]);
+        let wire = len.max(60);
+        for b in &mut buf[len..wire] {
+            *b = 0;
+        }
+        write_volatile(
+            d,
+            Desc {
+                opts1: r.desc_own | r.ring_end | r.first_frag | r.last_frag | wire as u32,
+                opts2: 0,
+                addr: buf.as_ptr() as u64,
+            },
+        );
+        fence(Ordering::SeqCst);
+        bus.w8(r.tx_poll, r.npq);
+        let t0 = rdtsc();
+        while read_volatile(addr_of!((*d).opts1)) & r.desc_own != 0 {
+            if rdtsc() - t0 > 2_000_000_000 {
+                TX_WEDGED = true;
+                kprintln!("nic: TX descriptor not returned by NIC, TX disabled");
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        fence(Ordering::SeqCst);
+        let st = bus.r16(r.intr_status);
+        bus.w16(r.intr_status, st);
+        res
+    }
+}
+//! bmctl: authenticated UDP control port (5515) so an agent can inspect and drive the kernel over the LAN, the way
+//! the DS client is driven over net2. Frame: [seq u64 LE][ciphertext][16-byte tag], ChaCha20-Poly1305 (RFC 8439),
+//! nonce = b"C2K\0"|b"K2C\0" ++ seq, AAD = this boot's random 16-byte id. Master = SHA-256("nc110-bmctl-v1" ++
+//! client seed from the key module): nothing secret is compiled in. Handshake (Codex MUST-FIX x2, nonce reuse):
+//! `who` ++ a fresh random 16-byte client nonce Nc is the only clear-text request; the reply carries the boot id, a
+//! NEW session number and check = SHA-256("nc110-bmctl-v1 who" ++ master ++ Nc ++ boot id ++ session)[..16].
+//! Traffic key = SHA-256("nc110-bmctl-v1 session" ++ master ++ boot id ++ session ++ Nc); seq counts from 1. A
+//! replayed or forged `who` reply cannot make two client runs share a key, because Nc is fresh per run, and the
+//! kernel never reissues a session number in a boot. A session binds to the endpoint that asked `who`; pending and authenticated sessions live in separate tables.
+//! A duplicate of the last accepted seq gets the cached reply bytes back (safe UDP retries, nothing re-executed).
+//! The loop pets the watchdog; 10 minutes without a valid command -> 0xCF9 reset.
+//! `peek` is read-only and allowlisted (see `peek`): RAM only inside the multiboot map and never the kernel image
+//! (text, data, bss: stack, session table, keys), NIC registers only inside its 256-byte MMIO window as aligned
+//! dwords, ports only the ACPI PM block (PMBASE..+0x80, which contains the TCO); everything else is refused.
+use crate::net::Nic;
+use crate::nic::{Bus, Rtl};
+use crate::port::{inb, inl, inw};
+use crate::{console, kprintln, rng, time, wdt};
+use chacha20::cipher::{KeyIvInit, StreamCipher};
+use chacha20::ChaCha20;
+use poly1305::universal_hash::{KeyInit, UniversalHash};
+use poly1305::Poly1305;
+use sha2::{Digest, Sha256};
+use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+use smoltcp::socket::{dhcpv4, udp};
+use smoltcp::time::Instant;
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
+
+const PORT: u16 = 5515;
+const IDLE_MS: i64 = 600_000;
+
+static mut SESS: [Option<Sess>; 16] = [const { None }; 16]; // authenticated
+static mut PEND: [Option<Sess>; 8] = [const { None }; 8]; // issued by `who`, no good frame yet
+static mut SOCKS: [SocketStorage<'static>; 2] = [SocketStorage::EMPTY; 2];
+static mut RX_META: [udp::PacketMetadata; 8] = [udp::PacketMetadata::EMPTY; 8];
+static mut RX_BUF: [u8; 8192] = [0; 8192];
+static mut TX_META: [udp::PacketMetadata; 8] = [udp::PacketMetadata::EMPTY; 8];
+static mut TX_BUF: [u8; 8192] = [0; 8192];
+
+fn now() -> Instant {
+    Instant::from_millis(time::now_ms())
+}
+
+fn nonce(dir: &[u8; 4], seq: u64) -> [u8; 12] {
+    let mut n = [0u8; 12];
+    n[..4].copy_from_slice(dir);
+    n[4..].copy_from_slice(&seq.to_le_bytes());
+    n
+}
+
+/// RFC 8439 tag over aad and ct with the one-time key from keystream block 0.
+fn tag(pk: &[u8; 32], aad: &[u8], ct: &[u8]) -> [u8; 16] {
+    let mut m = Poly1305::new(pk.into());
+    m.update_padded(aad);
+    m.update_padded(ct);
+    let mut lens = [0u8; 16];
+    lens[..8].copy_from_slice(&(aad.len() as u64).to_le_bytes());
+    lens[8..].copy_from_slice(&(ct.len() as u64).to_le_bytes());
+    m.update_padded(&lens);
+    m.finalize().into()
+}
+
+fn cipher(key: &[u8; 32], n: &[u8; 12]) -> (ChaCha20, [u8; 32]) {
+    let mut c = ChaCha20::new(key.into(), n.into());
+    let mut b0 = [0u8; 64];
+    c.apply_keystream(&mut b0); // block 0 -> Poly1305 key; the stream continues at block 1
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&b0[..32]);
+    (c, pk)
+}
+
+pub fn seal(key: &[u8; 32], n: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
+    let (mut c, pk) = cipher(key, n);
+    c.apply_keystream(buf);
+    tag(&pk, aad, buf)
+}
+
+pub fn open(key: &[u8; 32], n: &[u8; 12], aad: &[u8], buf: &mut [u8], t: &[u8]) -> bool {
+    let (mut c, pk) = cipher(key, n);
+    let want = tag(&pk, aad, buf);
+    if t.len() != 16 {
+        return false;
+    }
+    let diff = want.iter().zip(t).fold(0u8, |a, (x, y)| a | (x ^ y));
+    if diff != 0 {
+        return false;
+    }
+    c.apply_keystream(buf);
+    true
+}
+
+pub fn session_key(master: &[u8; 32], boot_id: &[u8; 16], sess: u32, nc: &[u8; 16]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"nc110-bmctl-v1 session");
+    h.update(master);
+    h.update(boot_id);
+    h.update(sess.to_le_bytes());
+    h.update(nc);
+    h.finalize().into()
+}
+
+fn who_check(master: &[u8; 32], nc: &[u8; 16], boot_id: &[u8; 16], sess: u32) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"nc110-bmctl-v1 who");
+    h.update(master);
+    h.update(nc);
+    h.update(boot_id);
+    h.update(sess.to_le_bytes());
+    h.finalize().into()
+}
+
+struct Sess {
+    id: u32,
+    key: [u8; 32],
+    last_seq: u64,
+    peer: Option<IpEndpoint>,
+    last_t: i64,
+    retx: u8,
+    reply: [u8; 8 + 1300 + 16],
+    reply_len: usize,
+}
+
+pub fn derive_key(seed: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"nc110-bmctl-v1");
+    h.update(seed);
+    h.finalize().into()
+}
+
+fn hex(b: &[u8], out: &mut heapless::String<64>) {
+    for x in b {
+        let _ = core::fmt::write(out, format_args!("{:02x}", x));
+    }
+}
+
+extern "C" {
+    static __load_start: u8;
+    static __bss_end: u8;
+}
+
+/// Allowlisted read. Returns Err(reason) for anything outside the policy; never touches refused addresses.
+fn peek(w: &mut Writer, nic_mmio: Option<u64>, what: &str, a: &str, b: &str) -> Result<(), &'static str> {
+    let addr = u64::from_str_radix(a.trim_start_matches("0x"), 16).map_err(|_| "addr: hex")?;
+    let n: u64 = b.parse().map_err(|_| "len/width: decimal")?;
+    match what {
+        "mem" => {
+            if n == 0 || n > 512 {
+                return Err("len 1..512");
+            }
+            let end = addr.checked_add(n).ok_or("overflow")?;
+            let (ks, ke) = (core::ptr::addr_of!(__load_start) as u64, core::ptr::addr_of!(__bss_end) as u64);
+            if addr < ke && ks < end {
+                return Err("refused: kernel image (code, stack, keys)");
+            }
+            if end > 0x1_0000_0000 || !crate::mb::ram_contains(addr, n) {
+                return Err("refused: not inside one multiboot RAM range below 4 GiB");
+            }
+            for i in 0..n {
+                let v = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
+                let _ = core::fmt::write(w, format_args!("{:02x}", v));
+            }
+        }
+        "nic" => {
+            let base = nic_mmio.ok_or("refused: NIC not on MMIO")?;
+            if addr % 4 != 0 || n % 4 != 0 || n == 0 || addr.checked_add(n).is_none_or(|e| e > 0x100) {
+                return Err("nic: dword-aligned offset/len inside 0..0x100");
+            }
+            for o in (addr..addr + n).step_by(4) {
+                let v = unsafe { core::ptr::read_volatile((base + o) as *const u32) };
+                let _ = core::fmt::write(w, format_args!("{:08x} ", v));
+            }
+        }
+        "io" => {
+            let pm = wdt::pmbase() as u64;
+            if pm == 0 || !matches!(n, 1 | 2 | 4) || addr % n != 0 || addr < pm || addr + n > pm + 0x80 {
+                return Err("io: width 1|2|4, aligned, inside PMBASE..PMBASE+0x80 only");
+            }
+            let p = addr as u16;
+            let v = unsafe { match n { 1 => inb(p) as u32, 2 => inw(p) as u32, _ => inl(p) } };
+            let _ = core::fmt::write(w, format_args!("{:#x}", v));
+        }
+        _ => return Err("peek mem <hexaddr> <len> | peek nic <hexoff> <len> | peek io <hexport> <1|2|4>"),
+    }
+    Ok(())
+}
+
+pub fn run(nic: Rtl, seed: [u8; 32]) {
+    let nic_mmio = match nic.bus {
+        Bus::Mmio(b) => Some(b),
+        Bus::Pio(_) => None,
+    };
+    if rng::init(false).is_err() {
+        return;
+    }
+    let key = derive_key(&seed);
+    let mut boot_id = [0u8; 16];
+    let mut rs = [0u8; 8];
+    if rng::fill(&mut boot_id).is_err() || rng::fill(&mut rs).is_err() {
+        kprintln!("bmctl: entropy failed -> not starting");
+        return;
+    }
+    let mut bid = heapless::String::<64>::new();
+    hex(&boot_id, &mut bid);
+    let mac = nic.mac;
+    let mut dev = Nic(nic);
+    let mut cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    cfg.random_seed = u64::from_le_bytes(rs);
+    let mut iface = Interface::new(cfg, &mut dev, now());
+    let mut sockets = SocketSet::new(unsafe { &mut *core::ptr::addr_of_mut!(SOCKS) }[..].as_mut());
+    let dhcp_h = sockets.add(dhcpv4::Socket::new());
+    let udp_h = sockets.add(udp::Socket::new(
+        udp::PacketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(RX_META) }[..].as_mut(), unsafe { &mut *core::ptr::addr_of_mut!(RX_BUF) }[..].as_mut()),
+        udp::PacketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(TX_META) }[..].as_mut(), unsafe { &mut *core::ptr::addr_of_mut!(TX_BUF) }[..].as_mut()),
+    ));
+    let t0 = time::now_ms();
+    let mut ip = None;
+    while ip.is_none() && time::now_ms() - t0 < 15_000 {
+        wdt::pet();
+        crate::net::rx_budget(Some(32));
+        iface.poll(now(), &mut dev, &mut sockets);
+        if let Some(dhcpv4::Event::Configured(c)) = sockets.get_mut::<dhcpv4::Socket>(dhcp_h).poll() {
+            iface.update_ip_addrs(|a| {
+                a.clear();
+                let _ = a.push(IpCidr::Ipv4(c.address));
+            });
+            if let Some(gw) = c.router {
+                let _ = iface.routes_mut().add_default_ipv4_route(gw);
+            }
+            ip = Some(c.address);
+        }
+    }
+    let Some(ip) = ip else {
+        kprintln!("bmctl: no DHCP lease in 15 s -> not starting");
+        return;
+    };
+    sockets.get_mut::<udp::Socket>(udp_h).bind(PORT).expect("bind");
+    kprintln!("bmctl: listening on {}:{} boot id {} (idle reset after {} s)", ip.address(), PORT, bid, IDLE_MS / 1000);
+    crate::udplog::dump(5);
+
+    let (mut last_ok, mut last_hello) = (time::now_ms(), 0i64);
+    let (mut ok, mut bad, mut replay, mut retx) = (0u32, 0u32, 0u32, 0u32);
+    let (mut next_sess, mut who_window, mut who_count) = (1u32, 0i64, 0u32);
+    let sess = unsafe { &mut *core::ptr::addr_of_mut!(SESS) };
+    let pend = unsafe { &mut *core::ptr::addr_of_mut!(PEND) };
+    let mut reboot_at: Option<i64> = None;
+    loop {
+        wdt::pet();
+        crate::net::rx_budget(Some(32)); // bounded ingress per poll so the deadline checks below always run
+        iface.poll(now(), &mut dev, &mut sockets);
+        let t = time::now_ms();
+        if t - last_ok > IDLE_MS {
+            kprintln!("bmctl: idle {} s -> reset", IDLE_MS / 1000);
+            return;
+        }
+        if reboot_at.is_some_and(|r| t > r) {
+            kprintln!("bmctl: reboot requested");
+            wdt::hard_reset();
+        }
+        let sock = sockets.get_mut::<udp::Socket>(udp_h);
+        if t - last_hello > 2000 {
+            last_hello = t;
+            let mut h = heapless::String::<128>::new();
+            let _ = core::fmt::write(&mut h, format_args!("nc110 hello bmctl {}:{} boot {}", ip.address(), PORT, bid));
+            let _ = sock.send_slice(h.as_bytes(), IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::BROADCAST), 5514));
+        }
+        let mut buf = [0u8; 1500];
+        let Ok((n, meta)) = sock.recv_slice(&mut buf) else { continue };
+        let from = meta.endpoint;
+        if n == 3 + 16 && &buf[..3] == b"who" {
+            if t - who_window > 1000 {
+                (who_window, who_count) = (t, 0);
+            }
+            who_count += 1;
+            if who_count > 10 {
+                continue; // global cap: at most 10 clear-text replies per second (reflection)
+            }
+            // Unauthenticated `who` only ever writes the pending table (round-robin), never an authenticated session.
+            let slot = Some((next_sess as usize) % pend.len());
+            let (Some(slot), Some(next)) = (slot, next_sess.checked_add(1)) else { continue };
+            let id = next_sess;
+            next_sess = next;
+            let mut nc = [0u8; 16];
+            nc.copy_from_slice(&buf[3..19]);
+            pend[slot] = Some(Sess { id, key: session_key(&key, &boot_id, id, &nc), last_seq: 0, peer: Some(from), last_t: t, retx: 0, reply: [0; 8 + 1300 + 16], reply_len: 0 });
+            let mut chk = heapless::String::<64>::new();
+            hex(&who_check(&key, &nc, &boot_id, id)[..16], &mut chk);
+            let mut h = heapless::String::<160>::new();
+            let _ = core::fmt::write(&mut h, format_args!("nc110 boot {} session {} check {}", bid, id, chk));
+            let _ = sock.send_slice(h.as_bytes(), from);
+            continue;
+        }
+        // Frame: [session u32 LE][seq u64 LE][ct][tag]
+        if n < 4 + 8 + 16 {
+            bad += 1;
+            continue;
+        }
+        let sid = u32::from_le_bytes(buf[..4].try_into().unwrap());
+        // Authenticated session, or a pending one from the endpoint that asked `who` (promoted below once the frame
+        // authenticates; only then may it evict the least recently used authenticated session).
+        let in_sess = sess.iter().position(|x| x.as_ref().is_some_and(|x| x.id == sid && x.peer == Some(from)));
+        let in_pend = pend.iter().position(|x| x.as_ref().is_some_and(|x| x.id == sid && x.peer == Some(from)));
+        let se = match (in_sess, in_pend) {
+            (Some(i), _) => sess[i].as_mut().unwrap(),
+            (None, Some(i)) => pend[i].as_mut().unwrap(),
+            _ => {
+                bad += 1;
+                continue;
+            }
+        };
+        let seq = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+        let (body, tg) = buf[12..n].split_at_mut(n - 12 - 16);
+        if !open(&se.key, &nonce(b"C2K\0", seq), &boot_id, body, tg) {
+            bad += 1;
+            continue;
+        }
+        if seq == se.last_seq && se.reply_len > 0 {
+            if se.retx >= 5 {
+                continue; // cap resends of one reply
+            }
+            se.retx += 1;
+            retx += 1; // retry of the last request: same bytes again (to the bound peer), nothing re-executed
+            let _ = sock.send_slice(&se.reply[..se.reply_len], from);
+            continue;
+        }
+        if seq <= se.last_seq {
+            replay += 1;
+            continue;
+        }
+        se.last_seq = seq;
+        se.last_t = t;
+        se.retx = 0;
+        last_ok = t;
+        let se = if let (None, Some(i)) = (in_sess, in_pend) {
+            let dst = (0..sess.len()).find(|&j| sess[j].is_none())
+                .unwrap_or_else(|| (0..sess.len()).min_by_key(|&j| sess[j].as_ref().map_or(i64::MIN, |x| x.last_t)).unwrap());
+            sess[dst] = pend[i].take();
+            sess[dst].as_mut().unwrap()
+        } else {
+            se
+        };
+        ok += 1;
+        let mut out = [0u8; 1300];
+        let len = {
+            let mut w = Writer { b: &mut out, n: 0 };
+            let cmd = core::str::from_utf8(body).unwrap_or("");
+            let mut it = cmd.split(' ');
+            match it.next().unwrap_or("") {
+                "ping" => {
+                    let _ = core::fmt::write(&mut w, format_args!("pong uptime_ms={} ip={}", t, ip.address()));
+                }
+                "stats" => {
+                    let _ = core::fmt::write(&mut w, format_args!("ok={} bad={} replay={} retx={} sessions_issued={} log_bytes={}", ok, bad, replay, retx, next_sess - 1, console::captured().len()));
+                }
+                "log" => {
+                    let off: usize = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                    let l = console::captured();
+                    let st = off.min(l.len());
+                    let s = &l[st..st.saturating_add(1200).min(l.len())];
+                    w.put(s);
+                }
+                "peek" => {
+                    let (what, x, y) = (it.next().unwrap_or(""), it.next().unwrap_or(""), it.next().unwrap_or(""));
+                    if let Err(e) = peek(&mut w, nic_mmio, what, x, y) {
+                        w.n = 0;
+                        let _ = core::fmt::write(&mut w, format_args!("err {}", e));
+                    }
+                }
+                "reboot" => {
+                    let _ = core::fmt::write(&mut w, format_args!("rebooting in 500 ms"));
+                    reboot_at = Some(t + 500);
+                }
+                _ => {
+                    let _ = core::fmt::write(&mut w, format_args!("err unknown command (ping|stats|log <off>|peek ...|reboot)"));
+                }
+            }
+            w.n
+        };
+        let pkt = &mut se.reply;
+        pkt[..8].copy_from_slice(&seq.to_le_bytes());
+        pkt[8..8 + len].copy_from_slice(&out[..len]);
+        let tg = seal(&se.key, &nonce(b"K2C\0", seq), &boot_id, &mut pkt[8..8 + len]);
+        pkt[8 + len..8 + len + 16].copy_from_slice(&tg);
+        se.reply_len = 8 + len + 16;
+        let _ = sock.send_slice(&se.reply[..se.reply_len], from);
+    }
+}
+
+struct Writer<'a> {
+    b: &'a mut [u8],
+    n: usize,
+}
+impl Writer<'_> {
+    fn put(&mut self, s: &[u8]) {
+        let k = s.len().min(self.b.len() - self.n);
+        self.b[self.n..self.n + k].copy_from_slice(&s[..k]);
+        self.n += k;
+    }
+}
+impl core::fmt::Write for Writer<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.put(s.as_bytes());
+        Ok(())
+    }
+}
+[package]
+name = "nc110-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+neg-control = []
+grub-armed = []
+attended = []  # NC110 with evnchn at the machine: no watchdog gate (the TCO hangs this board instead of resetting it), 0xCF9 reset after 60 s
+badpin = []  # negative control: flip one bit of the pinned host key
+badjitter = []  # negative control: constant TSC in the jitter source, startup health test must refuse SSH
+
+[dependencies]
+# M2: pinned exact versions (Cargo.lock is committed too).
+sunset = { version = "=0.6.0", default-features = false }
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-tcp", "socket-dhcpv4", "socket-udp"] }
+getrandom = { version = "0.4", default-features = false }
+log = "0.4"
+heapless = { version = "=0.9.3", default-features = false }  # M3: sunset::Pty.term is a heapless::String
+sha2 = { version = "=0.11.1", default-features = false }
+chacha20 = { version = "=0.9.1", default-features = false }  # bmctl AEAD (RFC 8439), same versions sunset already pulls in
+poly1305 = { version = "=0.9.1", default-features = false }
+
+[[bin]]
+name = "nc110-kernel"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+src/nic.rs:2://!   10ec:8136 RTL8101E family (the NC110's wired NIC): MMIO only, r8169-style init. NOT RUNNABLE IN QEMU.
+src/nic.rs:3://!   10ec:8139 rtl8139 in C+ mode (QEMU stand-in): port I/O BAR0, or MMIO BAR1 with cmdline `nic=mmio`.
+src/nic.rs:9://! - MMIO base must be a 32-bit-reachable memory BAR, 256-byte aligned, outside multiboot RAM, and unable to
+src/nic.rs:155:    if crate::ram_overlaps(base, 0x100) {
+src/main.rs:60:    let client_seed = mb::take_client_key(info);
+src/main.rs:61:    mb::parse_memory(info);
+src/main.rs:91:                        bmctl::run(n, seed);
+src/main.rs:118:pub fn ram_overlaps(base: u64, len: u64) -> bool {
+src/main.rs:119:    mb::ram_overlaps(base, len)
+
+web search: RTL8105E datasheet "read" "clear"
+web search: 
+web search: 'read will'
+exec
+/bin/zsh -lc "git show cde7343:Cargo.toml; git show cde7343:src/bmctl.rs | sed -n '250,365p'; git show cde7343:tools/bmctl-q35-test.sh | tail -25; nl -ba src/bmctl.rs | sed -n '140,192p'" in ~/nc110-baremetal
+ succeeded in 0ms:
+[package]
+name = "nc110-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+neg-control = []
+grub-armed = []
+attended = []  # NC110 with evnchn at the machine: no watchdog gate (the TCO hangs this board instead of resetting it), 0xCF9 reset after 60 s
+badpin = []  # negative control: flip one bit of the pinned host key
+badjitter = []  # negative control: constant TSC in the jitter source, startup health test must refuse SSH
+
+[dependencies]
+# M2: pinned exact versions (Cargo.lock is committed too).
+sunset = { version = "=0.6.0", default-features = false }
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-tcp", "socket-dhcpv4", "socket-udp"] }
+getrandom = { version = "0.4", default-features = false }
+log = "0.4"
+heapless = { version = "=0.9.3", default-features = false }  # M3: sunset::Pty.term is a heapless::String
+sha2 = { version = "=0.11.1", default-features = false }
+chacha20 = { version = "=0.9.1", default-features = false }  # bmctl AEAD (RFC 8439), same versions sunset already pulls in
+poly1305 = { version = "=0.9.1", default-features = false }
+
+[[bin]]
+name = "nc110-kernel"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+        let t = time::now_ms();
+        if t - last_ok > IDLE_MS {
+            kprintln!("bmctl: idle {} s -> reset", IDLE_MS / 1000);
+            return;
+        }
+        if reboot_at.is_some_and(|r| t > r) {
+            kprintln!("bmctl: reboot requested");
+            wdt::hard_reset();
+        }
+        let sock = sockets.get_mut::<udp::Socket>(udp_h);
+        if t - last_hello > 2000 {
+            last_hello = t;
+            let mut h = heapless::String::<128>::new();
+            let _ = core::fmt::write(&mut h, format_args!("nc110 hello bmctl {}:{} boot {}", ip.address(), PORT, bid));
+            let _ = sock.send_slice(h.as_bytes(), IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::BROADCAST), 5514));
+        }
+        let mut buf = [0u8; 1500];
+        let Ok((n, meta)) = sock.recv_slice(&mut buf) else { continue };
+        let from = meta.endpoint;
+        if n == 3 + 16 && &buf[..3] == b"who" {
+            if t - who_window > 1000 {
+                (who_window, who_count) = (t, 0);
+            }
+            who_count += 1;
+            if who_count > 10 {
+                continue; // global cap: at most 10 clear-text replies per second (reflection)
+            }
+            // Unauthenticated `who` only ever writes the pending table (round-robin), never an authenticated session.
+            let slot = Some((next_sess as usize) % pend.len());
+            let (Some(slot), Some(next)) = (slot, next_sess.checked_add(1)) else { continue };
+            let id = next_sess;
+            next_sess = next;
+            let mut nc = [0u8; 16];
+            nc.copy_from_slice(&buf[3..19]);
+            pend[slot] = Some(Sess { id, key: session_key(&key, &boot_id, id, &nc), last_seq: 0, peer: Some(from), last_t: t, retx: 0, reply: [0; 8 + 1300 + 16], reply_len: 0 });
+            let mut chk = heapless::String::<64>::new();
+            hex(&who_check(&key, &nc, &boot_id, id)[..16], &mut chk);
+            let mut h = heapless::String::<160>::new();
+            let _ = core::fmt::write(&mut h, format_args!("nc110 boot {} session {} check {}", bid, id, chk));
+            let _ = sock.send_slice(h.as_bytes(), from);
+            continue;
+        }
+        // Frame: [session u32 LE][seq u64 LE][ct][tag]
+        if n < 4 + 8 + 16 {
+            bad += 1;
+            continue;
+        }
+        let sid = u32::from_le_bytes(buf[..4].try_into().unwrap());
+        // Authenticated session, or a pending one from the endpoint that asked `who` (promoted below once the frame
+        // authenticates; only then may it evict the least recently used authenticated session).
+        let in_sess = sess.iter().position(|x| x.as_ref().is_some_and(|x| x.id == sid && x.peer == Some(from)));
+        let in_pend = pend.iter().position(|x| x.as_ref().is_some_and(|x| x.id == sid && x.peer == Some(from)));
+        let se = match (in_sess, in_pend) {
+            (Some(i), _) => sess[i].as_mut().unwrap(),
+            (None, Some(i)) => pend[i].as_mut().unwrap(),
+            _ => {
+                bad += 1;
+                continue;
+            }
+        };
+        let seq = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+        let (body, tg) = buf[12..n].split_at_mut(n - 12 - 16);
+        if !open(&se.key, &nonce(b"C2K\0", seq), &boot_id, body, tg) {
+            bad += 1;
+            continue;
+        }
+        if seq == se.last_seq && se.reply_len > 0 {
+            if se.retx >= 5 {
+                continue; // cap resends of one reply
+            }
+            se.retx += 1;
+            retx += 1; // retry of the last request: same bytes again (to the bound peer), nothing re-executed
+            let _ = sock.send_slice(&se.reply[..se.reply_len], from);
+            continue;
+        }
+        if seq <= se.last_seq {
+            replay += 1;
+            continue;
+        }
+        se.last_seq = seq;
+        se.last_t = t;
+        se.retx = 0;
+        last_ok = t;
+        let se = if let (None, Some(i)) = (in_sess, in_pend) {
+            let dst = (0..sess.len()).find(|&j| sess[j].is_none())
+                .unwrap_or_else(|| (0..sess.len()).min_by_key(|&j| sess[j].as_ref().map_or(i64::MIN, |x| x.last_t)).unwrap());
+            sess[dst] = pend[i].take();
+            sess[dst].as_mut().unwrap()
+        } else {
+            se
+        };
+        ok += 1;
+        let mut out = [0u8; 1300];
+        let len = {
+            let mut w = Writer { b: &mut out, n: 0 };
+            let cmd = core::str::from_utf8(body).unwrap_or("");
+            let mut it = cmd.split(' ');
+            match it.next().unwrap_or("") {
+                "ping" => {
+                    let _ = core::fmt::write(&mut w, format_args!("pong uptime_ms={} ip={}", t, ip.address()));
+                }
+                "stats" => {
+                    let _ = core::fmt::write(&mut w, format_args!("ok={} bad={} replay={} retx={} sessions_issued={} log_bytes={}", ok, bad, replay, retx, next_sess - 1, console::captured().len()));
+                }
+                "log" => {
+                    let off: usize = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                    let l = console::captured();
+                    let st = off.min(l.len());
+                    let s = &l[st..st.saturating_add(1200).min(l.len())];
+                    w.put(s);
+                }
+                "peek" => {
+                    let (what, x, y) = (it.next().unwrap_or(""), it.next().unwrap_or(""), it.next().unwrap_or(""));
+                    if let Err(e) = peek(&mut w, nic_mmio, what, x, y) {
+                        w.n = 0;
+                        let _ = core::fmt::write(&mut w, format_args!("err {}", e));
+bad |= silent(frame(6, aead=aead_for(os.urandom(16), boot, sid)), "8 key from a replayed who reply + new Nc")
+# 9: flood of who must not evict the live authenticated session
+for _ in range(40):
+    try: who()
+    except socket.timeout: pass
+s.sendto(frame(7), ep)
+try: s.recvfrom(2048); print("ok   9 live session survives a who flood")
+except socket.timeout: print("FAIL 9 live session evicted by who flood"); bad = 1
+sys.exit(bad)
+PY
+chk() { r=$($B $2); echo "$1: $r"; case "$r" in $3) ;; *) echo "   ^ FAIL (want $3)"; fail=1;; esac; }
+chk "p1 mem BIOS data area" "peek mem 0x400 16"        "[0-9a-f]*"
+chk "p2 mem kernel image"   "peek mem 0x100000 16"     "err refused: kernel image*"
+chk "p3 mem LAPIC (not RAM)" "peek mem 0xfee00000 4"   "err refused: not inside*"
+chk "p4 mem len too big"    "peek mem 0x400 4096"      "err len*"
+chk "p5 mem wraps"          "peek mem 0xffffffffffffffff 16" "err *"
+chk "p6 nic regs 0..8"      "peek nic 0x0 8"           "[0-9a-f]* [0-9a-f]* "
+chk "p7 nic past window"    "peek nic 0xfc 8"          "err nic*"
+chk "p8 io TCO1_CNT"        "peek io 0x668 2"          "0x*"
+chk "p9 io i8042 data"      "peek io 0x60 1"           "err io*"
+r=$($B stats); echo "8 stats:   $r"
+r=$($B logall | grep -c .); echo "9 log:     $r lines"; [ "$r" -gt 5 ] || fail=1
+echo "10 reboot: $($B reboot)"; sleep 2
+if kill -0 $Q 2>/dev/null; then echo "FAIL qemu still running after reboot"; fail=1; else echo "ok   qemu exited after reboot"; fi
+echo "RESULT: $([ $fail = 0 ] && echo PASS || echo FAIL)"; exit $fail
+   140	
+   141	/// Allowlisted read. Returns Err(reason) for anything outside the policy; never touches refused addresses.
+   142	fn peek(w: &mut Writer, nic_mmio: Option<u64>, what: &str, a: &str, b: &str) -> Result<(), &'static str> {
+   143	    let addr = u64::from_str_radix(a.trim_start_matches("0x"), 16).map_err(|_| "addr: hex")?;
+   144	    let n: u64 = b.parse().map_err(|_| "len/width: decimal")?;
+   145	    match what {
+   146	        "mem" => {
+   147	            if n == 0 || n > 512 {
+   148	                return Err("len 1..512");
+   149	            }
+   150	            let end = addr.checked_add(n).ok_or("overflow")?;
+   151	            let (ks, ke) = (core::ptr::addr_of!(__load_start) as u64, core::ptr::addr_of!(__bss_end) as u64);
+   152	            if addr < ke && ks < end {
+   153	                return Err("refused: kernel image (code, stack, keys)");
+   154	            }
+   155	            if end > 0x1_0000_0000 || !crate::mb::ram_contains(addr, n) {
+   156	                return Err("refused: not inside one multiboot RAM range below 4 GiB");
+   157	            }
+   158	            for i in 0..n {
+   159	                let v = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
+   160	                let _ = core::fmt::write(w, format_args!("{:02x}", v));
+   161	            }
+   162	        }
+   163	        "nic" => {
+   164	            let base = nic_mmio.ok_or("refused: NIC not on MMIO")?;
+   165	            if addr % 4 != 0 || n % 4 != 0 || n == 0 || addr.checked_add(n).is_none_or(|e| e > 0x100) {
+   166	                return Err("nic: dword-aligned offset/len inside 0..0x100");
+   167	            }
+   168	            for o in (addr..addr + n).step_by(4) {
+   169	                let v = unsafe { core::ptr::read_volatile((base + o) as *const u32) };
+   170	                let _ = core::fmt::write(w, format_args!("{:08x} ", v));
+   171	            }
+   172	        }
+   173	        "io" => {
+   174	            let pm = wdt::pmbase() as u64;
+   175	            if pm == 0 || !matches!(n, 1 | 2 | 4) || addr % n != 0 || addr < pm || addr + n > pm + 0x80 {
+   176	                return Err("io: width 1|2|4, aligned, inside PMBASE..PMBASE+0x80 only");
+   177	            }
+   178	            let p = addr as u16;
+   179	            let v = unsafe { match n { 1 => inb(p) as u32, 2 => inw(p) as u32, _ => inl(p) } };
+   180	            let _ = core::fmt::write(w, format_args!("{:#x}", v));
+   181	        }
+   182	        _ => return Err("peek mem <hexaddr> <len> | peek nic <hexoff> <len> | peek io <hexport> <1|2|4>"),
+   183	    }
+   184	    Ok(())
+   185	}
+   186	
+   187	pub fn run(nic: Rtl, seed: [u8; 32]) {
+   188	    let nic_mmio = match nic.bus {
+   189	        Bus::Mmio(b) => Some(b),
+   190	        Bus::Pio(_) => None,
+   191	    };
+   192	    if rng::init(false).is_err() {
+
+codex
+I found an I/O range-check overflow and a hardware-specific issue: NM10’s permitted PM window includes registers whose reads request CPU sleep states. The RAM bounds protect the kernel stack and page tables, but still allow reading bootloader leftovers outside the image.
+web search: 
+web search: 
+exec
+/bin/zsh -lc "git show cde7343:tools/bmctl-q35-test.sh | head -24; rg -n 'get_regs|memcpy_fromio|RxErr|0x72|read.clear' third_party/linux-v6.12/r8169_main.c third_party/linux-v6.12/8139cp.c; rg -n 'overflow-checks|rustflags' .cargo Cargo.toml; git diff cde7343 -- src/bmctl.rs src/mb.rs linker.ld src/boot.s; python3 -c 'pm=0x600; mask=(1<<64)-1; [(print(hex(a),n,\"accepted=\",a%n==0 and a>=pm and ((a+n)&mask)<=pm+0x80,\"port=\",hex(a&65535))) for a,n in [(mask,1),(mask-1,2),(mask-3,4)]]'" in ~/nc110-baremetal
+ succeeded in 0ms:
+#!/bin/sh
+# q35 check of bmctl: positive path + wrong key + replay + tamper + other-boot + retry cache. Exit 1 on any failure.
+K=target/attended/x86_64-unknown-none/release/nc110-kernel; P=tools/.venv/bin/python; fail=0
+qemu-system-x86_64 -machine q35 -m 128 -display none -no-reboot -global ICH9-LPC.noreboot=false -serial file:/tmp/bmctl-q35.log \
+  -kernel $K -initrd test-keys/client.key -append "bmctl nic=mmio" -netdev user,id=n0,hostfwd=udp:127.0.0.1:15515-:5515 -device rtl8139,netdev=n0 &
+Q=$!; trap 'kill $Q 2>/dev/null' EXIT
+for i in $(seq 40); do grep -q 'bmctl: listening' /tmp/bmctl-q35.log 2>/dev/null && break; sleep 0.5; done
+B="$P tools/bmctl.py --host 127.0.0.1 --port 15515"
+r=$($B ping); echo "1 ping:    $r"; case "$r" in pong*) ;; *) fail=1;; esac
+head -c 72 /dev/urandom > /tmp/bmctl-badkey.bin
+r=$($B --key /tmp/bmctl-badkey.bin ping 2>&1); echo "2 bad key: $r"; case "$r" in *"failed its check"*) ;; *) fail=1;; esac
+$P - <<'PY' || fail=1
+import hashlib, os, socket, struct, sys
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+km = open("test-keys/client.key", "rb").read(); master = hashlib.sha256(b"nc110-bmctl-v1" + km[8:40]).digest()
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.5); ep = ("127.0.0.1", 15515)
+def who():
+    nc = os.urandom(16); s.sendto(b"who" + nc, ep); w = s.recvfrom(256)[0].split()
+    return nc, bytes.fromhex(w[2].decode()), int(w[4])
+def aead_for(nc, boot, sid):
+    return ChaCha20Poly1305(hashlib.sha256(b"nc110-bmctl-v1 session" + master + boot + struct.pack("<I", sid) + nc).digest())
+nc, boot, sid = who(); a = aead_for(nc, boot, sid)
+def frame(seq, msg=b"ping", aead=a, bid=boot, sess=sid):
+    return struct.pack("<IQ", sess, seq) + aead.encrypt(b"C2K\0" + struct.pack("<Q", seq), msg, bid)
+third_party/linux-v6.12/8139cp.c:180:	RxError		= (1 << 20), /* Rx error summary */
+third_party/linux-v6.12/8139cp.c:201:	RxErrFrame	= (1 << 27), /* Rx frame alignment error */
+third_party/linux-v6.12/8139cp.c:203:	RxErrCRC	= (1 << 18), /* Rx CRC error */
+third_party/linux-v6.12/8139cp.c:204:	RxErrRunt	= (1 << 19), /* Rx error, packet < 64 bytes */
+third_party/linux-v6.12/8139cp.c:205:	RxErrLong	= (1 << 21), /* Rx error, packet > 4096 bytes */
+third_party/linux-v6.12/8139cp.c:206:	RxErrFIFO	= (1 << 22), /* Rx error, FIFO overflowed, pkt bad */
+third_party/linux-v6.12/8139cp.c:232:	RxErr		= (1 << 1),  /* Rx error */
+third_party/linux-v6.12/8139cp.c:239:			  RxErr | RxOK | IntrResvd,
+third_party/linux-v6.12/8139cp.c:288:	cp_rx_intr_mask = RxOK | RxErr | RxEmpty | RxFIFOOvr,
+third_party/linux-v6.12/8139cp.c:440:	if (status & RxErrFrame)
+third_party/linux-v6.12/8139cp.c:442:	if (status & RxErrCRC)
+third_party/linux-v6.12/8139cp.c:444:	if ((status & RxErrRunt) || (status & RxErrLong))
+third_party/linux-v6.12/8139cp.c:448:	if (status & RxErrFIFO)
+third_party/linux-v6.12/8139cp.c:502:		if (status & (RxError | RxErrFIFO)) {
+third_party/linux-v6.12/8139cp.c:603:	if (status & (RxOK | RxErr | RxEmpty | RxFIFOOvr))
+third_party/linux-v6.12/8139cp.c:1401:static int cp_get_regs_len(struct net_device *dev)
+third_party/linux-v6.12/8139cp.c:1487:static void cp_get_regs(struct net_device *dev, struct ethtool_regs *regs,
+third_party/linux-v6.12/8139cp.c:1499:	memcpy_fromio(p, cp->regs, CP_REGS_SIZE);
+third_party/linux-v6.12/8139cp.c:1587:	.get_regs_len		= cp_get_regs_len,
+third_party/linux-v6.12/8139cp.c:1593:	.get_regs		= cp_get_regs,
+third_party/linux-v6.12/r8169_main.c:369:	RxErr		= 0x0002,
+third_party/linux-v6.12/r8169_main.c:1672:static int rtl8169_get_regs_len(struct net_device *dev)
+third_party/linux-v6.12/r8169_main.c:1751:static void rtl8169_get_regs(struct net_device *dev, struct ethtool_regs *regs,
+third_party/linux-v6.12/r8169_main.c:1760:		memcpy_fromio(dw++, data++, 4);
+third_party/linux-v6.12/r8169_main.c:2193:	.get_regs_len		= rtl8169_get_regs_len,
+third_party/linux-v6.12/r8169_main.c:2197:	.get_regs		= rtl8169_get_regs,
+third_party/linux-v6.12/r8169_main.c:5126:	tp->irq_mask = RxOK | RxErr | TxOK | TxErr | LinkChg;
+.cargo/config.toml:5:rustflags = ["-C", "relocation-model=static", "-C", "link-arg=-zmax-page-size=0x1000", "--cfg", "getrandom_backend=\"custom\"",
+0xffffffffffffffff 1 accepted= True port= 0xffff
+0xfffffffffffffffe 2 accepted= True port= 0xfffe
+0xfffffffffffffffc 4 accepted= True port= 0xfffc
+
+web search: 
+web search: 'cleared to zero by'
+exec
+/bin/zsh -lc "sed -n '1748,1765p' third_party/linux-v6.12/r8169_main.c; /bin/sh -c 'r=\"err refused: not inside one multiboot RAM range\"; case \""'$r" in [0-9a-f]*) echo "p1 incorrectly accepts error";; esac'"'; cat .cargo/config.toml" in ~/nc110-baremetal
+ succeeded in 0ms:
+		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), swab16(opts2 & 0xffff));
+}
+
+static void rtl8169_get_regs(struct net_device *dev, struct ethtool_regs *regs,
+			     void *p)
+{
+	struct rtl8169_private *tp = netdev_priv(dev);
+	u32 __iomem *data = tp->mmio_addr;
+	u32 *dw = p;
+	int i;
+
+	for (i = 0; i < R8169_REGS_SIZE; i += 4)
+		memcpy_fromio(dw++, data++, 4);
+}
+
+static const char rtl8169_gstrings[][ETH_GSTRING_LEN] = {
+	"tx_packets",
+	"rx_packets",
+p1 incorrectly accepts error
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = ["-C", "relocation-model=static", "-C", "link-arg=-zmax-page-size=0x1000", "--cfg", "getrandom_backend=\"custom\"",
+    # soft-float target: SIMD crypto backends make rustc/LLVM abort (SIGTRAP), force portable ones
+    "--cfg", "curve25519_dalek_backend=\"serial\"", "--cfg", "poly1305_backend=\"soft\"", "--cfg", "chacha20_force_soft", "--cfg", "aes_backend=\"soft\"", "--cfg", "sha2_backend=\"soft\""]
+
+codex
+Two MUST-FIX findings; both require authentication. No edits; reviewed source and documentation, without running QEMU/hardware.
+
+- **MUST-FIX — Port-range overflow** ([bmctl.rs:175](~/nc110-baremetal/src/bmctl.rs:175)). `peek io ffffffffffffffff 1` wraps `addr+n` to zero in release, passes validation, then reads port `0xffff`. Widths 2/4 similarly expose `0xfffe`/`0xfffc`. This is a narrow escape, **not arbitrary port access**. Checked-overflow builds panic instead. Use `checked_add` and validate before narrowing to `u16`.
+
+- **MUST-FIX — NM10 PM reads can stop execution.** Allowed offsets `PMBASE+0x14/15/16` request C2/C3/C4; execution resumes only on a break event. Thus an authenticated peek can disrupt or potentially hang this polling kernel. Exclude every access overlapping these registers, including wider reads; preferably allowlist documented register/width pairs. TCO status is write-one-to-clear, and reading TCO_RLD does **not** reload it—the concrete danger here is power-state entry. [Intel NM10 datasheet, §§13.8.3.6–8, 13.9](https://www.mouser.com/pdfdocs/82NM10datasheet.pdf).
+
+- **SHOULD-FIX — External RAM is not secret-free.** Multiboot info, cmdline, original mmap entries, and GRUB leftovers remain readable wherever classified as available RAM outside the image. The consumed 72-byte key module is genuinely wiped; that does not erase possible GRUB file buffers or other copies. Key/grub.cfg remnants are plausible, not demonstrated. This follows the stated RAM policy rather than bypassing it; restrict to explicitly safe buffers if confidentiality from authenticated operators is intended.
+
+- **SHOULD-FIX — “Read-only” does not mean nondestructive NIC inspection.** RTL8139C counters at `0x6c`, `0x6e`, and `0x72` clear on read; permitted dwords at `0x6c`/`0x70` cover them. This loses diagnostics, not demonstrated device control. [Realtek datasheet, §§6.23–26](https://pdf.dzsc.com/RTL/RTL8139.pdf). I did **not** establish equivalent RTL8105E behavior; the pinned Linux r8169 driver also dumps registers using dword reads, supporting a lower-risk assessment for that target.
+
+- **SHOULD-FIX — Tests can falsely pass.** p1’s shell glob `[0-9a-f]*` accepts `err ...` because `e` matches; reproduced locally. Require exact hex lengths and successful exit status. Add I/O overflow, kernel-boundary straddles, mmap holes/range crossings, 4-GiB boundaries, zero/misaligned lengths, and PM sleep-register refusals. q35/8139 coverage cannot validate NM10/8105E side effects.
+
+The RAM arithmetic and half-open kernel-overlap check otherwise look sound: `.bss` includes stack/page tables, and reads must fit one recorded range below 4 GiB. Firmware-misclassified holes/MMIO remain a trust limitation: identity mapping guarantees translation, not safe physical reads. No demonstrated remote way to alter the protected RAM-map copy.
+
+Security readiness: **5/10**
+tokens used
+52,597
+Two MUST-FIX findings; both require authentication. No edits; reviewed source and documentation, without running QEMU/hardware.
+
+- **MUST-FIX — Port-range overflow** ([bmctl.rs:175](~/nc110-baremetal/src/bmctl.rs:175)). `peek io ffffffffffffffff 1` wraps `addr+n` to zero in release, passes validation, then reads port `0xffff`. Widths 2/4 similarly expose `0xfffe`/`0xfffc`. This is a narrow escape, **not arbitrary port access**. Checked-overflow builds panic instead. Use `checked_add` and validate before narrowing to `u16`.
+
+- **MUST-FIX — NM10 PM reads can stop execution.** Allowed offsets `PMBASE+0x14/15/16` request C2/C3/C4; execution resumes only on a break event. Thus an authenticated peek can disrupt or potentially hang this polling kernel. Exclude every access overlapping these registers, including wider reads; preferably allowlist documented register/width pairs. TCO status is write-one-to-clear, and reading TCO_RLD does **not** reload it—the concrete danger here is power-state entry. [Intel NM10 datasheet, §§13.8.3.6–8, 13.9](https://www.mouser.com/pdfdocs/82NM10datasheet.pdf).
+
+- **SHOULD-FIX — External RAM is not secret-free.** Multiboot info, cmdline, original mmap entries, and GRUB leftovers remain readable wherever classified as available RAM outside the image. The consumed 72-byte key module is genuinely wiped; that does not erase possible GRUB file buffers or other copies. Key/grub.cfg remnants are plausible, not demonstrated. This follows the stated RAM policy rather than bypassing it; restrict to explicitly safe buffers if confidentiality from authenticated operators is intended.
+
+- **SHOULD-FIX — “Read-only” does not mean nondestructive NIC inspection.** RTL8139C counters at `0x6c`, `0x6e`, and `0x72` clear on read; permitted dwords at `0x6c`/`0x70` cover them. This loses diagnostics, not demonstrated device control. [Realtek datasheet, §§6.23–26](https://pdf.dzsc.com/RTL/RTL8139.pdf). I did **not** establish equivalent RTL8105E behavior; the pinned Linux r8169 driver also dumps registers using dword reads, supporting a lower-risk assessment for that target.
+
+- **SHOULD-FIX — Tests can falsely pass.** p1’s shell glob `[0-9a-f]*` accepts `err ...` because `e` matches; reproduced locally. Require exact hex lengths and successful exit status. Add I/O overflow, kernel-boundary straddles, mmap holes/range crossings, 4-GiB boundaries, zero/misaligned lengths, and PM sleep-register refusals. q35/8139 coverage cannot validate NM10/8105E side effects.
+
+The RAM arithmetic and half-open kernel-overlap check otherwise look sound: `.bss` includes stack/page tables, and reads must fit one recorded range below 4 GiB. Firmware-misclassified holes/MMIO remain a trust limitation: identity mapping guarantees translation, not safe physical reads. No demonstrated remote way to alter the protected RAM-map copy.
+
+Security readiness: **5/10**
+
+exec
+/bin/zsh -lc "git show HEAD -- src/bmctl.rs tools/bmctl-q35-test.sh; rg --files -g AGENTS.md -g '*nm10*' -g '*NM10*'; nl -ba tools/bmctl-q35-test.sh | tail -45; nl -ba src/bmctl.rs | sed -n '165,205p'" in ~/nc110-baremetal
+ succeeded in 0ms:
+commit 97a82b4d9eeb8f61957ad0a45f31de029e423279
+Author: evnchn <user1@example.invalid>
+Date:   Sun Oct 18 10:09:45 2026 +0800
+
+    bmctl peek: explicit PM/TCO register+width allowlist (LV2-4 C-state registers excluded), checked port math; stricter q35 peek cases incl. C2 register, wraps, straddles, 4 GiB (Codex peek MUST-FIX x2)
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/src/bmctl.rs b/src/bmctl.rs
+index 0bb6b80..f999dbb 100644
+--- a/src/bmctl.rs
++++ b/src/bmctl.rs
+@@ -11,7 +11,10 @@
+ //! The loop pets the watchdog; 10 minutes without a valid command -> 0xCF9 reset.
+ //! `peek` is read-only and allowlisted (see `peek`): RAM only inside the multiboot map and never the kernel image
+ //! (text, data, bss: stack, session table, keys), NIC registers only inside its 256-byte MMIO window as aligned
+-//! dwords, ports only the ACPI PM block (PMBASE..+0x80, which contains the TCO); everything else is refused.
++//! dwords, ports only an explicit allowlist of PM/TCO registers; everything else is refused. Confidentiality note:
++//! RAM outside the image can hold GRUB leftovers (multiboot info, maybe a copy of the key file). That is not an
++//! escalation: the bmctl master key is derived from that same seed, so any authenticated peer already holds it.
++//! NIC dword reads can clear RTL8139 statistics counters (QEMU only); r8169-family dumps use the same reads.
+ use crate::net::Nic;
+ use crate::nic::{Bus, Rtl};
+ use crate::port::{inb, inl, inw};
+@@ -171,11 +174,18 @@ fn peek(w: &mut Writer, nic_mmio: Option<u64>, what: &str, a: &str, b: &str) ->
+             }
+         }
+         "io" => {
++            // Explicit (offset from PMBASE, width) allowlist from the NM10 datasheet (13.8.3, 13.9). Deliberately
++            // absent: LV2/LV3/LV4 at +0x14..+0x16, whose READ requests C2/C3/C4 (Codex MUST-FIX), and anything else.
++            const OK: [(u64, u64); 16] = [
++                (0x00, 2), (0x02, 2), (0x04, 4), (0x08, 4), (0x10, 4), (0x28, 4), (0x2c, 4), (0x30, 4), (0x34, 4),
++                (0x60, 2), (0x64, 2), (0x66, 2), (0x68, 2), (0x6a, 2), (0x72, 2), (0x62, 1),
++            ];
+             let pm = wdt::pmbase() as u64;
+-            if pm == 0 || !matches!(n, 1 | 2 | 4) || addr % n != 0 || addr < pm || addr + n > pm + 0x80 {
+-                return Err("io: width 1|2|4, aligned, inside PMBASE..PMBASE+0x80 only");
++            let off = addr.checked_sub(pm).ok_or("io: below PMBASE")?;
++            if pm == 0 || !OK.contains(&(off, n)) {
++                return Err("io: only allowlisted PM/TCO registers (PMBASE+off,width): 0/2 2/2 4/4 8/4 10/4 28/4 2c/4 30/4 34/4 60/2 62/1 64/2 66/2 68/2 6a/2 72/2");
+             }
+-            let p = addr as u16;
++            let p = u16::try_from(addr).map_err(|_| "io: port > 0xffff")?;
+             let v = unsafe { match n { 1 => inb(p) as u32, 2 => inw(p) as u32, _ => inl(p) } };
+             let _ = core::fmt::write(w, format_args!("{:#x}", v));
+         }
+diff --git a/tools/bmctl-q35-test.sh b/tools/bmctl-q35-test.sh
+index eb1eccd..e635568 100755
+--- a/tools/bmctl-q35-test.sh
++++ b/tools/bmctl-q35-test.sh
+@@ -48,15 +48,23 @@ except socket.timeout: print("FAIL 9 live session evicted by who flood"); bad =
+ sys.exit(bad)
+ PY
+ chk() { r=$($B $2); echo "$1: $r"; case "$r" in $3) ;; *) echo "   ^ FAIL (want $3)"; fail=1;; esac; }
+-chk "p1 mem BIOS data area" "peek mem 0x400 16"        "[0-9a-f]*"
++chk "p1 mem BIOS data area" "peek mem 0x400 16"        "????????????????????????????????"
++case "$r" in err*) echo "   ^ FAIL (error)"; fail=1;; esac
+ chk "p2 mem kernel image"   "peek mem 0x100000 16"     "err refused: kernel image*"
++chk "p2b mem straddles image start" "peek mem 0xffff8 16" "err refused: kernel image*"
+ chk "p3 mem LAPIC (not RAM)" "peek mem 0xfee00000 4"   "err refused: not inside*"
++chk "p3b mem 4 GiB boundary" "peek mem 0xfffffff8 16"  "err refused: not inside*"
+ chk "p4 mem len too big"    "peek mem 0x400 4096"      "err len*"
+-chk "p5 mem wraps"          "peek mem 0xffffffffffffffff 16" "err *"
+-chk "p6 nic regs 0..8"      "peek nic 0x0 8"           "[0-9a-f]* [0-9a-f]* "
++chk "p4b mem len zero"      "peek mem 0x400 0"         "err len*"
++chk "p5 mem wraps"          "peek mem 0xffffffffffffffff 16" "err overflow"
++chk "p6 nic regs 0..8"      "peek nic 0x0 8"           "12005452 00005634 "
+ chk "p7 nic past window"    "peek nic 0xfc 8"          "err nic*"
++chk "p7b nic misaligned"    "peek nic 0x2 4"           "err nic*"
+ chk "p8 io TCO1_CNT"        "peek io 0x668 2"          "0x*"
++chk "p8b io TCO1_CNT wrong width" "peek io 0x668 4"    "err io*"
+ chk "p9 io i8042 data"      "peek io 0x60 1"           "err io*"
++chk "p9b io LV2 (C2 entry)" "peek io 0x614 1"          "err io*"
++chk "p9c io wrap"           "peek io 0xffffffffffffffff 1" "err io*"
+ r=$($B stats); echo "8 stats:   $r"
+ r=$($B logall | grep -c .); echo "9 log:     $r lines"; [ "$r" -gt 5 ] || fail=1
+ echo "10 reboot: $($B reboot)"; sleep 2
+    28	print(("ok  " if r1 == r2 else "FAIL") + " 3 retry of seq 1 -> identical cached reply"); bad |= r1 != r2
+    29	s.sendto(frame(2), ep); s.recvfrom(2048)
+    30	def silent(p, what):
+    31	    s.sendto(p, ep)
+    32	    try: s.recvfrom(2048); print(f"FAIL {what}: got a reply"); return 1
+    33	    except socket.timeout: print(f"ok   {what}: no reply"); return 0
+    34	bad |= silent(frame(1), "4 replay of an older accepted seq")
+    35	t = bytearray(frame(3)); t[14] ^= 1; bad |= silent(bytes(t), "5 tampered ciphertext")
+    36	bad |= silent(frame(4, bid=b"\0" * 16), "6 frame for another boot id")
+    37	bad |= silent(frame(5, sess=sid + 1000), "7 unknown session")
+    38	# 8: a replayed who reply (old boot+session) with a FRESH client nonce gives a different key: frames are rejected,
+    39	# so a replayed reply can never make two runs share (key, nonce).
+    40	bad |= silent(frame(6, aead=aead_for(os.urandom(16), boot, sid)), "8 key from a replayed who reply + new Nc")
+    41	# 9: flood of who must not evict the live authenticated session
+    42	for _ in range(40):
+    43	    try: who()
+    44	    except socket.timeout: pass
+    45	s.sendto(frame(7), ep)
+    46	try: s.recvfrom(2048); print("ok   9 live session survives a who flood")
+    47	except socket.timeout: print("FAIL 9 live session evicted by who flood"); bad = 1
+    48	sys.exit(bad)
+    49	PY
+    50	chk() { r=$($B $2); echo "$1: $r"; case "$r" in $3) ;; *) echo "   ^ FAIL (want $3)"; fail=1;; esac; }
+    51	chk "p1 mem BIOS data area" "peek mem 0x400 16"        "????????????????????????????????"
+    52	case "$r" in err*) echo "   ^ FAIL (error)"; fail=1;; esac
+    53	chk "p2 mem kernel image"   "peek mem 0x100000 16"     "err refused: kernel image*"
+    54	chk "p2b mem straddles image start" "peek mem 0xffff8 16" "err refused: kernel image*"
+    55	chk "p3 mem LAPIC (not RAM)" "peek mem 0xfee00000 4"   "err refused: not inside*"
+    56	chk "p3b mem 4 GiB boundary" "peek mem 0xfffffff8 16"  "err refused: not inside*"
+    57	chk "p4 mem len too big"    "peek mem 0x400 4096"      "err len*"
+    58	chk "p4b mem len zero"      "peek mem 0x400 0"         "err len*"
+    59	chk "p5 mem wraps"          "peek mem 0xffffffffffffffff 16" "err overflow"
+    60	chk "p6 nic regs 0..8"      "peek nic 0x0 8"           "12005452 00005634 "
+    61	chk "p7 nic past window"    "peek nic 0xfc 8"          "err nic*"
+    62	chk "p7b nic misaligned"    "peek nic 0x2 4"           "err nic*"
+    63	chk "p8 io TCO1_CNT"        "peek io 0x668 2"          "0x*"
+    64	chk "p8b io TCO1_CNT wrong width" "peek io 0x668 4"    "err io*"
+    65	chk "p9 io i8042 data"      "peek io 0x60 1"           "err io*"
+    66	chk "p9b io LV2 (C2 entry)" "peek io 0x614 1"          "err io*"
+    67	chk "p9c io wrap"           "peek io 0xffffffffffffffff 1" "err io*"
+    68	r=$($B stats); echo "8 stats:   $r"
+    69	r=$($B logall | grep -c .); echo "9 log:     $r lines"; [ "$r" -gt 5 ] || fail=1
+    70	echo "10 reboot: $($B reboot)"; sleep 2
+    71	if kill -0 $Q 2>/dev/null; then echo "FAIL qemu still running after reboot"; fail=1; else echo "ok   qemu exited after reboot"; fi
+    72	echo "RESULT: $([ $fail = 0 ] && echo PASS || echo FAIL)"; exit $fail
+   165	        }
+   166	        "nic" => {
+   167	            let base = nic_mmio.ok_or("refused: NIC not on MMIO")?;
+   168	            if addr % 4 != 0 || n % 4 != 0 || n == 0 || addr.checked_add(n).is_none_or(|e| e > 0x100) {
+   169	                return Err("nic: dword-aligned offset/len inside 0..0x100");
+   170	            }
+   171	            for o in (addr..addr + n).step_by(4) {
+   172	                let v = unsafe { core::ptr::read_volatile((base + o) as *const u32) };
+   173	                let _ = core::fmt::write(w, format_args!("{:08x} ", v));
+   174	            }
+   175	        }
+   176	        "io" => {
+   177	            // Explicit (offset from PMBASE, width) allowlist from the NM10 datasheet (13.8.3, 13.9). Deliberately
+   178	            // absent: LV2/LV3/LV4 at +0x14..+0x16, whose READ requests C2/C3/C4 (Codex MUST-FIX), and anything else.
+   179	            const OK: [(u64, u64); 16] = [
+   180	                (0x00, 2), (0x02, 2), (0x04, 4), (0x08, 4), (0x10, 4), (0x28, 4), (0x2c, 4), (0x30, 4), (0x34, 4),
+   181	                (0x60, 2), (0x64, 2), (0x66, 2), (0x68, 2), (0x6a, 2), (0x72, 2), (0x62, 1),
+   182	            ];
+   183	            let pm = wdt::pmbase() as u64;
+   184	            let off = addr.checked_sub(pm).ok_or("io: below PMBASE")?;
+   185	            if pm == 0 || !OK.contains(&(off, n)) {
+   186	                return Err("io: only allowlisted PM/TCO registers (PMBASE+off,width): 0/2 2/2 4/4 8/4 10/4 28/4 2c/4 30/4 34/4 60/2 62/1 64/2 66/2 68/2 6a/2 72/2");
+   187	            }
+   188	            let p = u16::try_from(addr).map_err(|_| "io: port > 0xffff")?;
+   189	            let v = unsafe { match n { 1 => inb(p) as u32, 2 => inw(p) as u32, _ => inl(p) } };
+   190	            let _ = core::fmt::write(w, format_args!("{:#x}", v));
+   191	        }
+   192	        _ => return Err("peek mem <hexaddr> <len> | peek nic <hexoff> <len> | peek io <hexport> <1|2|4>"),
+   193	    }
+   194	    Ok(())
+   195	}
+   196	
+   197	pub fn run(nic: Rtl, seed: [u8; 32]) {
+   198	    let nic_mmio = match nic.bus {
+   199	        Bus::Mmio(b) => Some(b),
+   200	        Bus::Pio(_) => None,
+   201	    };
+   202	    if rng::init(false).is_err() {
+   203	        return;
+   204	    }
+   205	    let key = derive_key(&seed);
+
+web search: 
+web search: https://www.mouser.com/pdfdocs/82NM10datasheet.pdf
+web search: 
+web search: '13.9.2'
+exec
+/bin/zsh -lc "rg --files /tmp ~/nc110-baremetal 2>/dev/null | rg -i 'nm10|322896|agents.md"'$'"'" in ~/nc110-baremetal
+ succeeded in 523ms:
+/tmp/claude-501/-Users-evnchn/4e6ca128-b07d-4467-b501-843f48d790d3/scratchpad/t3audit/repo/AGENTS.md
+/tmp/claude-501/-Users-evnchn/4e6ca128-b07d-4467-b501-843f48d790d3/scratchpad/t3audit/repo/docs/user/outside-agents.md
+/tmp/claude-501/-Users-evnchn/f460ea31-f5b8-4f02-a45f-39114b8e2fbd/scratchpad/merged/AGENTS.md
+/tmp/claude-501/-Users-evnchn/f460ea31-f5b8-4f02-a45f-39114b8e2fbd/scratchpad/trees/head/AGENTS.md
+/tmp/claude-501/-Users-evnchn/f460ea31-f5b8-4f02-a45f-39114b8e2fbd/scratchpad/trees/merged/AGENTS.md
+/tmp/claude-501/-Users-evnchn/f460ea31-f5b8-4f02-a45f-39114b8e2fbd/scratchpad/trees/v88d62/AGENTS.md
+/tmp/claude-501/-Users-evnchn/f460ea31-f5b8-4f02-a45f-39114b8e2fbd/scratchpad/trees/fix/AGENTS.md
+/tmp/claude-501/-Users-evnchn/f460ea31-f5b8-4f02-a45f-39114b8e2fbd/scratchpad/fixed/AGENTS.md
+/tmp/claude-501/-Users-evnchn/f460ea31-f5b8-4f02-a45f-39114b8e2fbd/scratchpad/trees/v6f125/AGENTS.md
+/tmp/claude-501/-Users-evnchn/f460ea31-f5b8-4f02-a45f-39114b8e2fbd/scratchpad/trees/e36c/AGENTS.md
+
+web search: 
+web search: 
+codex
+The overflow and LV2–LV4 access paths are closed in the source. The datasheet says TCO_DAT_IN triggers an SMI on writes, with no read side effect documented. I’m finishing the remaining register checks and testing the shell assertions with simulated failures.
+exec
+/bin/zsh -lc "command -v pdftotext; ls /tmp/*nm* /tmp/*NM* 2>/dev/null; sed -n '1,110p' tools/bmctl.py" in ~/nc110-baremetal
+ succeeded in 0ms:
+/opt/homebrew/bin/pdftotext
+zsh:1: no matches found: /tmp/*nm*
+#!/usr/bin/env python3
+"""bmctl client for the NC110 kernel's authenticated UDP control port (see src/bmctl.rs).
+
+Usage: tools/.venv/bin/python tools/bmctl.py [--host 192.168.50.120] [--key test-keys/client.key] <command...>
+  commands: ping | stats | log [offset] | logall | reboot
+The key file is the same 72-byte multiboot key module the kernel gets (magic 8 + ed25519 seed 32 + pub 32);
+master = SHA-256("nc110-bmctl-v1" + seed). Handshake: send "who" + fresh random 16-byte Nc; the reply carries boot id,
+session and check = SHA-256("nc110-bmctl-v1 who" + master + Nc + boot + session)[:16], verified here; traffic key =
+SHA-256("nc110-bmctl-v1 session" + master + boot + session_u32_le + Nc); seq counts from 1 per session. Uses the `cryptography` package's ChaCha20Poly1305,
+an implementation independent of the kernel's, so agreement is a real interop check.
+"""
+import argparse, hashlib, hmac, os, socket, struct, sys
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--host", default="192.168.50.120")
+ap.add_argument("--port", type=int, default=5515)
+ap.add_argument("--key", default="test-keys/client.key")
+ap.add_argument("cmd", nargs="+")
+a = ap.parse_args()
+km = open(a.key, "rb").read()
+assert len(km) == 72, "key module must be 72 bytes"
+master = hashlib.sha256(b"nc110-bmctl-v1" + km[8:40]).digest()
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2.0)
+
+
+def rpc(raw):
+    for _ in range(3):  # a retry of the same frame gets the kernel's cached reply, nothing runs twice
+        s.sendto(raw, (a.host, a.port))
+        try:
+            while True:
+                d, src = s.recvfrom(2048)
+                if src[0] == socket.gethostbyname(a.host):
+                    return d
+        except socket.timeout:
+            continue
+    sys.exit(f"no reply from {a.host}:{a.port}")
+
+
+nc = os.urandom(16)
+who = rpc(b"who" + nc).decode().split()
+if len(who) != 7 or who[:2] != ["nc110", "boot"] or who[3] != "session" or who[5] != "check" or len(who[2]) != 32:
+    sys.exit(f"bad who reply: {who}")
+boot, sid = bytes.fromhex(who[2]), int(who[4])
+want = hashlib.sha256(b"nc110-bmctl-v1 who" + master + nc + boot + struct.pack("<I", sid)).digest()[:16]
+if not hmac.compare_digest(want, bytes.fromhex(who[6])):
+    sys.exit("who reply failed its check (wrong key, or a forged/replayed reply)")
+aead = ChaCha20Poly1305(hashlib.sha256(b"nc110-bmctl-v1 session" + master + boot + struct.pack("<I", sid) + nc).digest())
+SEQ = [0]
+
+
+def call(cmd):
+    SEQ[0] += 1  # per-session counter from 1; a fresh session per run, so (key, nonce) never repeats
+    seq = SEQ[0]
+    ct = aead.encrypt(b"C2K\0" + struct.pack("<Q", seq), cmd.encode(), boot)
+    r = rpc(struct.pack("<IQ", sid, seq) + ct)
+    rseq = struct.unpack("<Q", r[:8])[0]
+    if rseq != seq:
+        sys.exit(f"reply seq {rseq} != {seq}")
+    return aead.decrypt(b"K2C\0" + struct.pack("<Q", seq), r[8:], boot)
+
+
+cmd = " ".join(a.cmd)
+if cmd == "logall":
+    off, out = 0, b""
+    while True:
+        chunk = call(f"log {off}")
+        if not chunk:
+            break
+        out += chunk
+        off += len(chunk)
+    sys.stdout.write(out.decode(errors="replace"))
+else:
+    print(call(cmd).decode(errors="replace"))
+
+web search: 
+web search: 
+exec
+/bin/zsh -lc 'curl -L -s https://www.mouser.com/pdfdocs/82NM10datasheet.pdf | pdftotext -f 415 -l 443 -layout - -' in ~/nc110-baremetal
+ exited 1 in 0ms:
+Syntax Error: Document stream is empty
+
+web search: 
+web search: 
+exec
+/bin/zsh -lc "python3 -c 'import pathlib,subprocess,re,shlex
+s=pathlib.Path(\"tools/bmctl-q35-test.sh\").read_text().splitlines()
+cases=[(\"p1 error\",s[50]+\"\\n\"+s[51],\"err refused: not inside one multiboot RAM range\",0,1),(\"p1 malformed\",s[50]+\"\\n\"+s[51],\"z\"*32,0,0),(\"p1 nonzero exit\",s[50]+\"\\n\"+s[51],\"0\"*32,1,0),(\"p6 error\",s[59],\"err refused\",0,1),(\"p9b accepted LV2\",s[65],\"0x0\",0,1),(\"p9c accepted wrap\",s[66],\"0xff\",0,1),(\"p9c timeout\",s[66],\"\",1,1)]
+for name,case,out,rc,expected in cases:
+    script='\\''fail=0\\nmock() { printf \"%s\\\\n\" '\\''+shlex.quote(out)+'\\''; return '\\''+str(rc)+'\\''; }\\nB=mock\\n'\\''+s[49]+'\\''\\n'\\''+case+'\\''\\nexit \""'$fail"'"\\n'\\''
+    r=subprocess.run([\"/bin/sh\"],input=script,text=True,capture_output=True)
+    assert r.returncode==expected,(name,r.stdout,r.stderr)
+    print(name+\": \"+(\"FAIL (caught)\" if r.returncode else \"PASS (false positive)\"))
+source=pathlib.Path(\"src/bmctl.rs\").read_text()
+block=source.split(\"const OK:\")[1].split(\"];\")[0]
+pairs=[(int(a,16),int(b)) for a,b in re.findall(r\"\\(0x([0-9a-f]+), (\\d+)\\)\",block)]
+assert len(pairs)==16
+assert not any(o<=x<o+n for o,n in pairs for x in (0x14,0x15,0x16))
+for pm in range(0x80,0x10000,0x80):
+    assert all(pm+o+n<=0x10000 for o,n in pairs)
+    for n in (1,2,4):
+        assert ((1<<64)-n-pm,n) not in pairs
+print(\"Allowlist model: all nonzero PMBASE values, wrapped widths 1/2/4 and LV2-4 overlap checks passed\")
+'" in ~/nc110-baremetal
+ succeeded in 0ms:
+p1 error: FAIL (caught)
+p1 malformed: PASS (false positive)
+p1 nonzero exit: PASS (false positive)
+p6 error: FAIL (caught)
+p9b accepted LV2: FAIL (caught)
+p9c accepted wrap: FAIL (caught)
+p9c timeout: FAIL (caught)
+Allowlist model: all nonzero PMBASE values, wrapped widths 1/2/4 and LV2-4 overlap checks passed
+
+web search: 
+web search: 
+codex
+Reviewed HEAD `97a82b4`; no edits. **Both original MUST-FIX findings are closed.**
+
+- **MUST-FIX — Closed:** [Port validation](~/nc110-baremetal/src/bmctl.rs:179) uses checked subtraction, exact offset/width matching, and checked `u16` conversion. Width-1/2/4 overflow inputs are rejected. No permitted access overlaps LV2–LV4, including wider reads.
+
+All 16 pairs match documented register widths; no read-triggered side effects are documented:
+
+| PMBASE offset / bytes | Registers |
+|---|---|
+| `00/2, 02/2, 04/4, 08/4, 10/4` | PM1_STS, PM1_EN, PM1_CNT, PM1_TMR, PROC_CNT |
+| `28/4, 2c/4, 30/4, 34/4` | GPE0_STS, GPE0_EN, SMI_EN, SMI_STS |
+| `60/2, 62/1, 64/2, 66/2, 68/2, 6a/2, 72/2` | TCO_RLD, DAT_IN, TCO1/2_STS, TCO1/2_CNT, TCO_TMR |
+
+**DAT_IN `62/1` is safe to read under the documented semantics:** writes trigger SMI/SW_TCO_SMI. TCO_RLD reads return the count without reloading; status clearing requires writes. [Intel NM10 datasheet, §§13.8.3, 13.9](https://www.mouser.com/pdfdocs/82NM10datasheet.pdf).
+
+- **SHOULD-FIX — Tests still incompletely validate success:** [chk/p1](~/nc110-baremetal/tools/bmctl-q35-test.sh:50) ignores client exit status; p1 accepts any 32 characters except `err*`. Reproduced false passes with 32 `z` characters and valid-looking output plus exit 1. Require successful exit and exact hexadecimal format.
+- **Verified improvements:** Using the actual shell assertions with mocked responses, p1/p6 errors, accepted LV2/wrap reads, and timeout now fail correctly. Arithmetic/overlap checks passed across every nonzero masked PMBASE. Full QEMU/hardware tests were **not run**.
+
+**8/10**
+tokens used
+71,243
+Reviewed HEAD `97a82b4`; no edits. **Both original MUST-FIX findings are closed.**
+
+- **MUST-FIX — Closed:** [Port validation](~/nc110-baremetal/src/bmctl.rs:179) uses checked subtraction, exact offset/width matching, and checked `u16` conversion. Width-1/2/4 overflow inputs are rejected. No permitted access overlaps LV2–LV4, including wider reads.
+
+All 16 pairs match documented register widths; no read-triggered side effects are documented:
+
+| PMBASE offset / bytes | Registers |
+|---|---|
+| `00/2, 02/2, 04/4, 08/4, 10/4` | PM1_STS, PM1_EN, PM1_CNT, PM1_TMR, PROC_CNT |
+| `28/4, 2c/4, 30/4, 34/4` | GPE0_STS, GPE0_EN, SMI_EN, SMI_STS |
+| `60/2, 62/1, 64/2, 66/2, 68/2, 6a/2, 72/2` | TCO_RLD, DAT_IN, TCO1/2_STS, TCO1/2_CNT, TCO_TMR |
+
+**DAT_IN `62/1` is safe to read under the documented semantics:** writes trigger SMI/SW_TCO_SMI. TCO_RLD reads return the count without reloading; status clearing requires writes. [Intel NM10 datasheet, §§13.8.3, 13.9](https://www.mouser.com/pdfdocs/82NM10datasheet.pdf).
+
+- **SHOULD-FIX — Tests still incompletely validate success:** [chk/p1](~/nc110-baremetal/tools/bmctl-q35-test.sh:50) ignores client exit status; p1 accepts any 32 characters except `err*`. Reproduced false passes with 32 `z` characters and valid-looking output plus exit 1. Require successful exit and exact hexadecimal format.
+- **Verified improvements:** Using the actual shell assertions with mocked responses, p1/p6 errors, accepted LV2/wrap reads, and timeout now fail correctly. Arithmetic/overlap checks passed across every nonzero masked PMBASE. Full QEMU/hardware tests were **not run**.
+
+**8/10**

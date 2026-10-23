@@ -1,0 +1,47 @@
+[  0.000s] host: qemu-system-x86_64 -machine q35 -m 128 -display none -vga std -global ICH9-LPC.noreboot=false -action watchdog=reset -serial file:~/nc110-baremetal/proof/.wdt-grub-badrcba.serial -qmp unix:~/nc110-baremetal/proof/.qmp.sock,server,wait=off -cdrom grub-test/wdt-badrcba.iso -boot d
+[  0.386s] serial: [H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  0.386s] serial: 
+[  0.386s] serial: 
+grub: mode badrcba
+[  0.585s] serial: 
+wdt: selftest OK (21 regexp cases + test -o)
+[  0.585s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  0.585s] serial: 
+wdt: chipset mismatch, NOT arming
+[  0.585s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[  3.566s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  4.192s] serial: 
+[H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  4.192s] serial: 
+[  4.391s] serial: 
+grub: mode badrcba
+[  4.391s] serial: 
+wdt: selftest OK (21 regexp cases + test -o)
+[  4.391s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  4.583s] serial: 
+wdt: chipset mismatch, NOT arming
+[  4.583s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[  7.514s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  8.119s] serial: 
+[H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  8.119s] serial: 
+[  8.315s] serial: 
+grub: mode badrcba
+[  8.315s] serial: 
+wdt: selftest OK (21 regexp cases + test -o)
+[  8.315s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  8.315s] serial: 
+wdt: chipset mismatch, NOT arming
+[  8.315s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[ 11.413s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[ 11.991s] serial: 
+[H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[ 11.991s] serial: 
+[ 12.159s] host: stop: banners=0 want=1 elapsed=12.2s
+[ 12.169s] host: VERDICT expect=refuse: PASS (3 refusals, 3 GRUB reboots, 0 kernel boots, 0 WATCHDOG)

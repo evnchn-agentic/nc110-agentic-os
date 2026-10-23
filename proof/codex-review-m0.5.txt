@@ -1,0 +1,85 @@
+**MUST-FIX**
+
+1. **The M1 “armed” check does not verify the complete reset configuration.**  
+   [m1-nc110-entry.cfg:22](~/nc110-baremetal/grub-test/m1-nc110-entry.cfg:22), especially lines 28–37.
+
+   `tmr` and `smien` are printed but never checked. The lock requirement exists only in a preparation comment. Thus an unsuccessful timer write or unsuccessful `TCO_EN` clear can still produce “armed.” A first-stage SMI handler that reloads the watchdog defeats recovery.
+
+   On NM10, `TCO_LOCK` prevents changing `SMI_EN.TCO_EN`; it does **not** lock `TCO_TMR_HLT`. Preserving a pre-existing lock is not equivalent to establishing the intended SMI configuration. [Intel NM10 datasheet, §§13.8–13.9](https://www.mouser.com/pdfdocs/82NM10datasheet.pdf)
+
+   **Fix:** enforce live predicates: `NO_REBOOT=0`, `HLT=0`, `TCO_EN=0`, and `(TMR & 0x3ff)=100`. Enforce the proposed `LOCK=0` policy before modification. Check command failures, initialize readback variables, and make rejection structurally prevent subsequent arming/booting even if `reboot` returns or is unavailable. Check that the current counter actually decrements before calling the setup verified. Keep the exact LPC/PMBASE/RCBA guards.
+
+2. **The proposed M1 payload does not establish the safety properties of the reviewed kernel.**  
+   [m1-nc110-entry.cfg:39](~/nc110-baremetal/grub-test/m1-nc110-entry.cfg:39), versus [QEMU grub.cfg:44](~/nc110-baremetal/grub-test/iso/boot/grub/grub.cfg:44).
+
+   QEMU boots a `grub-armed` kernel with `wdt=hang`. M1 boots `/baremetal/ipxe.lkrn`, whose contents, embedded script, fetched payload, and eventual kernel flags are absent here. A reset during iPXE, a loading failure, or an early kernel fault could be mistaken for a successful kernel hang test. The kernel’s “no disk driver” property also does not cover this additional executable.
+
+   **Fix:** make the first watchdog test boot a pinned `grub-armed` kernel directly with `wdt=hang`. Require a visible hang marker, the expected reset interval, and successful return to Slot A. Test the iPXE chain separately with pinned artifacts and an audited script. If M1 intentionally tests only iPXE recovery, state that narrower pass criterion.
+
+3. **One-shot recovery is a prerequisite, not something demonstrated by this repository.**  
+   [m1-nc110-entry.cfg:7](~/nc110-baremetal/grub-test/m1-nc110-entry.cfg:7); [wdt-grub.log:20](~/nc110-baremetal/proof/wdt-grub.log:20).
+
+   The entry merely instructs use of `next_entry`. The actual installed GRUB header, environment persistence, and default OS entry are not supplied. The QEMU proof deliberately returns to the experimental entry.
+
+   `next_entry` depends on GRUB successfully writing its environment block; setting it from Linux does not prove that GRUB can clear it during boot. Failure can create an unattended reboot loop. [GNU GRUB documentation](https://www.gnu.org/software/grub/manual/grub/html_node/next_005fentry.html)
+
+   **Fix:** first exercise the installed one-shot mechanism using a harmless entry that reboots before arming anything. Verify persistent consumption of `next_entry` and automatic return to the known-good OS. Then require the real watchdog test to reach a stable Slot A session, not merely POST or GRUB. Capture watchdog reset status early if available; firmware may clear it before Linux reads it.
+
+4. **A negative-control build can deliberately disable recovery on the real NM10.**  
+   [boot.s:68](~/nc110-baremetal/src/boot.s:68), [wdt.rs:7](~/nc110-baremetal/src/wdt.rs:7).
+
+   Without `grub-armed`, `neg-control` sets `NO_REBOOT` on **both** supported LPC IDs, including `8086:27bc`. Accidentally deploying the negative-control artifact therefore undoes GRUB’s protection before hanging. An ordinary default build also replaces the proposed 120-second timeout with roughly six seconds.
+
+   **Fix:** restrict negative control at runtime to QEMU’s `8086:2918`, and make the hardware artifact explicitly require `grub-armed` and reject `neg-control`. Pin its hash in the deployment procedure. Do not rely on remembering which Cargo target directory holds which build.
+
+**SHOULD**
+
+5. **Clear the two TCO2 status bits in the documented order.**  
+   [boot.s:90](~/nc110-baremetal/src/boot.s:90), [m1-nc110-entry.cfg:27](~/nc110-baremetal/grub-test/m1-nc110-entry.cfg:27), [QEMU grub.cfg:34](~/nc110-baremetal/grub-test/iso/boot/grub/grub.cfg:34).
+
+   All three use one `0x0006` write. Intel specifies clearing `SECOND_TO_STS` **before** `BOOT_STS`; Linux uses separate `0x0002` then `0x0004` writes. Change all three and verify clearance. QEMU accepting the combined write is insufficient evidence for silicon behavior. [Intel datasheet](https://www.mouser.com/pdfdocs/82NM10datasheet.pdf), [Linux iTCO driver](https://raw.githubusercontent.com/torvalds/linux/master/drivers/watchdog/iTCO_wdt.c)
+
+   Also establish the timer’s initial running/halted state before reprogramming it; otherwise an already-running timer can expire during setup. The intended “configure, reload, unhalt” order is otherwise sensible.
+
+6. **NIC initialization trusts the BAR and enables bus mastering too early.**  
+   [nic.rs:61](~/nc110-baremetal/src/nic.rs:61), [nic.rs:76](~/nc110-baremetal/src/nic.rs:76), [pci.rs:12](~/nc110-baremetal/src/pci.rs:12).
+
+   BAR0 is truncated to `u16` without checking that it is an assigned I/O BAR, and bus mastering is enabled before reset and ring installation. A malformed or misinterpreted BAR can redirect subsequent port writes, including into storage ranges; stale DMA state can corrupt RAM.
+
+   This is **not reachable for the stated onboard NIC today**, hence SHOULD rather than an M1 blocker. Before expanding support:
+   - Validate endpoint identity, header type, revision, BAR type/range, and the entire accessed interval.
+   - Reset/quiesce with bus mastering disabled; install valid rings before enabling DMA.
+   - Use a 16-bit PCI command write, avoiding accidental write-one-to-clear acknowledgement of PCI status bits.
+   - Keep bridge discovery read-only and carry the full bus/device/function through accessors. The existing API has no bus parameter; reusing it after a bridge walk would address bus 0.
+
+   Do not enable `8136` merely by adding its ID to this driver.
+
+7. **“Armed” currently means “took a code branch,” and unsupported hardware continues running.**  
+   [boot.s:43](~/nc110-baremetal/src/boot.s:43), [boot.s:107](~/nc110-baremetal/src/boot.s:107), [wdt.rs:30](~/nc110-baremetal/src/wdt.rs:30), [main.rs:25](~/nc110-baremetal/src/main.rs:25).
+
+   Result `0` is assigned without validating arming; result `4` trusts the build feature. On an unexpected chipset the watchdog writes are correctly skipped, but execution proceeds toward NIC probing and an eventual unprotected halt.
+
+   **Fix:** distinguish “delegated to GRUB” from “verified armed.” For the hardware artifact, validate and retain one trusted watchdog configuration; stop unsupported hardware in the bootloader before transferring control. The exact GRUB guards already provide the stronger protection for the intended path.
+
+8. **The identity map provides no explicit MMIO cache policy.**  
+   [boot.s:124](~/nc110-baremetal/src/boot.s:124), [wdt.rs:55](~/nc110-baremetal/src/wdt.rs:55).
+
+   `0x83` selects the default PAT entry throughout 4 GiB. That does **not** prove MMIO is write-back: firmware MTRRs participate in the effective type and may correctly make it uncacheable. Nor does mapping AHCI itself issue disk commands. But the current code never verifies that assumption. [Intel memory-type rules](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-3a-part-1-manual.pdf)
+
+   **Fix:** record the inherited PAT/MTRR configuration for M1; establish explicit UC mappings for accessed MMIO before M2. Prefer leaving unrelated device apertures unmapped. Use smaller pages where RAM and device mappings need different treatment.
+
+9. **The test harness can report success without a watchdog event.**  
+   [run-wdt.py:71](~/nc110-baremetal/run-wdt.py:71), [run-wdt.py:90](~/nc110-baremetal/run-wdt.py:90).
+
+   Success depends only on banner count. A fault-reset loop could satisfy it. **The supplied positive logs themselves are stronger:** they contain `WATCHDOG` followed by reset, and the negative log contains neither.
+
+   **Fix:** assert the hang marker, watchdog event, subsequent reset, and timing window. Give negative control its own explicit success condition. Keep recovery-to-OS testing separate from repeated-kernel-banner testing.
+
+**NOTE**
+
+- [console.rs:33](~/nc110-baremetal/src/console.rs:33): serial polling is unbounded and precedes VGA output. An awkward COM1 decode can hide the hang marker. Bound polling or let VGA output proceed independently; a blank display followed by reboot is not proof that the intended hang point ran.
+- [nic.rs:38](~/nc110-baremetal/src/nic.rs:38) and [linker.ld:3](~/nc110-baremetal/linker.ld:3): static aligned rings and buffers are compatible with the current identity-linked layout; I found no inherent virtual-versus-physical address error. M2 still needs validated usable RAM, DMA ownership ordering, and quiescence before memory reuse.
+- Clearing only `SMI_EN.TCO_EN` preserves unrelated SMI enables. The GCS mask preserves firmware-control bits outside `NO_REBOOT`. I found no basis to claim these intended writes brick firmware or CMOS.
+- A watchdog reset is not a disk flush mechanism. M1 should begin after a clean OS shutdown and avoid any write-capable payload while armed. The reviewed hang-only kernel itself issues no storage commands.
+
+**Score: 6/10 for taking the proposed sequence to M1 as written.** Addressing the four MUST-FIX items, correcting status-clear ordering, and demonstrating a deliberate hang followed by stable one-shot recovery to Slot A would raise it to **8/10**. The remaining major uncertainty would be the separate iPXE/M2 hardware and DMA path.

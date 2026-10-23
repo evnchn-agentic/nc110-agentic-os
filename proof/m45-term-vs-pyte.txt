@@ -1,0 +1,3 @@
+shell (printf lines): byte 497: 0 cells differ (0 in the character), cursor ours 9 0 true pyte 9 0
+htop (last frame): byte 9863: 0 cells differ (0 in the character), cursor ours 24 0 true pyte 24 0
+vi (before the : command line): byte 12589: 0 cells differ (0 in the character), cursor ours 24 69 false pyte 24 69

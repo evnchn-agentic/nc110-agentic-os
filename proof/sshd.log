@@ -1,0 +1,57 @@
+Server listening on 127.0.0.1 port 2223.
+Connection from 127.0.0.1 port 51647 on 127.0.0.1 port 2223
+Connection closed by authenticating user evnchn 127.0.0.1 port 51647 [preauth]
+srclimit_penalise: ipv4: new 127.0.0.1/32 deferred penalty of 1 seconds for penalty: connections without attempting authentication
+Connection from 127.0.0.1 port 51657 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 51657 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 51657 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 99116
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 51657 id 0
+Received disconnect from 127.0.0.1 port 51657:11: disconnected by user
+Disconnected from user evnchn 127.0.0.1 port 51657
+Connection from 127.0.0.1 port 52914 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 52914 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 52914 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 10561
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 52914 id 0
+Connection closed by 127.0.0.1 port 52914
+Close session: user evnchn from 127.0.0.1 port 52914 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 52914
+Connection from 127.0.0.1 port 52957 on 127.0.0.1 port 2223
+Connection closed by 127.0.0.1 port 52957 [preauth]
+srclimit_penalise: ipv4: new 127.0.0.1/32 deferred penalty of 1 seconds for penalty: connections without attempting authentication
+Connection from 127.0.0.1 port 53028 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 53028 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 53028 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 11974
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 53028 id 0
+Connection closed by 127.0.0.1 port 53028
+Close session: user evnchn from 127.0.0.1 port 53028 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 53028
+Connection from 127.0.0.1 port 53666 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 53666 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 53666 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 18176
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 53666 id 0
+Connection closed by 127.0.0.1 port 53666
+Close session: user evnchn from 127.0.0.1 port 53666 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 53666
+Connection from 127.0.0.1 port 53674 on 127.0.0.1 port 2223
+Connection closed by 127.0.0.1 port 53674 [preauth]
+srclimit_penalise: ipv4: new 127.0.0.1/32 deferred penalty of 1 seconds for penalty: connections without attempting authentication
+Received signal 15; terminating.

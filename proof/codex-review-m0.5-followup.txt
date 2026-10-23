@@ -1,0 +1,16 @@
+**Updated score: 7/10**, pending the remaining verification checks and hardware recovery evidence.
+tokens used
+47,199
+1. **PARTIAL — complete arming verification.** Register predicates, lock rejection and boot gating are corrected; all six regexps passed exhaustive 16-bit checks. Command failures remain unchecked, and `c0=unset`, `c1=valid` incorrectly passes the counter test.
+
+2. **PARTIAL — controlled M1 payload.** Step 1 now directly boots `wdt=hang`, separately from iPXE, with appropriate pass criteria. Actual artifact hashes and the audited iPXE script remain absent.
+
+3. **PARTIAL — one-shot recovery.** Step 0 supplies the required harmless probe, but no hardware evidence demonstrates persistent `next_entry` consumption and stable return to Slot A.
+
+4. **FIXED — negative control disabling NM10 recovery.** Every build bypasses assembly watchdog writes on NM10; the negative-control exception requires the ICH9 self-arm result. Combining `neg-control` with `grub-armed` fails compilation.
+
+**No new MUST-FIX found.** GRUB variable scoping supports this structure; neither supplied M1 payload branch bypasses `wdt_ok=yes`. [GRUB implementation](https://raw.githubusercontent.com/rhboot/grub2/master/grub-core/script/execute.c)
+
+On the guarded NM10 path, CF9 `02→06` is a documented hard reset; GCS and PM-timer reads have no documented destructive side effects. A stalled PM timer could hang verification, but leaves the already-armed watchdog running. [NM10 datasheet, §§10.1.50, 13.7.5, 13.8.3.4](https://www.mouser.com/pdfdocs/82NM10datasheet.pdf)
+
+**Updated score: 7/10**, pending the remaining verification checks and hardware recovery evidence.

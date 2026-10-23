@@ -1,0 +1,43 @@
+Most of it is sound. **I found no host-pin bypass or weak-RNG fallback into SSH cryptography.** The concrete correctness bug is TX buffer reuse after an ownership timeout.
+
+Reviewed `e885807` against `0095080`, including the installed dependency sources and supplied logs. No files modified; no builds or fresh QEMU runs performed.
+
+1. **NOTE — Host-key enforcement holds, including rekey.**  
+   [src/ssh.rs:218](~/nc110-baremetal/src/ssh.rs:218) checks every `Hostkey` event against the raw Ed25519 pin. There is no “already verified” shortcut. Other key types and parsing errors enter the rejection branch, and `stop_all` exits before further event handling or output draining.
+
+   Sunset emits the event **before** signature verification, but `h.accept()` performs that verification before installing keys or establishing the session ID: dependency `kex.rs:669`, `kex.rs:791`, and `kex.rs:641`. Consequently, copying the pinned public key into a forged exchange is insufficient.
+
+   Ignoring `accept()`’s error at [src/ssh.rs:230](~/nc110-baremetal/src/ssh.rs:230) is poor diagnostics, **not an authentication bypass**: Sunset’s `runner.rs:161` leaves the event unresolved on failure; `runner.rs:306` then returns `BadUsage`, and your loop exits. Ignoring `reject()`’s error is also safe here because your own unconditional exit supplies the termination that Sunset’s rejection implementation lacks.
+
+   Rekeys traverse the same event and signature checks. I found no path allowing a MITM lacking the pinned private key to establish its own session and obtain publickey authentication or exec.
+
+2. **NOTE — The badpin control is meaningful, but narrower than complete adversarial coverage.**  
+   [proof/m2-badpin-serial.log:12](~/nc110-baremetal/proof/m2-badpin-serial.log:12) demonstrates rejection of a real server with a mismatched pin, before the username/publickey milestones. The positive log reaches authentication and command output.
+
+   This does not dynamically test “correct pinned public key, invalid exchange signature,” changed-key rekey, or malformed host-key blobs. Those paths were assessed from source. Explicitly handling `accept()` errors would preserve their actual cause and make such tests clearer.
+
+3. **SHOULD-FIX — Network RNG failure is silently converted into a predictable seed.**  
+   At [src/ssh.rs:94](~/nc110-baremetal/src/ssh.rs:94), failure of the eight-byte fill leaves `seed` zero, which then seeds smoltcp and selects the local port. The earlier successful probe does not guarantee this next call succeeds.
+
+   Return on failure. This affects network randomization; **it does not seed Sunset**, which independently calls getrandom. If entropy subsequently recovers, SSH can still proceed with proper cryptographic randomness despite the predictable network seed.
+
+4. **NOTE — The cryptographic RNG plumbing is correct for this milestone.**  
+   [src/rng.rs:51](~/nc110-baremetal/src/rng.rs:51) exactly matches getrandom **0.4.3**’s custom-backend declaration, including the seemingly old `__getrandom_v03_custom` symbol and Rust ABI. Initializing the destination before forming the byte slice is appropriate.
+
+   CPUID gating and checking the intrinsic’s success result on each of 32 retries are correct. The repeat check rejects a fourth identical nonzero word; its zero-initialized history rejects repeated zero slightly earlier. It is a limited stuck-output detector, not a comprehensive entropy test.
+
+   Sunset obtains ephemeral X25519 secrets through `SysRng`; failure there panics through `UnwrapErr`, and this kernel halts. Other fallible random fills propagate errors. Neither consumes failed fills as successful randomness. ChaCha packet nonces derive from sequence numbers, not smoltcp’s seed. The no-RDRAND refusal is sound and supported by the negative-control log.
+
+5. **MUST-FIX — TX timeout does not establish buffer ownership.**  
+   [src/nic.rs:144](~/nc110-baremetal/src/nic.rs:144) exits its wait on either ownership release **or timeout**, then unconditionally overwrites the DMA buffer and descriptor. The completion wait at line 158 likewise silently times out.
+
+   A stalled device can therefore retain ownership while the next transmission modifies its packet and descriptor. That is a real DMA ownership/correctness bug, although the supplied QEMU runs do not demonstrate it. On timeout, stop transmission or reset/quiesce the device before touching its resources; elapsed time cannot substitute for `OWN` clearing.
+
+6. **NOTE — Current RX consumption is safe; its helper API overpromises.**  
+   [src/net.rs:23](~/nc110-baremetal/src/net.rs:23) releases the descriptor only after the callback returns. smoltcp processes the frame and constructs any response inside that callback, so I found no current reuse-while-borrowed path.
+
+   However, [src/nic.rs:124](~/nc110-baremetal/src/nic.rs:124) exposes a safe, arbitrary-length `&'static [u8]`. That interface permits misuse beyond the current bounded caller; tie access to token ownership and validate lengths when tightening the driver.
+
+The soft-backend cfg names match the locked dependency versions. The 2 MiB stack is aligned and covered by the boot mapping; I found no concrete stack defect, though the logs do not measure worst-case stack usage.
+
+**Milestone score as shipped: 8/10.**

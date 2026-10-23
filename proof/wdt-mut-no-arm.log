@@ -1,0 +1,50 @@
+[  0.000s] host: qemu-system-x86_64 -machine q35 -m 128 -display none -vga std -global ICH9-LPC.noreboot=false -action watchdog=reset -serial file:~/nc110-baremetal/proof/.wdt-mut-no-arm.serial -qmp unix:~/nc110-baremetal/proof/.qmp.sock,server,wait=off -cdrom /var/folders/l1/7xrlxl717d16rbfvqj272zc40000gn/T/tmp.h9mdM4kYTx/g/m.iso -boot d
+[  0.667s] serial: [H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  0.667s] serial: 
+[  0.667s] serial: 
+grub: mode locked-accept mutant no-arm
+[  0.667s] serial: 
+wdt: after: GCS=20 TCO1_CNT=1800 TCO_TMR=0 SMI_EN=2021 fake
+[  0.667s] serial: 
+grub: armed and verified, loading kernel
+[  0.869s] serial: 
+NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+[  0.869s] host: boot #1
+[  0.869s] serial: multiboot magic=0x2badb002 info=0x10000 -> long mode OK
+[  0.869s] serial: wdt: left to GRUB (grub-armed build); live registers follow (result=4)
+[  0.869s] serial: wdt: live TCOBASE=0x660 GCS=0x00000020 NO_REBOOT=1 TCO1_CNT=0x1800 HLT=1 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=4
+[  1.535s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  1.607s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  1.658s] serial: wdt: verify NO_REBOOT=1 HLT=1 TMR=4 count 4->4 => NOT VERIFIED
+[  1.658s] serial: wdt: reset path not verified on this machine, refusing to run
+[  1.658s] serial: wdt: hard reset via 0xCF9
+[  2.404s] serial: [H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  2.404s] serial: 
+[  2.590s] serial: 
+grub: mode locked-accept mutant no-arm
+[  2.590s] serial: 
+wdt: after: GCS=20 TCO1_CNT=1800 TCO_TMR=0 SMI_EN=2021 fake
+[  2.590s] serial: 
+grub: armed and verified, loading kernel
+[  2.783s] serial: 
+NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+[  2.783s] host: boot #2
+[  2.783s] serial: multiboot magic=0x2badb002 info=0x10000 -> long mode OK
+[  2.783s] serial: wdt: left to GRUB (grub-armed build); live registers follow (result=4)
+[  2.783s] serial: wdt: live TCOBASE=0x660 GCS=0x00000020 NO_REBOOT=1 TCO1_CNT=0x1800 HLT=1 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=4
+[  3.432s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  3.503s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  3.529s] serial: wdt: verify NO_REBOOT=1 HLT=1 TMR=4 count 4->4 => NOT VERIFIED
+[  3.529s] serial: wdt: reset path not verified on this machine, refusing to run
+[  3.529s] serial: wdt: hard reset via 0xCF9
+[  4.275s] serial: [H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  4.275s] serial: 
+[  4.473s] serial: 
+grub: mode locked-accept mutant no-arm
+[  4.473s] serial: 
+wdt: after: GCS=20 TCO1_CNT=1800 TCO_TMR=0 SMI_EN=2021 fake
+[  4.473s] serial: 
+grub: armed and verified, loading kernel
+[  4.473s] host: stop: banners=2 want=2 elapsed=4.5s
+[  4.491s] host: locked check: 0 'after:' line(s) in the watchdog's boot, TCO_LOCK and TCO_EN still set in all: False
+[  4.491s] host: VERDICT expect=watchdog: FAIL (start=None hang=None wd=None next=None)

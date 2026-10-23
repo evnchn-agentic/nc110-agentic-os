@@ -1,0 +1,23 @@
+/private/tmp/claude-501/-Users-evnchn/bbbd91ed-4f87-4398-8936-b25c60d55400/scratchpad/q35-raw.bin: 1000000 samples, 256 distinct, most common 0x92 x79292
+  quick  MCV 3.644  lag-1 2.846 bits/sample
+    Most Common Value Estimate (bit string) [1-bit] 0.8866
+    Most Common Value Estimate [8-bit]       3.6441
+    Collision Test Estimate (bit string) [1-bit] 1.0000
+    Markov Test Estimate (bit string) [1-bit] 0.8240
+    Compression Test Estimate (bit string) [1-bit] 0.3049
+    T-Tuple Test Estimate (bit string) [1-bit] 0.3931
+    T-Tuple Test Estimate [8-bit]            2.8723
+    LRS Test Estimate (bit string) [1-bit]   0.4490
+    LRS Test Estimate [8-bit]                3.4305
+    Multi Most Common in Window (MultiMCW) Prediction Test Estimate (bit string) [1-bit] 0.8811
+    Multi Most Common in Window (MultiMCW) Prediction Test Estimate [8-bit] 3.1468
+    Lag Prediction Test Estimate (bit string) [1-bit] 0.4315
+    Lag Prediction Test Estimate [8-bit]     3.5748
+    Multi Markov Model with Counting (MultiMMC) Prediction Test Estimate (bit string) [1-bit] 0.4246
+    Multi Markov Model with Counting (MultiMMC) Prediction Test Estimate [8-bit] 3.2853
+    LZ78Y Prediction Test Estimate (bit string) [1-bit] 0.5256
+    LZ78Y Prediction Test Estimate [8-bit]   3.3017
+    H_original                               2.8723
+    H_bitstring                              0.3049
+  NIST   SP 800-90B non-IID min(H_original, 8 x H_bitstring) = 2.4394 bits/sample
+  RESULT min-entropy 2.4394 bits per 8-bit sample (kernel claims 0.100)

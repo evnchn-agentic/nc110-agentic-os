@@ -1,0 +1,29 @@
+version = 1
+
+# Default: original work, MIT.
+[[annotations]]
+path = "**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 evnchn"
+SPDX-License-Identifier = "MIT"
+
+# Drivers ported from Linux (r8169, iwlwifi DVM) and the notes they were written from.
+[[annotations]]
+path = ["src/nic.rs", "src/nic_regs.rs", "src/wifi.rs", "src/iwl.rs", "docs/iwl-dvm-bringup.md", "docs/iwl-dvm-associate.md", "tools/nic_regs_test.rs", "tools/test-nic-regs.sh"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 evnchn; derived from the Linux kernel drivers"
+SPDX-License-Identifier = "GPL-2.0-only"
+
+# Reference copies of Linux drivers, under their own headers.
+[[annotations]]
+path = "third_party/**"
+precedence = "override"
+SPDX-FileCopyrightText = "The Linux kernel authors"
+SPDX-License-Identifier = "GPL-2.0-only"
+
+# Spleen font and the tables generated from it.
+[[annotations]]
+path = ["src/font.rs", "tools/font/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2018-2024 Frederic Cambus"
+SPDX-License-Identifier = "BSD-2-Clause"

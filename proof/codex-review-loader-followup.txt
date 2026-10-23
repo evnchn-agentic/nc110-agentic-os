@@ -1,0 +1,1441 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a14ce9-9de1-7b71-8569-393958de964a
+--------
+user
+Follow-up review of the chain loader. Previous: proof/codex-review-loader.txt (6/10; MUST-FIX NIC DMA drain, image mutable after commit; SHOULD-FIX client success unauthenticated + lost lcom reply, sha UTF-8 panic, multiboot flags/module alignment, GRUB info snapshot + oversized mmap). Fix commit: HEAD (git show HEAD). Verify each item; for the drain, compare src/nic.rs quiesce with the r8169 down/reset path for RTL8105E (VER_30) in third_party/linux-v6.12/r8169_main.c and say whether a completed CmdReset is sufficient evidence that descriptor DMA has stopped. q35 loader suite passes (5 refusals + 2 authenticated hops). Tier MUST-FIX/SHOULD-FIX/NIT, brief. Do not edit. End 0-10.
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll review HEAD against the previous findings and compare the NIC shutdown sequence with Linux’s RTL8105E path.
+exec
+/bin/zsh -lc "git show HEAD -- src tools; rg -n 'rtl8169_hw_reset|rtl8169_down|rtl8169_cleanup|rtl_hw_reset|rtl_chipcmd_cond|StopReq|RX_CONFIG_ACCEPT_MASK|VER_30|rtl_rx_close|rtl_wait_txrx_fifo_empty' third_party/linux-v6.12/r8169_main.c" in ~/nc110-baremetal
+ succeeded in 0ms:
+commit 69729a9f7f7e51be239d6532f55b237062f50ca5
+Author: evnchn <user1@example.invalid>
+Date:   Sun Oct 18 10:48:57 2026 +0800
+
+    loader: Codex review fixes: NIC quiesce = RX accept off + chip stop + reset with completion wait (else hard reset, no jump), staged image frozen after lcom, ASCII-hex sha, refuse unsupported multiboot flags, page-aligned key module, GRUB info/mmap snapshot at boot (refuse oversized); client: authenticated post-hop handshake + encrypted ping, lost lcom reply tolerated
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/src/bmctl.rs b/src/bmctl.rs
+index ba120a3..43b238c 100644
+--- a/src/bmctl.rs
++++ b/src/bmctl.rs
+@@ -195,6 +195,7 @@ fn peek(w: &mut Writer, nic_mmio: Option<u64>, what: &str, a: &str, b: &str) ->
+ }
+ 
+ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
++    crate::loader::snapshot_boot_info(info);
+     let nic_mmio = match nic.bus {
+         Bus::Mmio(b) => Some(b),
+         Bus::Pio(_) => None,
+@@ -360,7 +361,11 @@ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+         let mut out = [0u8; 1300];
+         let len = {
+             let mut w = Writer { b: &mut out, n: 0 };
+-            if body.len() >= 8 && &body[..4] == b"ldat" {
++            let loading = |c: &[u8]| c.starts_with(b"ldat") || c.starts_with(b"lbeg") || c.starts_with(b"lcom");
++            if jump_at.is_some() && loading(body) {
++                // committed: the staged image is frozen until the hop (Codex loader MUST-FIX 2)
++                let _ = core::fmt::write(&mut w, format_args!("err committed, jump pending"));
++            } else if body.len() >= 8 && &body[..4] == b"ldat" {
+                 // binary chunk: "ldat" ++ u32 LE offset ++ bytes (checked before the text parser)
+                 let off = u32::from_le_bytes(body[4..8].try_into().unwrap()) as u64;
+                 let r = match stage.as_mut() {
+@@ -389,7 +394,7 @@ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+                 "lcom" => {
+                     let rest = cmd.splitn(2, ' ').nth(1).unwrap_or("");
+                     let r = match stage.as_ref() {
+-                        Some(st) => crate::loader::prepare(st, rest, &seed, info),
++                        Some(st) => crate::loader::prepare(st, rest, &seed),
+                         None => Err("no lbeg"),
+                     };
+                     match r {
+diff --git a/src/loader.rs b/src/loader.rs
+index 847171e..59c2a02 100644
+--- a/src/loader.rs
++++ b/src/loader.rs
+@@ -4,7 +4,7 @@
+ //! checks every destination range, builds a multiboot info block (cmdline, the ORIGINAL GRUB memory map, and a
+ //! rebuilt 72-byte key module with this boot's seed), quiesces the NIC and jumps through the trampoline in boot.s,
+ //! which turns paging off, copies the image to load_addr, zeroes its bss and enters it like GRUB would.
+-//! The TCO stays armed across the hop; the new kernel re-arms it as its first act. Any refusal leaves us running.
++//! The TCO stays armed across the hop (the attended successor re-arms it in kmain). Any refusal leaves us running.
+ use crate::kprintln;
+ use crate::mb;
+ use crate::nic::Rtl;
+@@ -12,14 +12,42 @@ use sha2::{Digest, Sha256};
+ 
+ pub const STAGE: u64 = 0x0400_0000; // 64 MiB
+ pub const CAP: u64 = 0x0080_0000; // 8 MiB (STAGE + CAP < 128 MiB, so q35 -m 128 works)
+-const TRAMP: u64 = 0x8000; // trampoline code + its stack (< 0xE00)
+-const PARAMS: u64 = 0x8E00;
+-const INFO: u64 = 0x9000;
+-const MODENT: u64 = 0x9080;
+-const MODULE: u64 = 0x9100;
+-const CMDLINE: u64 = 0x9200;
+-const MMAP: u64 = 0x9400;
++const TRAMP: u64 = 0x8000; // trampoline code + its stack (< 0xC00)
++const PARAMS: u64 = 0x8C00;
++const INFO: u64 = 0x8D00;
++const MODENT: u64 = 0x8E80;
++const CMDLINE: u64 = 0x8F00; // <= 255 bytes + NUL
++const MODULE: u64 = 0x9000; // page-aligned (our header asks for it: flag bit 0)
++const MMAP: u64 = 0x9100;
+ const LOW_END: u64 = 0xA000;
++const MMAP_MAX: usize = (LOW_END - MMAP) as usize;
++
++/// GRUB's boot metadata, copied out at boot (before any staging could overwrite it). (flags, mem_lower, mem_upper)
++static mut ORIG: (u32, u32, u32) = (0, 0, 0);
++static mut ORIG_MMAP: [u8; MMAP_MAX] = [0; MMAP_MAX];
++static mut ORIG_MMAP_LEN: usize = 0;
++static mut ORIG_MMAP_TOO_BIG: bool = false;
++
++/// Call once, early, with the multiboot info pointer GRUB (or a previous loader) gave us.
++pub fn snapshot_boot_info(info: u64) {
++    if info == 0 {
++        return;
++    }
++    unsafe {
++        let r32 = |a: u64| core::ptr::read_volatile(a as *const u32);
++        let f = r32(info);
++        ORIG = (f, if f & 1 != 0 { r32(info + 4) } else { 0 }, if f & 1 != 0 { r32(info + 8) } else { 0 });
++        if f & (1 << 6) != 0 {
++            let (l, a) = (r32(info + 44) as usize, r32(info + 48) as u64);
++            if l <= MMAP_MAX {
++                core::ptr::copy(a as *const u8, core::ptr::addr_of_mut!(ORIG_MMAP) as *mut u8, l);
++                ORIG_MMAP_LEN = l;
++            } else {
++                ORIG_MMAP_TOO_BIG = true;
++            }
++        }
++    }
++}
+ 
+ extern "C" {
+     static tramp_start: u8;
+@@ -51,7 +79,7 @@ pub fn begin(size: u64, sha_hex: &str) -> Result<Stage, &'static str> {
+     if !mb::ram_contains(STAGE, size) || overlaps(STAGE, size, ks, kl) {
+         return Err("staging area not free RAM");
+     }
+-    if sha_hex.len() != 64 {
++    if sha_hex.len() != 64 || !sha_hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+         return Err("sha256: 64 hex chars");
+     }
+     let mut sha = [0u8; 32];
+@@ -93,6 +121,9 @@ fn plan(st: &Stage) -> Result<(u64, u64, u64, u64, u64), &'static str> {
+     if flags & (1 << 16) == 0 {
+         return Err("multiboot header lacks the address kludge (flag 16)");
+     }
++    if flags & 0xFFFC != 0 {
++        return Err("multiboot header requires features this loader does not provide (bits 2..15)");
++    }
+     let (haddr, laddr, lend, bend, entry) =
+         (rd(hoff + 12) as u64, rd(hoff + 16) as u64, rd(hoff + 20) as u64, rd(hoff + 24) as u64, rd(hoff + 28) as u64);
+     if laddr > haddr || lend <= laddr || bend < lend || entry < laddr || entry >= lend {
+@@ -117,8 +148,8 @@ pub struct Plan {
+ }
+ 
+ /// All checks plus writing the low pages (trampoline, info, module, cmdline, mmap). Nothing of ours is touched:
+-/// the low pages are outside the kernel image, and GRUB's info/mmap are copied out before they are overwritten.
+-pub fn prepare(st: &Stage, cmdline: &str, seed: &[u8; 32], orig_info: u64) -> Result<Plan, &'static str> {
++/// the low pages are outside the kernel image; GRUB's info/mmap come from the boot-time snapshot.
++pub fn prepare(st: &Stage, cmdline: &str, seed: &[u8; 32]) -> Result<Plan, &'static str> {
+     let (src, dst, len, bss, entry) = plan(st)?;
+     let tl = (core::ptr::addr_of!(tramp_end) as u64) - (core::ptr::addr_of!(tramp_start) as u64);
+     if tl > PARAMS - TRAMP || !mb::ram_contains(TRAMP, LOW_END - TRAMP) {
+@@ -128,18 +159,12 @@ pub fn prepare(st: &Stage, cmdline: &str, seed: &[u8; 32], orig_info: u64) -> Re
+         return Err("cmdline > 255");
+     }
+     unsafe {
+-        let r32 = |a: u64| core::ptr::read_volatile(a as *const u32);
+-        let oflags = if orig_info != 0 { r32(orig_info) } else { 0 };
+-        let (mlo, mhi) = if oflags & 1 != 0 { (r32(orig_info + 4), r32(orig_info + 8)) } else { (0, 0) };
+-        let mut mmap = [0u8; (LOW_END - MMAP) as usize];
+-        let mut ml = 0usize;
+-        if oflags & (1 << 6) != 0 {
+-            let (l, a) = (r32(orig_info + 44) as usize, r32(orig_info + 48) as u64);
+-            if l <= mmap.len() {
+-                core::ptr::copy(a as *const u8, mmap.as_mut_ptr(), l);
+-                ml = l;
+-            }
++        if ORIG_MMAP_TOO_BIG {
++            return Err("GRUB memory map larger than the loader's buffer: refusing rather than dropping it");
+         }
++        let (oflags, mlo, mhi) = ORIG;
++        let ml = ORIG_MMAP_LEN;
++        let mmap = &*core::ptr::addr_of!(ORIG_MMAP);
+         let w32 = |a: u64, v: u32| core::ptr::write_volatile(a as *mut u32, v);
+         core::ptr::write_bytes(TRAMP as *mut u8, 0, (LOW_END - TRAMP) as usize);
+         core::ptr::copy_nonoverlapping(core::ptr::addr_of!(tramp_start), TRAMP as *mut u8, tl as usize);
+@@ -173,13 +198,18 @@ pub fn prepare(st: &Stage, cmdline: &str, seed: &[u8; 32], orig_info: u64) -> Re
+     Ok(Plan { params: [src, dst, len, bss, entry, INFO] })
+ }
+ 
+-/// Point of no return: NIC quiesced, trampoline entered. The TCO stays armed across the hop.
++/// Point of no return: NIC quiesced (reset completed), trampoline entered. The TCO stays armed across the hop.
++/// If the NIC reset does not complete, its DMA may still target memory the new image would overwrite: hard reset
++/// instead of jumping (back to Slot A via GRUB's default).
+ pub fn jump(p: &Plan, nic: &Rtl) -> ! {
++    if let Err(e) = nic.quiesce() {
++        kprintln!("loader: NIC quiesce failed ({}): NOT jumping, hard reset", e);
++        crate::wdt::hard_reset();
++    }
+     unsafe {
+         for (i, v) in p.params.iter().enumerate() {
+             core::ptr::write_volatile((PARAMS + 8 * i as u64) as *mut u64, *v);
+         }
+-        nic.quiesce();
+         crate::wdt::pet();
+         let f: extern "sysv64" fn(u64) -> ! = core::mem::transmute(TRAMP as usize);
+         f(PARAMS)
+diff --git a/src/main.rs b/src/main.rs
+index d28e820..5821634 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -49,6 +49,9 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
+         wdt::hard_reset();
+     }
+     kprintln!("NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)");
++    if let Some(b) = option_env!("NC110_BUILD") {
++        kprintln!("build: {}", b);
++    }
+     kprintln!("multiboot magic={:#010x} info={:#x} -> long mode OK", magic, info);
+     wdt::report();
+     if cfg!(feature = "attended") {
+diff --git a/src/nic.rs b/src/nic.rs
+index 68e2e3f..d957dd4 100644
+--- a/src/nic.rs
++++ b/src/nic.rs
+@@ -284,10 +284,19 @@ impl Rtl {
+         }
+     }
+ 
+-    /// Stop the chip and its DMA before control leaves this kernel (chain load): Rx/Tx off, bus mastering off.
+-    pub fn quiesce(&self) {
+-        unsafe { self.bus.w8(self.regs.chip_cmd, 0) };
++    /// Stop the chip and its DMA before control leaves this kernel (chain load), like r8169's down path: close RX
++    /// acceptance, Rx/Tx off, then a chip reset WITH its completion wait (outstanding descriptor DMA ends with the
++    /// reset), then bus mastering off. Err = the reset did not complete: the caller must not reuse that memory.
++    pub fn quiesce(&self) -> Result<(), &'static str> {
++        unsafe {
++            let rc = self.bus.r32(self.regs.rx_config);
++            self.bus.w32(self.regs.rx_config, rc & !0x3F); // accept nothing
++            self.bus.w8(self.regs.chip_cmd, 0);
++        }
++        time::delay_us(10_000);
++        let r = self.reset();
+         set_pci_cmd(self.bdf, 0, PCI_CMD_BM);
++        r
+     }
+ 
+     /// rtl_ephy_write / rtl_ephy_read (r8169_main.c:1261-1277): EPHYAR 0x80, flag bit 31, reg 20:16, data 15:0.
+diff --git a/tools/bmctl.py b/tools/bmctl.py
+index 3a8c26d..40b185e 100644
+--- a/tools/bmctl.py
++++ b/tools/bmctl.py
+@@ -40,15 +40,21 @@ def rpc(raw):
+     sys.exit(f"no reply from {a.host}:{a.port}")
+ 
+ 
+-nc = os.urandom(16)
+-who = rpc(b"who" + nc).decode().split()
+-if len(who) != 7 or who[:2] != ["nc110", "boot"] or who[3] != "session" or who[5] != "check" or len(who[2]) != 32:
+-    sys.exit(f"bad who reply: {who}")
+-boot, sid = bytes.fromhex(who[2]), int(who[4])
+-want = hashlib.sha256(b"nc110-bmctl-v1 who" + master + nc + boot + struct.pack("<I", sid)).digest()[:16]
+-if not hmac.compare_digest(want, bytes.fromhex(who[6])):
+-    sys.exit("who reply failed its check (wrong key, or a forged/replayed reply)")
+-aead = ChaCha20Poly1305(hashlib.sha256(b"nc110-bmctl-v1 session" + master + boot + struct.pack("<I", sid) + nc).digest())
++def handshake():
++    """Authenticated session setup; returns (aead, boot_id, session). Exits on a bad/forged reply."""
++    nc = os.urandom(16)
++    who = rpc(b"who" + nc).decode().split()
++    if len(who) != 7 or who[:2] != ["nc110", "boot"] or who[3] != "session" or who[5] != "check" or len(who[2]) != 32:
++        sys.exit(f"bad who reply: {who}")
++    bid, sess = bytes.fromhex(who[2]), int(who[4])
++    want = hashlib.sha256(b"nc110-bmctl-v1 who" + master + nc + bid + struct.pack("<I", sess)).digest()[:16]
++    if not hmac.compare_digest(want, bytes.fromhex(who[6])):
++        sys.exit("who reply failed its check (wrong key, or a forged/replayed reply)")
++    k = hashlib.sha256(b"nc110-bmctl-v1 session" + master + bid + struct.pack("<I", sess) + nc).digest()
++    return ChaCha20Poly1305(k), bid, sess
++
++
++aead, boot, sid = handshake()
+ SEQ = [0]
+ 
+ 
+@@ -89,22 +95,27 @@ if a.cmd[0] == "load":
+         if not r.startswith("ok"):
+             sys.exit(f"ldat at {off}: {r}")
+     print(f"staged {len(img)} B in {time.time() - t0:.1f} s")
+-    r = call(f"lcom {cl}".strip()).decode()
++    try:
++        r = call(f"lcom {cl}".strip()).decode()
++    except SystemExit:
++        r = "ok (lcom reply lost; the kernel may already have jumped)"
+     print(r)
+     if not r.startswith("ok"):
+         sys.exit(1)
+     old = boot
+-    for _ in range(60):
++    for _ in range(60):  # wait for an AUTHENTICATED answer from a kernel with a new boot id
+         time.sleep(1)
+         try:
+-            s.sendto(b"who" + os.urandom(16), (a.host, a.port))
+-            w = s.recvfrom(256)[0].split()
+-            if len(w) >= 3 and bytes.fromhex(w[2].decode()) != old:
+-                print(f"new kernel up: boot {w[2].decode()} after {time.time() - t0:.1f} s")
+-                sys.exit(0)
+-        except (socket.timeout, ValueError):
+-            pass
+-    sys.exit("no new kernel answered within 60 s")
++            s.settimeout(1.0)
++            aead, boot, sid = handshake()
++            SEQ[0] = 0
++            pong = call("ping").decode() if boot != old else None
++        except (OSError, ValueError, SystemExit):  # rpc() and handshake() signal failure with SystemExit
++            continue
++        if pong:
++            print(f"new kernel up: boot {boot.hex()} after {time.time() - t0:.1f} s; {pong}")
++            sys.exit(0)
++    sys.exit("no new kernel answered (authenticated) within 60 s")
+ if cmd == "logall":
+     off, out = 0, b""
+     while True:
+diff --git a/tools/loader-q35-test.sh b/tools/loader-q35-test.sh
+index 432d25e..8187944 100755
+--- a/tools/loader-q35-test.sh
++++ b/tools/loader-q35-test.sh
+@@ -24,7 +24,7 @@ neg "n4 bss into staging" "X=1" "$T/overlap.elf" "target range"
+ neg "n5 out-of-order"     "BMCTL_TEST_SWAP=1" "$K" "out of order"
+ for g in 2 3; do
+   r=$($B load $K bmctl gen=$g 2>&1 | tail -1); l=$($B logall | grep -c "cmdline: bmctl gen=$g")
+-  k=$($B logall | grep -c 'keymod: client key from module 0 at 0x9100')
++  k=$($B logall | grep -c 'keymod: client key from module 0 at 0x9000')
+   case "$r" in "new kernel up"*) [ "$l" = 1 ] && [ "$k" = 1 ] && echo "ok   hop to gen=$g: $r" || { echo "FAIL hop gen=$g log=$l key=$k"; fail=1; };;
+   *) echo "FAIL hop gen=$g: $r"; fail=1;; esac
+ done
+119:	[RTL_GIGA_MAC_VER_30] = {"RTL8105e",		FIRMWARE_8105E_1},
+379:	StopReq		= 0x80,
+403:#define RX_CONFIG_ACCEPT_MASK		0x3f
+1456:	case RTL_GIGA_MAC_VER_29 ... RTL_GIGA_MAC_VER_30:
+2317:		{ 0x7c8, 0x408,	RTL_GIGA_MAC_VER_30 },
+2619:DECLARE_RTL_COND(rtl_chipcmd_cond)
+2624:static void rtl_hw_reset(struct rtl8169_private *tp)
+2628:	rtl_loop_wait_low(tp, &rtl_chipcmd_cond, 100, 100);
+2656:static void rtl_rx_close(struct rtl8169_private *tp)
+2658:	RTL_W32(tp, RxConfig, RTL_R32(tp, RxConfig) & ~RX_CONFIG_ACCEPT_MASK);
+2682:static void rtl_wait_txrx_fifo_empty(struct rtl8169_private *tp)
+2693:		RTL_W8(tp, ChipCmd, RTL_R8(tp, ChipCmd) | StopReq);
+2711:	rtl_wait_txrx_fifo_empty(tp);
+3844:		[RTL_GIGA_MAC_VER_30] = rtl_hw_start_8105e_2,
+4095:static void rtl8169_cleanup(struct rtl8169_private *tp)
+4105:	rtl_rx_close(tp);
+4113:		RTL_W8(tp, ChipCmd, RTL_R8(tp, ChipCmd) | StopReq);
+4121:		RTL_W8(tp, ChipCmd, RTL_R8(tp, ChipCmd) | StopReq);
+4126:	rtl_hw_reset(tp);
+4138:	rtl8169_cleanup(tp);
+4807:static void rtl8169_down(struct rtl8169_private *tp)
+4819:	rtl8169_cleanup(tp);
+4851:	rtl8169_down(tp);
+4983:		rtl8169_down(tp);
+5456:	rtl_hw_reset(tp);
+
+exec
+/bin/zsh -lc "sed -n '2600,2725p' third_party/linux-v6.12/r8169_main.c; sed -n '4080,4155p' third_party/linux-v6.12/r8169_main.c; sed -n '4795,4865p' third_party/linux-v6.12/r8169_main.c; rg -n 'fn reset|fn hard_reset|snapshot|mb::|bmctl::run' src/nic.rs src/wdt.rs src/main.rs; cat tools/bmctl.py; cat src/loader.rs" in ~/nc110-baremetal
+ succeeded in 0ms:
+		break;
+	default:
+		break;
+	}
+	rtl_lock_config_regs(tp);
+
+	if (pci_is_pcie(tp->pci_dev) && tp->supports_gmii)
+		pcie_set_readrq(tp->pci_dev, readrq);
+
+	/* Chip doesn't support pause in jumbo mode */
+	if (jumbo) {
+		linkmode_clear_bit(ETHTOOL_LINK_MODE_Pause_BIT,
+				   tp->phydev->advertising);
+		linkmode_clear_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT,
+				   tp->phydev->advertising);
+		phy_start_aneg(tp->phydev);
+	}
+}
+
+DECLARE_RTL_COND(rtl_chipcmd_cond)
+{
+	return RTL_R8(tp, ChipCmd) & CmdReset;
+}
+
+static void rtl_hw_reset(struct rtl8169_private *tp)
+{
+	RTL_W8(tp, ChipCmd, CmdReset);
+
+	rtl_loop_wait_low(tp, &rtl_chipcmd_cond, 100, 100);
+}
+
+static void rtl_request_firmware(struct rtl8169_private *tp)
+{
+	struct rtl_fw *rtl_fw;
+
+	/* firmware loaded already or no firmware available */
+	if (tp->rtl_fw || !tp->fw_name)
+		return;
+
+	rtl_fw = kzalloc(sizeof(*rtl_fw), GFP_KERNEL);
+	if (!rtl_fw)
+		return;
+
+	rtl_fw->phy_write = rtl_writephy;
+	rtl_fw->phy_read = rtl_readphy;
+	rtl_fw->mac_mcu_write = mac_mcu_write;
+	rtl_fw->mac_mcu_read = mac_mcu_read;
+	rtl_fw->fw_name = tp->fw_name;
+	rtl_fw->dev = tp_to_dev(tp);
+
+	if (rtl_fw_request_firmware(rtl_fw))
+		kfree(rtl_fw);
+	else
+		tp->rtl_fw = rtl_fw;
+}
+
+static void rtl_rx_close(struct rtl8169_private *tp)
+{
+	RTL_W32(tp, RxConfig, RTL_R32(tp, RxConfig) & ~RX_CONFIG_ACCEPT_MASK);
+}
+
+DECLARE_RTL_COND(rtl_npq_cond)
+{
+	return RTL_R8(tp, TxPoll) & NPQ;
+}
+
+DECLARE_RTL_COND(rtl_txcfg_empty_cond)
+{
+	return RTL_R32(tp, TxConfig) & TXCFG_EMPTY;
+}
+
+DECLARE_RTL_COND(rtl_rxtx_empty_cond)
+{
+	return (RTL_R8(tp, MCU) & RXTX_EMPTY) == RXTX_EMPTY;
+}
+
+DECLARE_RTL_COND(rtl_rxtx_empty_cond_2)
+{
+	/* IntrMitigate has new functionality on RTL8125 */
+	return (RTL_R16(tp, IntrMitigate) & 0x0103) == 0x0103;
+}
+
+static void rtl_wait_txrx_fifo_empty(struct rtl8169_private *tp)
+{
+	switch (tp->mac_version) {
+	case RTL_GIGA_MAC_VER_40 ... RTL_GIGA_MAC_VER_53:
+		rtl_loop_wait_high(tp, &rtl_txcfg_empty_cond, 100, 42);
+		rtl_loop_wait_high(tp, &rtl_rxtx_empty_cond, 100, 42);
+		break;
+	case RTL_GIGA_MAC_VER_61 ... RTL_GIGA_MAC_VER_61:
+		rtl_loop_wait_high(tp, &rtl_rxtx_empty_cond, 100, 42);
+		break;
+	case RTL_GIGA_MAC_VER_63 ... RTL_GIGA_MAC_VER_66:
+		RTL_W8(tp, ChipCmd, RTL_R8(tp, ChipCmd) | StopReq);
+		rtl_loop_wait_high(tp, &rtl_rxtx_empty_cond, 100, 42);
+		rtl_loop_wait_high(tp, &rtl_rxtx_empty_cond_2, 100, 42);
+		break;
+	default:
+		break;
+	}
+}
+
+static void rtl_disable_rxdvgate(struct rtl8169_private *tp)
+{
+	RTL_W32(tp, MISC, RTL_R32(tp, MISC) & ~RXDV_GATED_EN);
+}
+
+static void rtl_enable_rxdvgate(struct rtl8169_private *tp)
+{
+	RTL_W32(tp, MISC, RTL_R32(tp, MISC) | RXDV_GATED_EN);
+	fsleep(2000);
+	rtl_wait_txrx_fifo_empty(tp);
+}
+
+static void rtl_wol_enable_rx(struct rtl8169_private *tp)
+{
+	if (tp->mac_version >= RTL_GIGA_MAC_VER_25)
+		RTL_W32(tp, RxConfig, RTL_R32(tp, RxConfig) |
+			AcceptBroadcast | AcceptMulticast | AcceptMyPhys);
+
+	if (tp->mac_version >= RTL_GIGA_MAC_VER_40)
+		rtl_disable_rxdvgate(tp);
+}
+
+static void rtl_prepare_power_down(struct rtl8169_private *tp)
+{
+			struct sk_buff *skb = tx_skb->skb;
+
+			rtl8169_unmap_tx_skb(tp, entry);
+			if (skb)
+				dev_consume_skb_any(skb);
+		}
+	}
+}
+
+static void rtl8169_tx_clear(struct rtl8169_private *tp)
+{
+	rtl8169_tx_clear_range(tp, tp->dirty_tx, NUM_TX_DESC);
+	netdev_reset_queue(tp->dev);
+}
+
+static void rtl8169_cleanup(struct rtl8169_private *tp)
+{
+	napi_disable(&tp->napi);
+
+	/* Give a racing hard_start_xmit a few cycles to complete. */
+	synchronize_net();
+
+	/* Disable interrupts */
+	rtl8169_irq_mask_and_ack(tp);
+
+	rtl_rx_close(tp);
+
+	switch (tp->mac_version) {
+	case RTL_GIGA_MAC_VER_28:
+	case RTL_GIGA_MAC_VER_31:
+		rtl_loop_wait_low(tp, &rtl_npq_cond, 20, 2000);
+		break;
+	case RTL_GIGA_MAC_VER_34 ... RTL_GIGA_MAC_VER_38:
+		RTL_W8(tp, ChipCmd, RTL_R8(tp, ChipCmd) | StopReq);
+		rtl_loop_wait_high(tp, &rtl_txcfg_empty_cond, 100, 666);
+		break;
+	case RTL_GIGA_MAC_VER_40 ... RTL_GIGA_MAC_VER_66:
+		rtl_enable_rxdvgate(tp);
+		fsleep(2000);
+		break;
+	default:
+		RTL_W8(tp, ChipCmd, RTL_R8(tp, ChipCmd) | StopReq);
+		fsleep(100);
+		break;
+	}
+
+	rtl_hw_reset(tp);
+
+	rtl8169_tx_clear(tp);
+	rtl8169_init_ring_indexes(tp);
+}
+
+static void rtl_reset_work(struct rtl8169_private *tp)
+{
+	int i;
+
+	netif_stop_queue(tp->dev);
+
+	rtl8169_cleanup(tp);
+
+	for (i = 0; i < NUM_RX_DESC; i++)
+		rtl8169_mark_to_asic(tp->RxDescArray + i);
+
+	napi_enable(&tp->napi);
+	rtl_hw_start(tp);
+}
+
+static void rtl8169_tx_timeout(struct net_device *dev, unsigned int txqueue)
+{
+	struct rtl8169_private *tp = netdev_priv(dev);
+
+	rtl_schedule_task(tp, RTL_FLAG_TASK_TX_TIMEOUT);
+}
+
+static int rtl8169_tx_map(struct rtl8169_private *tp, const u32 *opts, u32 len,
+			  void *addr, unsigned int entry, bool desc_own)
+				 phy_mode);
+	if (ret)
+		return ret;
+
+	if (!tp->supports_gmii)
+		phy_set_max_speed(phydev, SPEED_100);
+
+	phy_attached_info(phydev);
+
+	return 0;
+}
+
+static void rtl8169_down(struct rtl8169_private *tp)
+{
+	/* Clear all task flags */
+	bitmap_zero(tp->wk.flags, RTL_FLAG_MAX);
+
+	phy_stop(tp->phydev);
+
+	rtl8169_update_counters(tp);
+
+	pci_clear_master(tp->pci_dev);
+	rtl_pci_commit(tp);
+
+	rtl8169_cleanup(tp);
+	rtl_disable_exit_l1(tp);
+	rtl_prepare_power_down(tp);
+
+	if (tp->dash_type != RTL_DASH_NONE)
+		rtl8168_driver_stop(tp);
+}
+
+static void rtl8169_up(struct rtl8169_private *tp)
+{
+	if (tp->dash_type != RTL_DASH_NONE)
+		rtl8168_driver_start(tp);
+
+	pci_set_master(tp->pci_dev);
+	phy_init_hw(tp->phydev);
+	phy_resume(tp->phydev);
+	rtl8169_init_phy(tp);
+	napi_enable(&tp->napi);
+	set_bit(RTL_FLAG_TASK_ENABLED, tp->wk.flags);
+	rtl_reset_work(tp);
+
+	phy_start(tp->phydev);
+}
+
+static int rtl8169_close(struct net_device *dev)
+{
+	struct rtl8169_private *tp = netdev_priv(dev);
+	struct pci_dev *pdev = tp->pci_dev;
+
+	pm_runtime_get_sync(&pdev->dev);
+
+	netif_stop_queue(dev);
+	rtl8169_down(tp);
+	rtl8169_rx_clear(tp);
+
+	cancel_work(&tp->wk.work);
+
+	free_irq(tp->irq, tp);
+
+	phy_disconnect(tp->phydev);
+
+	dma_free_coherent(&pdev->dev, R8169_RX_RING_BYTES, tp->RxDescArray,
+			  tp->RxPhyAddr);
+	dma_free_coherent(&pdev->dev, R8169_TX_RING_BYTES, tp->TxDescArray,
+			  tp->TxPhyAddr);
+	tp->TxDescArray = NULL;
+	tp->RxDescArray = NULL;
+src/nic.rs:350:    fn reset(&self) -> Result<(), &'static str> {
+src/main.rs:64:    let client_seed = mb::take_client_key(info);
+src/main.rs:65:    mb::parse_memory(info);
+src/main.rs:66:    let cmdline = mb::cmdline(info);
+src/main.rs:95:                        bmctl::run(n, seed, info);
+src/main.rs:123:    mb::ram_overlaps(base, len)
+src/wdt.rs:124:pub fn hard_reset() -> ! {
+#!/usr/bin/env python3
+"""bmctl client for the NC110 kernel's authenticated UDP control port (see src/bmctl.rs).
+
+Usage: tools/.venv/bin/python tools/bmctl.py [--host 192.168.50.120] [--key test-keys/client.key] <command...>
+  commands: ping | stats | log [offset] | logall | peek ... | reboot
+            load <kernel.elf> [cmdline...]   stage over the network, verify, chain-load in RAM (nothing on /boot),
+                                             then wait for the new kernel's bmctl (new boot id) and print its ping
+The key file is the same 72-byte multiboot key module the kernel gets (magic 8 + ed25519 seed 32 + pub 32);
+master = SHA-256("nc110-bmctl-v1" + seed). Handshake: send "who" + fresh random 16-byte Nc; the reply carries boot id,
+session and check = SHA-256("nc110-bmctl-v1 who" + master + Nc + boot + session)[:16], verified here; traffic key =
+SHA-256("nc110-bmctl-v1 session" + master + boot + session_u32_le + Nc); seq counts from 1 per session. Uses the `cryptography` package's ChaCha20Poly1305,
+an implementation independent of the kernel's, so agreement is a real interop check.
+"""
+import argparse, hashlib, hmac, os, socket, struct, sys, time
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--host", default="192.168.50.120")
+ap.add_argument("--port", type=int, default=5515)
+ap.add_argument("--key", default="test-keys/client.key")
+ap.add_argument("cmd", nargs="+")
+a = ap.parse_args()
+km = open(a.key, "rb").read()
+assert len(km) == 72, "key module must be 72 bytes"
+master = hashlib.sha256(b"nc110-bmctl-v1" + km[8:40]).digest()
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2.0)
+
+
+def rpc(raw):
+    for _ in range(3):  # a retry of the same frame gets the kernel's cached reply, nothing runs twice
+        s.sendto(raw, (a.host, a.port))
+        try:
+            while True:
+                d, src = s.recvfrom(2048)
+                if src[0] == socket.gethostbyname(a.host):
+                    return d
+        except socket.timeout:
+            continue
+    sys.exit(f"no reply from {a.host}:{a.port}")
+
+
+def handshake():
+    """Authenticated session setup; returns (aead, boot_id, session). Exits on a bad/forged reply."""
+    nc = os.urandom(16)
+    who = rpc(b"who" + nc).decode().split()
+    if len(who) != 7 or who[:2] != ["nc110", "boot"] or who[3] != "session" or who[5] != "check" or len(who[2]) != 32:
+        sys.exit(f"bad who reply: {who}")
+    bid, sess = bytes.fromhex(who[2]), int(who[4])
+    want = hashlib.sha256(b"nc110-bmctl-v1 who" + master + nc + bid + struct.pack("<I", sess)).digest()[:16]
+    if not hmac.compare_digest(want, bytes.fromhex(who[6])):
+        sys.exit("who reply failed its check (wrong key, or a forged/replayed reply)")
+    k = hashlib.sha256(b"nc110-bmctl-v1 session" + master + bid + struct.pack("<I", sess) + nc).digest()
+    return ChaCha20Poly1305(k), bid, sess
+
+
+aead, boot, sid = handshake()
+SEQ = [0]
+
+
+def call(cmd):
+    return call_raw(cmd.encode())
+
+
+def call_raw(body):
+    SEQ[0] += 1  # per-session counter from 1; a fresh session per run, so (key, nonce) never repeats
+    seq = SEQ[0]
+    ct = aead.encrypt(b"C2K\0" + struct.pack("<Q", seq), body, boot)
+    r = rpc(struct.pack("<IQ", sid, seq) + ct)
+    rseq = struct.unpack("<Q", r[:8])[0]
+    if rseq != seq:
+        sys.exit(f"reply seq {rseq} != {seq}")
+    return aead.decrypt(b"K2C\0" + struct.pack("<Q", seq), r[8:], boot)
+
+
+cmd = " ".join(a.cmd)
+if a.cmd[0] == "load":
+    img = open(a.cmd[1], "rb").read()
+    cl = " ".join(a.cmd[2:])
+    sha = os.environ.get("BMCTL_TEST_SHA") or hashlib.sha256(img).hexdigest()  # test hooks: wrong digest,
+    if os.environ.get("BMCTL_TEST_SEND"):                                      # truncated send,
+        img_send = img[: int(os.environ["BMCTL_TEST_SEND"])]
+    else:
+        img_send = img
+    r = call(f"lbeg {len(img)} {sha}").decode()
+    print(r)
+    if not r.startswith("ok"):
+        sys.exit(1)
+    t0 = time.time()
+    offs = list(range(0, len(img_send), 1000))
+    if os.environ.get("BMCTL_TEST_SWAP") and len(offs) > 2:                    # out-of-order chunks
+        offs[1], offs[2] = offs[2], offs[1]
+    for off in offs:
+        r = call_raw(b"ldat" + struct.pack("<I", off) + img_send[off:off + 1000]).decode()
+        if not r.startswith("ok"):
+            sys.exit(f"ldat at {off}: {r}")
+    print(f"staged {len(img)} B in {time.time() - t0:.1f} s")
+    try:
+        r = call(f"lcom {cl}".strip()).decode()
+    except SystemExit:
+        r = "ok (lcom reply lost; the kernel may already have jumped)"
+    print(r)
+    if not r.startswith("ok"):
+        sys.exit(1)
+    old = boot
+    for _ in range(60):  # wait for an AUTHENTICATED answer from a kernel with a new boot id
+        time.sleep(1)
+        try:
+            s.settimeout(1.0)
+            aead, boot, sid = handshake()
+            SEQ[0] = 0
+            pong = call("ping").decode() if boot != old else None
+        except (OSError, ValueError, SystemExit):  # rpc() and handshake() signal failure with SystemExit
+            continue
+        if pong:
+            print(f"new kernel up: boot {boot.hex()} after {time.time() - t0:.1f} s; {pong}")
+            sys.exit(0)
+    sys.exit("no new kernel answered (authenticated) within 60 s")
+if cmd == "logall":
+    off, out = 0, b""
+    while True:
+        chunk = call(f"log {off}")
+        if not chunk:
+            break
+        out += chunk
+        off += len(chunk)
+    sys.stdout.write(out.decode(errors="replace"))
+else:
+    print(call(cmd).decode(errors="replace"))
+//! In-RAM chain loader, driven over bmctl (the DS OTA equivalent: nothing is written to /boot).
+//! `lbeg <size> <sha256>` opens a staging buffer at STAGE; binary `ldat` ++ u32 offset ++ bytes appends in order;
+//! `lcom <cmdline>` verifies length + SHA-256 + the multiboot header (a.out kludge, flag bit 16, as GRUB applies it),
+//! checks every destination range, builds a multiboot info block (cmdline, the ORIGINAL GRUB memory map, and a
+//! rebuilt 72-byte key module with this boot's seed), quiesces the NIC and jumps through the trampoline in boot.s,
+//! which turns paging off, copies the image to load_addr, zeroes its bss and enters it like GRUB would.
+//! The TCO stays armed across the hop (the attended successor re-arms it in kmain). Any refusal leaves us running.
+use crate::kprintln;
+use crate::mb;
+use crate::nic::Rtl;
+use sha2::{Digest, Sha256};
+
+pub const STAGE: u64 = 0x0400_0000; // 64 MiB
+pub const CAP: u64 = 0x0080_0000; // 8 MiB (STAGE + CAP < 128 MiB, so q35 -m 128 works)
+const TRAMP: u64 = 0x8000; // trampoline code + its stack (< 0xC00)
+const PARAMS: u64 = 0x8C00;
+const INFO: u64 = 0x8D00;
+const MODENT: u64 = 0x8E80;
+const CMDLINE: u64 = 0x8F00; // <= 255 bytes + NUL
+const MODULE: u64 = 0x9000; // page-aligned (our header asks for it: flag bit 0)
+const MMAP: u64 = 0x9100;
+const LOW_END: u64 = 0xA000;
+const MMAP_MAX: usize = (LOW_END - MMAP) as usize;
+
+/// GRUB's boot metadata, copied out at boot (before any staging could overwrite it). (flags, mem_lower, mem_upper)
+static mut ORIG: (u32, u32, u32) = (0, 0, 0);
+static mut ORIG_MMAP: [u8; MMAP_MAX] = [0; MMAP_MAX];
+static mut ORIG_MMAP_LEN: usize = 0;
+static mut ORIG_MMAP_TOO_BIG: bool = false;
+
+/// Call once, early, with the multiboot info pointer GRUB (or a previous loader) gave us.
+pub fn snapshot_boot_info(info: u64) {
+    if info == 0 {
+        return;
+    }
+    unsafe {
+        let r32 = |a: u64| core::ptr::read_volatile(a as *const u32);
+        let f = r32(info);
+        ORIG = (f, if f & 1 != 0 { r32(info + 4) } else { 0 }, if f & 1 != 0 { r32(info + 8) } else { 0 });
+        if f & (1 << 6) != 0 {
+            let (l, a) = (r32(info + 44) as usize, r32(info + 48) as u64);
+            if l <= MMAP_MAX {
+                core::ptr::copy(a as *const u8, core::ptr::addr_of_mut!(ORIG_MMAP) as *mut u8, l);
+                ORIG_MMAP_LEN = l;
+            } else {
+                ORIG_MMAP_TOO_BIG = true;
+            }
+        }
+    }
+}
+
+extern "C" {
+    static tramp_start: u8;
+    static tramp_end: u8;
+    static __load_start: u8;
+    static __bss_end: u8;
+}
+
+pub struct Stage {
+    size: u64,
+    sha: [u8; 32],
+    got: u64,
+}
+
+fn overlaps(a: u64, al: u64, b: u64, bl: u64) -> bool {
+    a < b.saturating_add(bl) && b < a.saturating_add(al)
+}
+
+fn kernel_image() -> (u64, u64) {
+    let (s, e) = (core::ptr::addr_of!(__load_start) as u64, core::ptr::addr_of!(__bss_end) as u64);
+    (s, e - s)
+}
+
+pub fn begin(size: u64, sha_hex: &str) -> Result<Stage, &'static str> {
+    if size == 0 || size > CAP {
+        return Err("size 1..8 MiB");
+    }
+    let (ks, kl) = kernel_image();
+    if !mb::ram_contains(STAGE, size) || overlaps(STAGE, size, ks, kl) {
+        return Err("staging area not free RAM");
+    }
+    if sha_hex.len() != 64 || !sha_hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err("sha256: 64 hex chars");
+    }
+    let mut sha = [0u8; 32];
+    for (i, b) in sha.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&sha_hex[2 * i..2 * i + 2], 16).map_err(|_| "sha256: hex")?;
+    }
+    Ok(Stage { size, sha, got: 0 })
+}
+
+pub fn data(st: &mut Stage, off: u64, bytes: &[u8]) -> Result<u64, &'static str> {
+    if off != st.got {
+        return Err("out of order (send chunks in sequence)");
+    }
+    let end = off.checked_add(bytes.len() as u64).ok_or("overflow")?;
+    if end > st.size {
+        return Err("past announced size");
+    }
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), (STAGE + off) as *mut u8, bytes.len()) };
+    st.got = end;
+    Ok(end)
+}
+
+/// Everything checked, nothing moved yet. Returns (src, dst, len, bss_len, entry).
+fn plan(st: &Stage) -> Result<(u64, u64, u64, u64, u64), &'static str> {
+    if st.got != st.size {
+        return Err("incomplete image");
+    }
+    let img = unsafe { core::slice::from_raw_parts(STAGE as *const u8, st.size as usize) };
+    let d: [u8; 32] = Sha256::digest(img).into();
+    if d != st.sha {
+        return Err("sha256 mismatch");
+    }
+    let rd = |o: usize| u32::from_le_bytes(img[o..o + 4].try_into().unwrap());
+    let lim = img.len().min(8192);
+    let hoff = (0..lim.saturating_sub(31)).step_by(4).find(|&o| {
+        rd(o) == 0x1BAD_B002 && rd(o).wrapping_add(rd(o + 4)).wrapping_add(rd(o + 8)) == 0
+    }).ok_or("no multiboot header in the first 8 KiB")?;
+    let flags = rd(hoff + 4);
+    if flags & (1 << 16) == 0 {
+        return Err("multiboot header lacks the address kludge (flag 16)");
+    }
+    if flags & 0xFFFC != 0 {
+        return Err("multiboot header requires features this loader does not provide (bits 2..15)");
+    }
+    let (haddr, laddr, lend, bend, entry) =
+        (rd(hoff + 12) as u64, rd(hoff + 16) as u64, rd(hoff + 20) as u64, rd(hoff + 24) as u64, rd(hoff + 28) as u64);
+    if laddr > haddr || lend <= laddr || bend < lend || entry < laddr || entry >= lend {
+        return Err("inconsistent header addresses");
+    }
+    let foff = (hoff as u64).checked_sub(haddr - laddr).ok_or("header offset")?;
+    let len = lend - laddr;
+    if foff.checked_add(len).is_none_or(|e| e > st.size) {
+        return Err("image shorter than load_end - load_addr");
+    }
+    if laddr < 0x10_0000 || bend > STAGE || !mb::ram_contains(laddr, bend - laddr) {
+        return Err("target range not RAM in [1 MiB, staging)");
+    }
+    if overlaps(laddr, bend - laddr, TRAMP, LOW_END - TRAMP) {
+        return Err("target overlaps the trampoline/info pages");
+    }
+    Ok((STAGE + foff, laddr, len, bend - lend, entry))
+}
+
+pub struct Plan {
+    params: [u64; 6],
+}
+
+/// All checks plus writing the low pages (trampoline, info, module, cmdline, mmap). Nothing of ours is touched:
+/// the low pages are outside the kernel image; GRUB's info/mmap come from the boot-time snapshot.
+pub fn prepare(st: &Stage, cmdline: &str, seed: &[u8; 32]) -> Result<Plan, &'static str> {
+    let (src, dst, len, bss, entry) = plan(st)?;
+    let tl = (core::ptr::addr_of!(tramp_end) as u64) - (core::ptr::addr_of!(tramp_start) as u64);
+    if tl > PARAMS - TRAMP || !mb::ram_contains(TRAMP, LOW_END - TRAMP) {
+        return Err("low pages 0x8000-0xA000 not usable");
+    }
+    if cmdline.len() > 255 {
+        return Err("cmdline > 255");
+    }
+    unsafe {
+        if ORIG_MMAP_TOO_BIG {
+            return Err("GRUB memory map larger than the loader's buffer: refusing rather than dropping it");
+        }
+        let (oflags, mlo, mhi) = ORIG;
+        let ml = ORIG_MMAP_LEN;
+        let mmap = &*core::ptr::addr_of!(ORIG_MMAP);
+        let w32 = |a: u64, v: u32| core::ptr::write_volatile(a as *mut u32, v);
+        core::ptr::write_bytes(TRAMP as *mut u8, 0, (LOW_END - TRAMP) as usize);
+        core::ptr::copy_nonoverlapping(core::ptr::addr_of!(tramp_start), TRAMP as *mut u8, tl as usize);
+        // key module: MAGIC + seed + public key, exactly the 72 bytes GRUB's `module` line gave us
+        core::ptr::copy_nonoverlapping(mb::MAGIC.as_ptr(), MODULE as *mut u8, 8);
+        core::ptr::copy_nonoverlapping(seed.as_ptr(), (MODULE + 8) as *mut u8, 32);
+        let publ = sunset::ed25519_dalek::SigningKey::from_bytes(seed).verifying_key().to_bytes();
+        core::ptr::copy_nonoverlapping(publ.as_ptr(), (MODULE + 40) as *mut u8, 32);
+        w32(MODENT, MODULE as u32);
+        w32(MODENT + 4, (MODULE + 72) as u32);
+        core::ptr::copy_nonoverlapping(cmdline.as_ptr(), CMDLINE as *mut u8, cmdline.len());
+        // multiboot info: flags 0 (mem), 2 (cmdline), 3 (mods), 6 (GRUB's memory map, verbatim)
+        let mut flags = (1 << 2) | (1 << 3);
+        if oflags & 1 != 0 {
+            flags |= 1;
+            w32(INFO + 4, mlo);
+            w32(INFO + 8, mhi);
+        }
+        if ml > 0 {
+            core::ptr::copy_nonoverlapping(mmap.as_ptr(), MMAP as *mut u8, ml);
+            flags |= 1 << 6;
+            w32(INFO + 44, ml as u32);
+            w32(INFO + 48, MMAP as u32);
+        }
+        w32(INFO, flags);
+        w32(INFO + 16, CMDLINE as u32);
+        w32(INFO + 20, 1);
+        w32(INFO + 24, MODENT as u32);
+    }
+    kprintln!("loader: ready: {} B image -> {:#x}..{:#x} (+{} B bss), entry {:#x}, cmdline '{}'", st.size, dst, dst + len, bss, entry, cmdline);
+    Ok(Plan { params: [src, dst, len, bss, entry, INFO] })
+}
+
+/// Point of no return: NIC quiesced (reset completed), trampoline entered. The TCO stays armed across the hop.
+/// If the NIC reset does not complete, its DMA may still target memory the new image would overwrite: hard reset
+/// instead of jumping (back to Slot A via GRUB's default).
+pub fn jump(p: &Plan, nic: &Rtl) -> ! {
+    if let Err(e) = nic.quiesce() {
+        kprintln!("loader: NIC quiesce failed ({}): NOT jumping, hard reset", e);
+        crate::wdt::hard_reset();
+    }
+    unsafe {
+        for (i, v) in p.params.iter().enumerate() {
+            core::ptr::write_volatile((PARAMS + 8 * i as u64) as *mut u64, *v);
+        }
+        crate::wdt::pet();
+        let f: extern "sysv64" fn(u64) -> ! = core::mem::transmute(TRAMP as usize);
+        f(PARAMS)
+    }
+}
+
+exec
+/bin/zsh -lc "sed -n '345,375p' src/nic.rs; sed -n '120,145p' src/wdt.rs; sed -n '45,105p' src/main.rs; rg -n 'irq_mask|intr_mask|imr|cli|rtl_pci_commit' src/nic.rs src/boot.s third_party/linux-v6.12/r8169_main.c; sed -n '260,285p' src/bmctl.rs; cat tools/loader-q35-test.sh; rg -n 'fn parse_memory|fn ram_contains|fn take_client_key' src/mb.rs" in ~/nc110-baremetal
+ succeeded in 0ms:
+        }
+        kprintln!("nic: rtl_hw_start_8105e_{} applied (FuncEvent, MCU, DLLPR, 8 ephy writes, L2/L3 off)", self.ver - 28);
+        Ok(())
+    }
+
+    fn reset(&self) -> Result<(), &'static str> {
+        let r = self.regs;
+        unsafe {
+            self.bus.w8(r.chip_cmd, r.cmd_reset);
+            for _ in 0..1000 {
+                if self.bus.r8(r.chip_cmd) & r.cmd_reset == 0 {
+                    return Ok(());
+                }
+                time::delay_us(100);
+            }
+        }
+        Err("chip reset did not complete in 100 ms")
+    }
+
+    fn program_rings(&self) {
+        let r = self.regs;
+        unsafe {
+            for i in 0..NRX {
+                let d = addr_of_mut!(RX_DESC.0[i]);
+                let mut o = r.desc_own | BUFSZ as u32;
+                if i == NRX - 1 {
+                    o |= r.ring_end;
+                }
+                write_volatile(d, Desc { opts1: o, opts2: 0, addr: addr_of!(RX_BUF.0[i]) as u64 });
+            }
+            write_volatile(addr_of_mut!(TX_DESC.0[0]), Desc { opts1: r.ring_end, opts2: 0, addr: 0 });
+    on
+}
+
+/// Hard reset via the reset control register (spec M2 `reboot`): back to the firmware / Slot A.
+pub fn hard_reset() -> ! {
+    kprintln!("wdt: hard reset via 0xCF9");
+    unsafe {
+        outb(0xCF9, 0x02);
+        outb(0xCF9, 0x06);
+    }
+    loop {
+        unsafe { core::arch::asm!("cli; hlt") };
+    }
+}
+
+/// Attended `wdt=probe`: arm the NM10 TCO ourselves without touching locked bits (SMI_EN.TCO_EN stays as the
+/// BIOS left it): clear GCS.NO_REBOOT (the BIOS leaves it SET on the NC110), clear stale status, TMR=50 ticks
+/// (30 s per stage, reset ~60 s after the last pet), reload, un-halt. Returns true if the readback says armed.
+pub fn arm_probe() -> bool {
+    let lpc = pci::read32(pci::b0(31, 0), 0);
+    let rcba_raw = pci::read32(pci::b0(31, 0), 0xF0);
+    if !(lpc == 0x27BC_8086 || lpc == 0x2918_8086) || pmbase() == 0 || rcba_raw & 1 == 0 {
+        kprintln!("wdt: probe arm: prerequisites fail (LPC {:#010x}, PMBASE {:#x}, RCBA {:#x})", lpc, pmbase(), rcba_raw);
+        return false;
+    }
+    let b = base();
+    console::init();
+    // Attended: arm the TCO before anything else can block (Codex night review MUST-FIX 1). No net -> no run.
+    if cfg!(feature = "attended") && !wdt::arm_probe() {
+        kprintln!("wdt: ATTENDED: could not arm the TCO, refusing to run");
+        wdt::hard_reset();
+    }
+    kprintln!("NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)");
+    if let Some(b) = option_env!("NC110_BUILD") {
+        kprintln!("build: {}", b);
+    }
+    kprintln!("multiboot magic={:#010x} info={:#x} -> long mode OK", magic, info);
+    wdt::report();
+    if cfg!(feature = "attended") {
+        kprintln!("wdt: ATTENDED build: TCO armed by us with NO_REBOOT cleared (one-shot boot, Slot A on any reset)");
+    } else if !wdt::is_qemu_pc() && !wdt::verify_live() && !wdt::neg_control_on_q35() {
+        kprintln!("wdt: reset path not verified on this machine, refusing to run");
+        wdt::hard_reset();
+    }
+    // Key module right after the watchdog gate: copy the seed out and wipe the module before anything else.
+    let client_seed = mb::take_client_key(info);
+    mb::parse_memory(info);
+    let cmdline = mb::cmdline(info);
+    kprintln!("cmdline: {}", cmdline);
+    wdt::rehearse(cmdline);
+
+    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
+    kprintln!("time: TSC {} ticks/ms (PIT ch2 calibrated)", time::init());
+
+    match nic::probe(cmdline.contains("nic=mmio")) {
+        Ok(mut n) => {
+            if cmdline.contains("nic=no8105e") {
+                n.skip_8105e(); // A/B switch for the rtl_hw_start_8105e tweaks
+            }
+            kprintln!("nic: {} at {} {} mac={}", n.name(), n.bdf, n.bus, dhcp::Mac(n.mac));
+            match n.init() {
+                Ok(()) if cfg!(feature = "attended") => {
+                    kprintln!("udplog: broadcasting this log to UDP 5514");
+                    udplog::set_nic(&n);
+                    udplog::dump(1);
+                    udplog::dhcp_probe(&mut n);
+                    udplog::dump(2);
+                    if cmdline.contains("wdt=probe") {
+                        wdt::pet();
+                        kprintln!("wdt: HANG now (probe): cli; hlt, nobody pets; expect a reset ~60 s from here");
+                        udplog::dump(3);
+                        loop {
+                            unsafe { asm!("cli; hlt") };
+                        }
+                    }
+                    if let (Some(seed), true) = (client_seed, cmdline.contains("bmctl")) {
+                        bmctl::run(n, seed, info);
+                    } else if client_seed.is_some() {
+                        ssh::run(n, client_seed, cmdline.contains("rng=dump"));
+                    }
+                    kprintln!("attended: final log round, then reset");
+                    udplog::dump(4);
+                }
+                Ok(()) => ssh::run(n, client_seed, cmdline.contains("rng=dump")),
+                Err(e) => kprintln!("nic: init failed: {} (bus mastering left off)", e),
+            }
+        }
+third_party/linux-v6.12/r8169_main.c:652:	u32 irq_mask;
+third_party/linux-v6.12/r8169_main.c:738:static void rtl_pci_commit(struct rtl8169_private *tp)
+third_party/linux-v6.12/r8169_main.c:1515:		RTL_W32(tp, IntrMask_8125, tp->irq_mask);
+third_party/linux-v6.12/r8169_main.c:1517:		RTL_W16(tp, IntrMask, tp->irq_mask);
+third_party/linux-v6.12/r8169_main.c:1520:static void rtl8169_irq_mask_and_ack(struct rtl8169_private *tp)
+third_party/linux-v6.12/r8169_main.c:1524:	rtl_pci_commit(tp);
+third_party/linux-v6.12/r8169_main.c:1732:	rtl_pci_commit(tp);
+third_party/linux-v6.12/r8169_main.c:1799:	rtl_pci_commit(tp);
+third_party/linux-v6.12/r8169_main.c:2086:	rtl_pci_commit(tp);
+third_party/linux-v6.12/r8169_main.c:2460:	rtl_pci_commit(tp);
+third_party/linux-v6.12/r8169_main.c:2463:	rtl_pci_commit(tp);
+third_party/linux-v6.12/r8169_main.c:3955:	rtl_pci_commit(tp);
+third_party/linux-v6.12/r8169_main.c:4103:	rtl8169_irq_mask_and_ack(tp);
+third_party/linux-v6.12/r8169_main.c:4682:	if ((status & 0xffff) == 0xffff || !(status & tp->irq_mask))
+third_party/linux-v6.12/r8169_main.c:4817:	rtl_pci_commit(tp);
+third_party/linux-v6.12/r8169_main.c:5124:static void rtl_set_irq_mask(struct rtl8169_private *tp)
+third_party/linux-v6.12/r8169_main.c:5126:	tp->irq_mask = RxOK | RxErr | TxOK | TxErr | LinkChg;
+third_party/linux-v6.12/r8169_main.c:5129:		tp->irq_mask |= SYSErr | RxFIFOOver;
+third_party/linux-v6.12/r8169_main.c:5132:		tp->irq_mask |= RxFIFOOver;
+third_party/linux-v6.12/r8169_main.c:5452:	rtl8169_irq_mask_and_ack(tp);
+third_party/linux-v6.12/r8169_main.c:5526:	rtl_set_irq_mask(tp);
+src/nic.rs:403:            self.bus.w16(r.intr_mask, 0); // polled
+src/nic.rs:437:            self.bus.w16(r.intr_mask, 0);
+src/boot.s:25:    cli
+src/boot.s:180:3:  cli
+src/boot.s:225:    cli
+        wdt::pet();
+        crate::net::rx_budget(Some(32)); // bounded ingress per poll so the deadline checks below always run
+        iface.poll(now(), &mut dev, &mut sockets);
+        let t = time::now_ms();
+        if t - last_ok > IDLE_MS {
+            kprintln!("bmctl: idle {} s -> reset", IDLE_MS / 1000);
+            return;
+        }
+        if jump_at.as_ref().is_some_and(|(j, _)| t > *j) {
+            let (_, p) = jump_at.take().unwrap();
+            kprintln!("bmctl: chain-loading the staged kernel");
+            crate::udplog::dump(7);
+            crate::loader::jump(&p, &dev.0);
+        }
+        if reboot_at.is_some_and(|r| t > r) {
+            kprintln!("bmctl: reboot requested");
+            wdt::hard_reset();
+        }
+        let sock = sockets.get_mut::<udp::Socket>(udp_h);
+        if t - last_hello > 2000 {
+            last_hello = t;
+            let mut h = heapless::String::<128>::new();
+            let _ = core::fmt::write(&mut h, format_args!("nc110 hello bmctl {}:{} boot {}", ip.address(), PORT, bid));
+            let _ = sock.send_slice(h.as_bytes(), IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::BROADCAST), 5514));
+        }
+        let mut buf = [0u8; 1500];
+#!/bin/sh
+# q35 check of the in-RAM chain loader: 5 refusals (the kernel must stay up), then gen1 -> gen2 -> gen3.
+K=target/attended/x86_64-unknown-none/release/nc110-kernel; P=tools/.venv/bin/python; fail=0; T=$(mktemp -d)
+$P - "$K" "$T" <<'PY'
+import struct, sys
+img = bytearray(open(sys.argv[1], "rb").read()); d = sys.argv[2]
+o = next(i for i in range(0, 8192, 4) if struct.unpack_from("<I", img, i)[0] == 0x1BADB002)
+a = bytearray(img); fl = struct.unpack_from("<I", a, o + 4)[0] & ~(1 << 16)
+struct.pack_into("<II", a, o + 4, fl, (-(0x1BADB002 + fl)) & 0xffffffff); open(f"{d}/nokludge.elf", "wb").write(a)
+b = bytearray(img); struct.pack_into("<I", b, o + 24, 0x0400_1000); open(f"{d}/overlap.elf", "wb").write(b)
+PY
+qemu-system-x86_64 -machine q35 -m 128 -display none -no-reboot -global ICH9-LPC.noreboot=false -serial file:/tmp/loader-q35.log \
+  -kernel $K -initrd test-keys/client.key -append "bmctl gen=1" -netdev user,id=n0,hostfwd=udp:127.0.0.1:15515-:5515 -device rtl8139,netdev=n0 &
+Q=$!; trap 'kill $Q 2>/dev/null; rm -rf $T' EXIT
+for i in $(seq 40); do grep -q 'bmctl: listening' /tmp/loader-q35.log 2>/dev/null && break; sleep 0.5; done
+B="$P tools/bmctl.py --host 127.0.0.1 --port 15515"
+neg() { r=$(env $2 $B load $3 bmctl x 2>&1 | grep -E 'err|jumping' | tail -1); alive=$($B ping 2>&1)
+  case "$r" in *"$4"*) case "$alive" in pong*) echo "ok   $1: '$r', still up";; *) echo "FAIL $1: kernel gone"; fail=1;; esac;;
+  *) echo "FAIL $1: got '$r'"; fail=1;; esac; }
+neg "n1 wrong sha256"     "BMCTL_TEST_SHA=$(printf '0%.0s' $(seq 64))" "$K" "sha256 mismatch"
+neg "n2 truncated image"  "BMCTL_TEST_SEND=4000" "$K" "incomplete image"
+neg "n3 no kludge flag"   "X=1" "$T/nokludge.elf" "lacks the address kludge"
+neg "n4 bss into staging" "X=1" "$T/overlap.elf" "target range"
+neg "n5 out-of-order"     "BMCTL_TEST_SWAP=1" "$K" "out of order"
+for g in 2 3; do
+  r=$($B load $K bmctl gen=$g 2>&1 | tail -1); l=$($B logall | grep -c "cmdline: bmctl gen=$g")
+  k=$($B logall | grep -c 'keymod: client key from module 0 at 0x9000')
+  case "$r" in "new kernel up"*) [ "$l" = 1 ] && [ "$k" = 1 ] && echo "ok   hop to gen=$g: $r" || { echo "FAIL hop gen=$g log=$l key=$k"; fail=1; };;
+  *) echo "FAIL hop gen=$g: $r"; fail=1;; esac
+done
+echo "RESULT: $([ $fail = 0 ] && echo PASS || echo FAIL)"; exit $fail
+23:pub fn parse_memory(info: u64) {
+66:pub fn ram_contains(base: u64, len: u64) -> bool {
+89:pub fn take_client_key(info: u64) -> Option<[u8; 32]> {
+
+web search: 
+web search: https://raw.githubusercontent.com/torvalds/linux/v6.12/drivers/net/ethernet/realtek/r8169_main.c
+codex
+The commit freeze, SHA validation, metadata snapshot, and authenticated post-hop check address the reported issues. Linux uses reset completion before reclaiming descriptors, which supports closing the DMA blocker; one difference remains: VER_30 requests `StopReq`, while this code writes `ChipCmd=0`.
+exec
+/bin/zsh -lc "sed -n '730,748p' third_party/linux-v6.12/r8169_main.c; nl -ba tools/bmctl.py | sed -n '95,125p'; nl -ba src/bmctl.rs | sed -n '355,408p'; sed -n '1,88p' src/mb.rs" in ~/nc110-baremetal
+ succeeded in 0ms:
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&tp->cfg9346_usage_lock, flags);
+	if (!tp->cfg9346_usage_count++)
+		RTL_W8(tp, Cfg9346, Cfg9346_Unlock);
+	raw_spin_unlock_irqrestore(&tp->cfg9346_usage_lock, flags);
+}
+
+static void rtl_pci_commit(struct rtl8169_private *tp)
+{
+	/* Read an arbitrary register to commit a preceding PCI write */
+	RTL_R8(tp, ChipCmd);
+}
+
+static void rtl_mod_config2(struct rtl8169_private *tp, u8 clear, u8 set)
+{
+	unsigned long flags;
+	u8 val;
+
+    95	        if not r.startswith("ok"):
+    96	            sys.exit(f"ldat at {off}: {r}")
+    97	    print(f"staged {len(img)} B in {time.time() - t0:.1f} s")
+    98	    try:
+    99	        r = call(f"lcom {cl}".strip()).decode()
+   100	    except SystemExit:
+   101	        r = "ok (lcom reply lost; the kernel may already have jumped)"
+   102	    print(r)
+   103	    if not r.startswith("ok"):
+   104	        sys.exit(1)
+   105	    old = boot
+   106	    for _ in range(60):  # wait for an AUTHENTICATED answer from a kernel with a new boot id
+   107	        time.sleep(1)
+   108	        try:
+   109	            s.settimeout(1.0)
+   110	            aead, boot, sid = handshake()
+   111	            SEQ[0] = 0
+   112	            pong = call("ping").decode() if boot != old else None
+   113	        except (OSError, ValueError, SystemExit):  # rpc() and handshake() signal failure with SystemExit
+   114	            continue
+   115	        if pong:
+   116	            print(f"new kernel up: boot {boot.hex()} after {time.time() - t0:.1f} s; {pong}")
+   117	            sys.exit(0)
+   118	    sys.exit("no new kernel answered (authenticated) within 60 s")
+   119	if cmd == "logall":
+   120	    off, out = 0, b""
+   121	    while True:
+   122	        chunk = call(f"log {off}")
+   123	        if not chunk:
+   124	            break
+   125	        out += chunk
+   355	            sess[dst] = pend[i].take();
+   356	            sess[dst].as_mut().unwrap()
+   357	        } else {
+   358	            se
+   359	        };
+   360	        ok += 1;
+   361	        let mut out = [0u8; 1300];
+   362	        let len = {
+   363	            let mut w = Writer { b: &mut out, n: 0 };
+   364	            let loading = |c: &[u8]| c.starts_with(b"ldat") || c.starts_with(b"lbeg") || c.starts_with(b"lcom");
+   365	            if jump_at.is_some() && loading(body) {
+   366	                // committed: the staged image is frozen until the hop (Codex loader MUST-FIX 2)
+   367	                let _ = core::fmt::write(&mut w, format_args!("err committed, jump pending"));
+   368	            } else if body.len() >= 8 && &body[..4] == b"ldat" {
+   369	                // binary chunk: "ldat" ++ u32 LE offset ++ bytes (checked before the text parser)
+   370	                let off = u32::from_le_bytes(body[4..8].try_into().unwrap()) as u64;
+   371	                let r = match stage.as_mut() {
+   372	                    Some(st) => crate::loader::data(st, off, &body[8..]),
+   373	                    None => Err("no lbeg"),
+   374	                };
+   375	                match r {
+   376	                    Ok(got) => { let _ = core::fmt::write(&mut w, format_args!("ok {}", got)); }
+   377	                    Err(e) => { let _ = core::fmt::write(&mut w, format_args!("err {}", e)); }
+   378	                }
+   379	            }
+   380	            let cmd = if w.n > 0 { "" } else { core::str::from_utf8(body).unwrap_or("") };
+   381	            let mut it = cmd.split(' ');
+   382	            match it.next().unwrap_or("") {
+   383	                "" if w.n > 0 => {} // already answered (ldat)
+   384	                "lbeg" => {
+   385	                    let size: u64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+   386	                    match crate::loader::begin(size, it.next().unwrap_or("")) {
+   387	                        Ok(st) => {
+   388	                            stage = Some(st);
+   389	                            let _ = core::fmt::write(&mut w, format_args!("ok staging {} B at {:#x}", size, crate::loader::STAGE));
+   390	                        }
+   391	                        Err(e) => { let _ = core::fmt::write(&mut w, format_args!("err {}", e)); }
+   392	                    }
+   393	                }
+   394	                "lcom" => {
+   395	                    let rest = cmd.splitn(2, ' ').nth(1).unwrap_or("");
+   396	                    let r = match stage.as_ref() {
+   397	                        Some(st) => crate::loader::prepare(st, rest, &seed),
+   398	                        None => Err("no lbeg"),
+   399	                    };
+   400	                    match r {
+   401	                        Ok(p) => {
+   402	                            let _ = core::fmt::write(&mut w, format_args!("ok jumping in 300 ms"));
+   403	                            jump_at = Some((t + 300, p)); // the reply leaves first, then the hop
+   404	                        }
+   405	                        Err(e) => { let _ = core::fmt::write(&mut w, format_args!("err {}", e)); }
+   406	                    }
+   407	                }
+   408	                "ping" => {
+//! Multiboot v1 info: cmdline, memory map, and the client-key module (M2.5).
+//!
+//! The SSH client key is NOT compiled into the ELF. GRUB loads it with `module /baremetal/<file>` (QEMU:
+//! `-initrd <file>`), so the key lives on /boot and can be rotated without a rebuild.
+//! Module format (72 bytes): b"NC110K1\n" | ed25519 seed (32) | ed25519 public key (32).
+//! The kernel derives the public key from the seed and refuses on mismatch (truncation / corruption / wrong
+//! file), copies the seed into a static, then zeroes the module bytes in RAM.
+use crate::kprintln;
+use core::ptr::{read_volatile, write_volatile};
+
+pub const MAGIC: &[u8; 8] = b"NC110K1\n";
+const KEYMOD_LEN: u64 = 72;
+
+static mut RAM: [(u64, u64); 32] = [(0, 0); 32];
+static mut NRAM: usize = 0;
+static mut HAVE_MAP: bool = false;
+
+unsafe fn rd32(a: u64) -> u32 {
+    read_volatile(a as *const u32)
+}
+
+/// Record available-RAM ranges (mmap type 1, or mem_lower/mem_upper as a fallback).
+pub fn parse_memory(info: u64) {
+    unsafe {
+        if info == 0 {
+            return;
+        }
+        let flags = rd32(info);
+        if flags & (1 << 6) != 0 {
+            let len = rd32(info + 44) as u64;
+            let mut p = rd32(info + 48) as u64;
+            let end = p + len;
+            while p + 24 <= end && NRAM < 32 {
+                let size = rd32(p) as u64;
+                let base = read_volatile((p + 4) as *const u64);
+                let l = read_volatile((p + 12) as *const u64);
+                let ty = rd32(p + 20);
+                if ty == 1 && l > 0 {
+                    RAM[NRAM] = (base, l);
+                    NRAM += 1;
+                }
+                p += size + 4;
+            }
+            HAVE_MAP = true;
+        } else if flags & 1 != 0 {
+            RAM[0] = (0, rd32(info + 4) as u64 * 1024);
+            RAM[1] = (0x10_0000, rd32(info + 8) as u64 * 1024);
+            NRAM = 2;
+            HAVE_MAP = true;
+        }
+    }
+}
+
+/// True if [base, base+len) touches available RAM, or if no memory map was given (fail closed).
+pub fn ram_overlaps(base: u64, len: u64) -> bool {
+    unsafe {
+        if !HAVE_MAP {
+            return true;
+        }
+        let ram = &*core::ptr::addr_of!(RAM);
+        ram[..NRAM].iter().any(|&(b, l)| base < b + l && b < base + len)
+    }
+}
+
+/// True only if [base, base+len) lies entirely inside ONE available-RAM range of the multiboot map.
+pub fn ram_contains(base: u64, len: u64) -> bool {
+    let Some(end) = base.checked_add(len) else { return false };
+    unsafe {
+        let ram = &*core::ptr::addr_of!(RAM);
+        HAVE_MAP && ram[..NRAM].iter().any(|&(b, l)| base >= b && end <= b.saturating_add(l))
+    }
+}
+
+pub fn cmdline(info: u64) -> &'static str {
+    unsafe {
+        if info == 0 || rd32(info) & 4 == 0 {
+            return "";
+        }
+        let p = rd32(info + 16) as *const u8;
+        let mut n = 0;
+        while n < 256 && *p.add(n) != 0 {
+            n += 1;
+        }
+        core::str::from_utf8(core::slice::from_raw_parts(p, n)).unwrap_or("")
+    }
+}
+
+/// Find the key module, validate it, copy the seed out, wipe the module. None (with a log line) if absent/bad.
+
+codex
+Reviewed HEAD `69729a9`; no edits or test reruns.
+
+**MUST-FIX: none remaining from the previous review.**
+
+- **DMA drain: blocker resolved.** [reset()](~/nc110-baremetal/src/nic.rs:350) polls `CmdReset` clear; failure forces a hard reset without entering the trampoline. **Yes: completed `CmdReset` is sufficient driver-level evidence that descriptor DMA has stopped.** Linux’s [cleanup](~/nc110-baremetal/third_party/linux-v6.12/r8169_main.c:4095) resets, waits for that bit to clear, then unmaps TX buffers/reuses descriptors—including through `rtl_reset_work`, without first clearing bus mastering. This supports memory reuse; it is not independent silicon validation.
+- **Committed image mutation: fixed.** The [pending-jump guard](~/nc110-baremetal/src/bmctl.rs:364) rejects all three loader commands before dispatch, including commands from another authenticated session.
+
+**SHOULD-FIX**
+
+- **Match VER_30’s stop request.** [quiesce()](~/nc110-baremetal/src/nic.rs:287) writes `ChipCmd=0`, waits 10 ms, resets, then clears BME. Linux VER_30 takes the default cleanup branch: `ChipCmd |= StopReq`, waits 100 µs, then resets. Linux’s down path additionally clears BME and performs a register readback before cleanup. Use the applicable `StopReq` sequence rather than describing the current sequence as equivalent. Reset completion makes this a shutdown-sequence fidelity issue, not the previous unbounded-DMA blocker.
+
+Previous SHOULD-FIX items are addressed:
+
+- **Client authentication/lost reply:** fresh authenticated handshake, changed boot ID, and encrypted ping now gate success; a timed-out `lcom` reply proceeds to discovery. [Client](~/nc110-baremetal/tools/bmctl.py:98)
+- **SHA UTF-8 panic:** ASCII-hex validation precedes string slicing. [Validation](~/nc110-baremetal/src/loader.rs:82)
+- **Multiboot:** unsupported required bits 2–15 are rejected; module starts at page-aligned `0x9000`. [Loader](~/nc110-baremetal/src/loader.rs:124)
+- **GRUB metadata:** snapshot occurs before uploads; maps above the new 3840-byte capacity cause refusal before low-page writes. [Snapshot](~/nc110-baremetal/src/loader.rs:34)
+
+**NIT:** The client’s “within 60 s” means 60 iterations; three one-second RPC timeouts per iteration can stretch silence to roughly 240 seconds. Use a monotonic deadline.
+
+The reported five refusals and two authenticated hops support the software path. The suite uses RTL8139, so RTL8105E hardware shutdown remains untested.
+
+**8/10**
+tokens used
+33,891
+Reviewed HEAD `69729a9`; no edits or test reruns.
+
+**MUST-FIX: none remaining from the previous review.**
+
+- **DMA drain: blocker resolved.** [reset()](~/nc110-baremetal/src/nic.rs:350) polls `CmdReset` clear; failure forces a hard reset without entering the trampoline. **Yes: completed `CmdReset` is sufficient driver-level evidence that descriptor DMA has stopped.** Linux’s [cleanup](~/nc110-baremetal/third_party/linux-v6.12/r8169_main.c:4095) resets, waits for that bit to clear, then unmaps TX buffers/reuses descriptors—including through `rtl_reset_work`, without first clearing bus mastering. This supports memory reuse; it is not independent silicon validation.
+- **Committed image mutation: fixed.** The [pending-jump guard](~/nc110-baremetal/src/bmctl.rs:364) rejects all three loader commands before dispatch, including commands from another authenticated session.
+
+**SHOULD-FIX**
+
+- **Match VER_30’s stop request.** [quiesce()](~/nc110-baremetal/src/nic.rs:287) writes `ChipCmd=0`, waits 10 ms, resets, then clears BME. Linux VER_30 takes the default cleanup branch: `ChipCmd |= StopReq`, waits 100 µs, then resets. Linux’s down path additionally clears BME and performs a register readback before cleanup. Use the applicable `StopReq` sequence rather than describing the current sequence as equivalent. Reset completion makes this a shutdown-sequence fidelity issue, not the previous unbounded-DMA blocker.
+
+Previous SHOULD-FIX items are addressed:
+
+- **Client authentication/lost reply:** fresh authenticated handshake, changed boot ID, and encrypted ping now gate success; a timed-out `lcom` reply proceeds to discovery. [Client](~/nc110-baremetal/tools/bmctl.py:98)
+- **SHA UTF-8 panic:** ASCII-hex validation precedes string slicing. [Validation](~/nc110-baremetal/src/loader.rs:82)
+- **Multiboot:** unsupported required bits 2–15 are rejected; module starts at page-aligned `0x9000`. [Loader](~/nc110-baremetal/src/loader.rs:124)
+- **GRUB metadata:** snapshot occurs before uploads; maps above the new 3840-byte capacity cause refusal before low-page writes. [Snapshot](~/nc110-baremetal/src/loader.rs:34)
+
+**NIT:** The client’s “within 60 s” means 60 iterations; three one-second RPC timeouts per iteration can stretch silence to roughly 240 seconds. Use a monotonic deadline.
+
+The reported five refusals and two authenticated hops support the software path. The suite uses RTL8139, so RTL8105E hardware shutdown remains untested.
+
+**8/10**

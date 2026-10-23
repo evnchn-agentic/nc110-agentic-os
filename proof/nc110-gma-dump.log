@@ -1,0 +1,23 @@
+[  0.015] gma: 0xa0118086 MMADR 0xf0200000 GMADR 0xd0000000 BSM 0x3f800000 GMCH_CTRL 0x1300000
+[  0.015] gma: LVDS              0x61180 = 0xc0300300
+[  0.016] gma: PFIT_CONTROL      0x61200 = 0xc0000008
+[  0.016] gma: PFIT_PGM_RATIOS   0x61204 = 0x00000001
+[  0.016] gma: PFIT_AUTO_RATIOS  0x61208 = 0x019009c4
+[  0.016] gma: HTOTAL_A          0x60000 = 0x031f027f
+[  0.017] gma: HSYNC_A           0x60008 = 0x02ef028f
+[  0.017] gma: VTOTAL_A          0x6000c = 0x020c01df
+[  0.017] gma: VSYNC_A           0x60014 = 0x01eb01e9
+[  0.017] gma: PIPEASRC          0x6001c = 0x027f01df
+[  0.017] gma: HTOTAL_B          0x61000 = 0x054703ff
+[  0.018] gma: HSYNC_B           0x61008 = 0x049f0417
+[  0.018] gma: VTOTAL_B          0x6100c = 0x02c50257
+[  0.018] gma: VSYNC_B           0x61014 = 0x0260025a
+[  0.018] gma: PIPEBSRC          0x6101c = 0x027f018f
+[  0.018] gma: PIPEACONF         0x70008 = 0x00000000
+[  0.019] gma: PIPEBCONF         0x71008 = 0x80000000
+[  0.019] gma: DSPACNTR          0x70180 = 0x00000000
+[  0.019] gma: DSPBCNTR          0x71180 = 0x49000000
+[  0.019] gma: DSPBSTRIDE        0x71188 = 0x00000340
+[  0.020] gma: DSPBSURF          0x7119c = 0x00000000
+[  0.020] gma: DSPBSIZE          0x71190 = 0x018f02cf
+[  0.020] gma: VGACNTRL          0x71400 = 0x22c4008e

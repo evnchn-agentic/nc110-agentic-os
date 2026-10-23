@@ -1,0 +1,37 @@
+--- 20:47:23 from ('192.168.50.118', 5514)
+nc110 1 00/01 NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x10000 -> long mode OK
+wdt: NM10: GRUB owns the watchdog, kernel hands off; live registers follow (result=5)
+wdt: live TCOBASE=0x1060 GCS=0x00000460 NO_REBOOT=1 TCO1_CNT=0x1000 HLT=0 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=1000
+wdt: ATTENDED build: no watchdog, the operator is the safety net (power cycle -> Slot A)
+wdt: halt: TCO1_CNT 0x1000 -> 0x1800, RLD 1000 -> 1000 (halted)
+keymod: no multiboot module
+cmdline: 
+time: TSC 1662168 ticks/ms (PIT ch2 calibrated)
+nic: mass-storage memory BAR 0xf0504400 (max span 0x400), NIC window 0xf050c000+0x100
+nic: 10ec:8136 XID 0x40a -> r8169 RTL_GIGA_MAC_VER_30
+nic: RTL8101E family (10ec:8136) at 09:00.0 mmio=0xf050c000 (UC) mac=02:00:00:00:00:01
+nic: PHYstatus 0xeb link up
+udplog: broadcasting this log to UDP 5514
+
+--- 20:47:27 from ('192.168.50.118', 5514)
+nc110 2 00/02 NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x10000 -> long mode OK
+wdt: NM10: GRUB owns the watchdog, kernel hands off; live registers follow (result=5)
+wdt: live TCOBASE=0x1060 GCS=0x00000460 NO_REBOOT=1 TCO1_CNT=0x1000 HLT=0 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=1000
+wdt: ATTENDED build: no watchdog, the operator is the safety net (power cycle -> Slot A)
+wdt: halt: TCO1_CNT 0x1000 -> 0x1800, RLD 1000 -> 1000 (halted)
+keymod: no multiboot module
+cmdline: 
+time: TSC 1662168 ticks/ms (PIT ch2 calibrated)
+nic: mass-storage memory BAR 0xf0504400 (max span 0x400), NIC window 0xf050c000+0x100
+nic: 10ec:8136 XID 0x40a -> r8169 RTL_GIGA_MAC_VER_30
+nic: RTL8101E family (10ec:8136) at 09:00.0 mmio=0xf050c000 (UC) mac=02:00:00:00:00:01
+nic: PHYstatus 0xeb link up
+udplog: broadcasting this log to UDP 5514
+dhcp: DISCOVER sent, waiting 4 s for an OFFER
+dhcp: OFFER 192.168.50.120 from 192.168.50.1 after 3680 ms (7 frames seen)
+attended: log
+--- 20:47:27 from ('192.168.50.118', 5514)
+nc110 2 01/02  round 2, then reset
+

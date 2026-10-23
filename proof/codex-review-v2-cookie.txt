@@ -1,0 +1,1722 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a15e7e-a7ef-7ab1-972e-b7ba96d24ada
+--------
+user
+Calibrated skeptic review of the uncommitted diff (git diff -- src/bmctl.rs src/acpi.rs src/main.rs tools/bmctl.py tools/bmctl-q35-test.sh tools/flood-q35-test.py) in this no_std Rust kernel's authenticated UDP control port (bmctl). It replaces the v1 handshake (stateful pending table) with protocol v2: a stateless cookie in the style of a SYN cookie / DTLS HelloVerifyRequest. who2 + client nonce Nc gets 'nc110 v2 boot B session S bucket b check C', where S = first 4 bytes of SHA-256(per-boot random cookie key || client IP || port || 30-s bucket || Nc) and C = SHA-256('nc110-bmctl-v2 who' || master || Nc || boot || S || b)[..16]. Every client frame carries Nc and the bucket's low byte after a seq with bit 63 set; an unknown session is created only when the cookie recomputes for that endpoint in the current or previous bucket AND the frame authenticates under SHA-256('nc110-bmctl-v2 session' || master || boot || S || Nc). A 64-entry ring blocks re-promoting a session number in a boot. v1 who gets a fixed refusal (capped 10/s). The step loop drains up to 64 datagrams; the RX queue grew to 64 packets / 64 KiB. The client sends who2 and who together and takes the first verified reply (it must still talk to installed v1 kernels). Also: the kernel now zeroes a nonzero FACS waking vector at every boot (acpi::clear_waking_vector). Find concrete failures: replay or key reuse (nonce = direction || seq with the flag masked off: can two sessions share a key? can a frame from one session be accepted in another?), the 32-bit cookie (blind forgery cost, collisions with live sessions, two clients with the same cookie), bucket-wrap and edge handling (u8 low byte, bucket-1 at boot), whether the promoted ring of 64 is enough (eviction then a replay after 64 more promotions), downgrade between v1 and v2 in the client, DoS cost per packet, the RX buffer size vs static memory, and FACS write safety on real firmware (alignment, the 64-bit X vector when FACS version < 1). Also judge whether the tests (bmctl-q35-test.sh cases 3-13, flood-q35-test.py) would catch regressions. Quote code. MUST-FIX / SHOULD / NIT, then 0-10. 'Most is sound' is valid.
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll trace session promotion and client negotiation, then check replay handling, FACS writes, memory use, and what the tests actually cover.
+exec
+/bin/zsh -lc 'git diff -- src/bmctl.rs src/acpi.rs src/main.rs tools/bmctl.py tools/bmctl-q35-test.sh tools/flood-q35-test.py' in ~/nc110-baremetal
+ succeeded in 0ms:
+diff --git a/src/acpi.rs b/src/acpi.rs
+index f76ff32..e6ad212 100644
+--- a/src/acpi.rs
++++ b/src/acpi.rs
+@@ -58,3 +58,18 @@ pub fn read(sig: &[u8; 4], off: usize, out: &mut [u8]) -> Option<(u32, usize)> {
+     }
+     Some((len, n))
+ }
++
++/// Zero the FACS waking vectors (offsets 12 and 24) if set; returns the old (32-bit, 64-bit) values. Only an OS about
++/// to sleep sets them; one left over (the 2026-10-21 01:40 S3 attempt left 0x6000) may make the firmware treat a later
++/// reset as a resume from S3.
++pub fn clear_waking_vector() -> Option<(u32, u64)> {
++    let (f, _) = table(b"FACS")?;
++    let (v, x) = unsafe { (read_volatile((f + 12) as *const u32), read_volatile((f + 24) as *const u64)) };
++    if v != 0 || x != 0 {
++        unsafe {
++            core::ptr::write_volatile((f + 12) as *mut u32, 0);
++            core::ptr::write_volatile((f + 24) as *mut u64, 0);
++        }
++    }
++    Some((v, x))
++}
+diff --git a/src/bmctl.rs b/src/bmctl.rs
+index 07cda2a..eba8858 100644
+--- a/src/bmctl.rs
++++ b/src/bmctl.rs
+@@ -7,6 +7,15 @@
+ //! Traffic key = SHA-256("nc110-bmctl-v1 session" ++ master ++ boot id ++ session ++ Nc); seq counts from 1. A
+ //! replayed or forged `who` reply cannot make two client runs share a key, because Nc is fresh per run, and the
+ //! kernel never reissues a session number in a boot. A session binds to the endpoint that asked `who`; pending and authenticated sessions live in separate tables.
++//! Protocol v2 (2026-10-21, stateless cookie, after a `who` flood starved v1): the clear-text request is `who2` ++ Nc
++//! and the kernel keeps NO state for it. The session number IS a cookie: the first 4 bytes of SHA-256(per-boot random
++//! cookie key ++ client IP ++ port ++ 30-s time bucket ++ Nc); the reply is "nc110 v2 boot B session S bucket b check
++//! C" with C = SHA-256("nc110-bmctl-v2 who" ++ master ++ Nc ++ boot ++ S ++ b)[..16]. Every client frame carries Nc and
++//! the bucket's low byte after the seq (seq bit 63 set): an unknown session is created only when the cookie recomputes
++//! for that endpoint in the current or previous bucket AND the frame authenticates under SHA-256("nc110-bmctl-v2
++//! session" ++ master ++ boot ++ S ++ Nc). A session number once promoted is never promoted again in a boot (so a
++//! replayed first frame cannot re-run after its session is evicted). A v1 `who` gets a reply an old client rejects
++//! loudly ("bad who reply ... v2-only:update-tools/bmctl.py").
+ //! A duplicate of the last accepted seq gets the cached reply bytes back (safe UDP retries, nothing re-executed).
+ //! The loop pets the watchdog; 10 minutes without a valid command -> 0xCF9 reset.
+ //! `peek` is read-only and allowlisted (see `peek`): RAM only inside the multiboot map and never the kernel image
+@@ -33,12 +42,9 @@ const PORT: u16 = 5515;
+ const IDLE_MS: i64 = 600_000; // default; cmdline idle=<s> (5..3600) overrides it, used by the q35 stall test
+ 
+ static mut SESS: [Option<Sess>; 16] = [const { None }; 16]; // authenticated
+-// Issued by `who`, no good frame yet: small records (the session key is derived when the first frame arrives), 256 of
+-// them, oldest issued evicted. At the 1000/s ceiling an entry lives about 256 ms, enough for a LAN round trip (review 1021).
+-static mut PEND: [Option<Pend>; 256] = [const { None }; 256];
+ static mut SOCKS: [SocketStorage<'static>; 3] = [SocketStorage::EMPTY; 3];
+-static mut RX_META: [udp::PacketMetadata; 8] = [udp::PacketMetadata::EMPTY; 8];
+-static mut RX_BUF: [u8; 8192] = [0; 8192];
++static mut RX_META: [udp::PacketMetadata; 64] = [udp::PacketMetadata::EMPTY; 64]; // a flood burst must not crowd out
++static mut RX_BUF: [u8; 65536] = [0; 65536]; // the one real request: room for 64 packets, drained up to 64 per step
+ static mut TX_META: [udp::PacketMetadata; 8] = [udp::PacketMetadata::EMPTY; 8];
+ static mut TX_BUF: [u8; 8192] = [0; 8192];
+ 
+@@ -94,9 +100,9 @@ pub fn open(key: &[u8; 32], n: &[u8; 12], aad: &[u8], buf: &mut [u8], t: &[u8])
+     true
+ }
+ 
+-pub fn session_key(master: &[u8; 32], boot_id: &[u8; 16], sess: u32, nc: &[u8; 16]) -> [u8; 32] {
++fn session_key2(master: &[u8; 32], boot_id: &[u8; 16], sess: u32, nc: &[u8; 16]) -> [u8; 32] {
+     let mut h = Sha256::new();
+-    h.update(b"nc110-bmctl-v1 session");
++    h.update(b"nc110-bmctl-v2 session");
+     h.update(master);
+     h.update(boot_id);
+     h.update(sess.to_le_bytes());
+@@ -104,20 +110,31 @@ pub fn session_key(master: &[u8; 32], boot_id: &[u8; 16], sess: u32, nc: &[u8; 1
+     h.finalize().into()
+ }
+ 
+-fn who_check(master: &[u8; 32], nc: &[u8; 16], boot_id: &[u8; 16], sess: u32) -> [u8; 32] {
++fn who2_check(master: &[u8; 32], nc: &[u8; 16], boot_id: &[u8; 16], sess: u32, bucket: u8) -> [u8; 32] {
+     let mut h = Sha256::new();
+-    h.update(b"nc110-bmctl-v1 who");
++    h.update(b"nc110-bmctl-v2 who");
+     h.update(master);
+     h.update(nc);
+     h.update(boot_id);
+     h.update(sess.to_le_bytes());
++    h.update([bucket]);
+     h.finalize().into()
+ }
+ 
+-struct Pend {
+-    id: u32,
+-    nc: [u8; 16],
+-    peer: IpEndpoint,
++/// The v2 cookie (= session number) for this endpoint, 30-s bucket and client nonce. Fixed-length input under a
++/// per-boot random key, so a plain SHA-256 prefix MAC is enough (no length extension to exploit).
++fn cookie(ck: &[u8; 32], from: &IpEndpoint, bucket: u32, nc: &[u8; 16]) -> u32 {
++    let ip = match from.addr {
++        IpAddress::Ipv4(a) => a.octets(),
++    };
++    let mut h = Sha256::new();
++    h.update(ck);
++    h.update(ip);
++    h.update(from.port.to_le_bytes());
++    h.update(bucket.to_le_bytes());
++    h.update(nc);
++    let d: [u8; 32] = h.finalize().into();
++    u32::from_le_bytes([d[0], d[1], d[2], d[3]])
+ }
+ 
+ struct Sess {
+@@ -227,7 +244,11 @@ pub struct Ctl {
+     bad: u32,
+     replay: u32,
+     retx: u32,
+-    next_sess: u32,
++    ck: [u8; 32],            // v2 cookie key: per boot, random, unrelated to the seed
++    promoted: [u32; 64],     // v2 session numbers already promoted this boot (ring)
++    promoted_n: usize,
++    who2_n: u64,             // v2 `who2` replies sent, and the TSC cycles spent on them (cost per flood packet)
++    who2_cyc: u64,
+     who_window: i64,
+     who_count: u32,
+     reboot_at: Option<i64>,
+@@ -304,6 +325,11 @@ impl Ctl {
+             kprintln!("bmctl: entropy failed -> not starting");
+             return None;
+         }
++        let mut ck = [0u8; 32];
++        if rng::fill(&mut ck).is_err() {
++            kprintln!("bmctl: entropy failed -> not starting");
++            return None;
++        }
+         let mut bid = heapless::String::<64>::new();
+         hex(&boot_id, &mut bid);
+         sock.bind(PORT).expect("bind");
+@@ -313,7 +339,7 @@ impl Ctl {
+         let t = time::now_ms();
+         Some(Ctl {
+             seed, key: derive_key(&seed), boot_id, bid, ip, idle_ms, nic_mmio, last_ok: t, last_hello: t - 2001, last_footer: t - 1000, battery: None,
+-            ok: 0, bad: 0, replay: 0, retx: 0, next_sess: 1, who_window: 0, who_count: 0, reboot_at: None, sleep_at: None, stage: None, jump_at: None,
++            ok: 0, bad: 0, replay: 0, retx: 0, ck, promoted: [0; 64], promoted_n: 0, who2_n: 0, who2_cyc: 0, who_window: 0, who_count: 0, reboot_at: None, sleep_at: None, stage: None, jump_at: None,
+         })
+     }
+ 
+@@ -384,60 +410,77 @@ impl Ctl {
+             let _ = core::fmt::write(&mut h, format_args!("nc110 hello bmctl {}:{} boot {}", self.ip, PORT, self.bid));
+             let _ = sock.send_slice(h.as_bytes(), IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::BROADCAST), 5514));
+         }
+-        let sess = unsafe { &mut *core::ptr::addr_of_mut!(SESS) };
+-        let pend = unsafe { &mut *core::ptr::addr_of_mut!(PEND) };
+         let mut buf = [0u8; 1500];
+-        let Ok((n, meta)) = sock.recv_slice(&mut buf) else { return None };
+-        let from = meta.endpoint;
++        // Drain up to 64 datagrams per step, so a flood cannot hold the real request back in the socket queue.
++        for _ in 0..64 {
++            let Ok((n, meta)) = sock.recv_slice(&mut buf) else { return None };
++            if let Some(a) = self.datagram(sock, t, &mut buf, n, meta.endpoint) {
++                return Some(a);
++            }
++        }
++        None
++    }
++
++    fn datagram(&mut self, sock: &mut udp::Socket, t: i64, buf: &mut [u8; 1500], n: usize, from: IpEndpoint) -> Option<Act> {
++        let sess = unsafe { &mut *core::ptr::addr_of_mut!(SESS) };
++        let bucket = (t / 30_000) as u32;
++        if n == 4 + 16 && &buf[..4] == b"who2" {
++            // Stateless: nothing is stored; the reply's session number is the cookie for this endpoint and bucket.
++            let c0 = crate::port::rdtsc();
++            let mut nc = [0u8; 16];
++            nc.copy_from_slice(&buf[4..20]);
++            let id = cookie(&self.ck, &from, bucket, &nc);
++            let mut chk = heapless::String::<64>::new();
++            hex(&who2_check(&self.key, &nc, &self.boot_id, id, bucket as u8)[..16], &mut chk);
++            let mut h = heapless::String::<160>::new();
++            let _ = core::fmt::write(&mut h, format_args!("nc110 v2 boot {} session {} bucket {} check {}", self.bid, id, bucket as u8, chk));
++            let _ = sock.send_slice(h.as_bytes(), from);
++            self.who2_n += 1;
++            self.who2_cyc += crate::port::rdtsc().wrapping_sub(c0);
++            return None;
++        }
+         if n == 3 + 16 && &buf[..3] == b"who" {
+             if t - self.who_window > 1000 {
+                 (self.who_window, self.who_count) = (t, 0);
+             }
+             self.who_count += 1;
+-            // ponytail: one global ceiling (CPU and reflection; bmctl is LAN-only), not per sender. A flood above it, or
+-            // one spoofing many sources, still starves `who`; the full fix is a stateless cookie handshake (protocol v2).
+-            if self.who_count > 1000 {
+-                return None;
++            if self.who_count <= 10 {
++                // An old (v1) client: 7 fields so its parser reaches the length check and prints this field.
++                let _ = sock.send_slice(b"nc110 boot v2-only:update-tools/bmctl.py session 0 check 0", from);
+             }
+-            // Unauthenticated `who` only ever writes the pending table (oldest entry out), never an authenticated session.
+-            let slot = (0..pend.len()).min_by_key(|&j| pend[j].as_ref().map(|x| x.id)); // None (empty) sorts first
+-            let (Some(slot), Some(next)) = (slot, self.next_sess.checked_add(1)) else { return None };
+-            let id = self.next_sess;
+-            self.next_sess = next;
+-            let mut nc = [0u8; 16];
+-            nc.copy_from_slice(&buf[3..19]);
+-            pend[slot] = Some(Pend { id, nc, peer: from });
+-            let mut chk = heapless::String::<64>::new();
+-            hex(&who_check(&self.key, &nc, &self.boot_id, id)[..16], &mut chk);
+-            let mut h = heapless::String::<160>::new();
+-            let _ = core::fmt::write(&mut h, format_args!("nc110 boot {} session {} check {}", self.bid, id, chk));
+-            let _ = sock.send_slice(h.as_bytes(), from);
+             return None;
+         }
+-        // Frame: [session u32 LE][seq u64 LE][ct][tag]
+-        if n < 4 + 8 + 16 {
++        // Frame: [session u32 LE][seq u64 LE, bit 63 set][Nc 16][bucket u8][ct][tag]
++        if n < 4 + 8 + 17 + 16 {
+             self.bad += 1;
+             return None;
+         }
+         let sid = u32::from_le_bytes(buf[..4].try_into().unwrap());
+-        // Authenticated session, or a pending one from the endpoint that asked `who` (promoted below once the frame
++        let raw = u64::from_le_bytes(buf[4..12].try_into().unwrap());
++        if raw >> 63 != 1 {
++            self.bad += 1;
++            return None;
++        }
++        let seq = raw & !(1 << 63);
++        let mut nc = [0u8; 16];
++        nc.copy_from_slice(&buf[12..28]);
++        let b8 = buf[28];
++        // Authenticated session, or a new one whose cookie recomputes for this endpoint (promoted below once the frame
+         // authenticates; only then may it evict the least recently used authenticated session).
+         let in_sess = sess.iter().position(|x| x.as_ref().is_some_and(|x| x.id == sid && x.peer == Some(from)));
+-        let in_pend = pend.iter().position(|x| x.as_ref().is_some_and(|x| x.id == sid && x.peer == from));
++        let fresh = in_sess.is_none()
++            && [bucket, bucket.wrapping_sub(1)].iter().any(|&b| b as u8 == b8 && cookie(&self.ck, &from, b, &nc) == sid)
++            && !self.promoted[..self.promoted_n.min(64)].contains(&sid);
+         let mut cand = None;
+-        let se = match (in_sess, in_pend) {
+-            (Some(i), _) => sess[i].as_mut().unwrap(),
+-            (None, Some(i)) => {
+-                let p = pend[i].as_ref().unwrap();
+-                cand.insert(Sess { id: p.id, key: session_key(&self.key, &self.boot_id, p.id, &p.nc), last_seq: 0, peer: Some(from), last_t: t, retx: 0, reply: [0; 8 + 1300 + 16], reply_len: 0 })
+-            }
+-            _ => {
++        let se = match in_sess {
++            Some(i) => sess[i].as_mut().unwrap(),
++            None if fresh => cand.insert(Sess { id: sid, key: session_key2(&self.key, &self.boot_id, sid, &nc), last_seq: 0, peer: Some(from), last_t: t, retx: 0, reply: [0; 8 + 1300 + 16], reply_len: 0 }),
++            None => {
+                 self.bad += 1;
+                 return None;
+             }
+         };
+-        let seq = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+-        let (body, tg) = buf[12..n].split_at_mut(n - 12 - 16);
++        let (body, tg) = buf[29..n].split_at_mut(n - 29 - 16);
+         if !open(&se.key, &nonce(b"C2K\0", seq), &self.boot_id, body, tg) {
+             self.bad += 1;
+             return None;
+@@ -459,10 +502,11 @@ impl Ctl {
+         se.last_t = t;
+         se.retx = 0;
+         self.last_ok = t;
+-        let se = if let (None, Some(i)) = (in_sess, in_pend) {
++        let se = if in_sess.is_none() {
+             let dst = (0..sess.len()).find(|&j| sess[j].is_none())
+                 .unwrap_or_else(|| (0..sess.len()).min_by_key(|&j| sess[j].as_ref().map_or(i64::MIN, |x| x.last_t)).unwrap());
+-            pend[i] = None;
++            self.promoted[self.promoted_n % 64] = sid;
++            self.promoted_n += 1;
+             sess[dst] = cand.take();
+             sess[dst].as_mut().unwrap()
+         } else {
+@@ -534,7 +578,7 @@ impl Ctl {
+                     let _ = core::fmt::write(&mut w, format_args!("pong uptime_ms={} ip={}", t, self.ip));
+                 }
+                 "stats" => {
+-                    let _ = core::fmt::write(&mut w, format_args!("ok={} bad={} replay={} retx={} sessions_issued={} log_bytes={}", self.ok, self.bad, self.replay, self.retx, self.next_sess - 1, console::captured().len()));
++                    let _ = core::fmt::write(&mut w, format_args!("ok={} bad={} replay={} retx={} sessions_issued={} log_bytes={} who2={} who2_cyc_avg={}", self.ok, self.bad, self.replay, self.retx, self.promoted_n, console::captured().len(), self.who2_n, self.who2_cyc / self.who2_n.max(1)));
+                 }
+                 "log" => {
+                     let off: usize = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+diff --git a/src/main.rs b/src/main.rs
+index 42c9db5..b8fa3fa 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -81,6 +81,13 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
+         console::show_log();
+     }
+     console::status("starting");
++    // A stale FACS waking vector (only a sleeping OS sets one) must never outlive the boot that set it.
++    {
++        match acpi::clear_waking_vector() {
++            Some((v, x)) => kprintln!("acpi: FACS waking vector was {:#x} (X {:#x}){}", v, x, if v != 0 || x != 0 { ", cleared" } else { "" }),
++            None => kprintln!("acpi: no FACS"),
++        }
++    }
+     wdt::rehearse(cmdline);
+ 
+     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
+diff --git a/tools/bmctl-q35-test.sh b/tools/bmctl-q35-test.sh
+index 1c3462e..5b44656 100755
+--- a/tools/bmctl-q35-test.sh
++++ b/tools/bmctl-q35-test.sh
+@@ -9,51 +9,65 @@ for i in $(seq 40); do grep -q 'bmctl: listening' /tmp/bmctl-q35.log 2>/dev/null
+ B="$P tools/bmctl.py --host 127.0.0.1 --port 15515"
+ r=$($B ping); echo "1 ping:    $r"; case "$r" in pong*) ;; *) fail=1;; esac
+ head -c 72 /dev/urandom > /tmp/bmctl-badkey.bin
+-r=$($B --key /tmp/bmctl-badkey.bin ping 2>&1); echo "2 bad key: $r"; case "$r" in *"failed its check"*) ;; *) fail=1;; esac
++r=$($B --key /tmp/bmctl-badkey.bin ping 2>&1); echo "2 bad key: $r"; case "$r" in *"wrong key"*) ;; *) fail=1;; esac
+ $P - <<'PY' || fail=1
+-import hashlib, os, socket, struct, sys
++import hashlib, os, socket, struct, subprocess, sys
+ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+ km = open("test-keys/client.key", "rb").read(); master = hashlib.sha256(b"nc110-bmctl-v1" + km[8:40]).digest()
+ s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.5); ep = ("127.0.0.1", 15515)
+-def who():
+-    nc = os.urandom(16); s.sendto(b"who" + nc, ep); w = s.recvfrom(256)[0].split()
+-    return nc, bytes.fromhex(w[2].decode()), int(w[4])
++def who(sock=s):  # protocol v2: stateless cookie; returns (Nc, boot, session, bucket)
++    nc = os.urandom(16); sock.sendto(b"who2" + nc, ep); w = sock.recvfrom(256)[0].split()
++    assert w[:3] == [b"nc110", b"v2", b"boot"], w
++    return nc, bytes.fromhex(w[3].decode()), int(w[5]), int(w[7])
+ def aead_for(nc, boot, sid):
+-    return ChaCha20Poly1305(hashlib.sha256(b"nc110-bmctl-v1 session" + master + boot + struct.pack("<I", sid) + nc).digest())
+-nc, boot, sid = who(); a = aead_for(nc, boot, sid)
+-def frame(seq, msg=b"ping", aead=a, bid=boot, sess=sid):
+-    return struct.pack("<IQ", sess, seq) + aead.encrypt(b"C2K\0" + struct.pack("<Q", seq), msg, bid)
++    return ChaCha20Poly1305(hashlib.sha256(b"nc110-bmctl-v2 session" + master + boot + struct.pack("<I", sid) + nc).digest())
++nc, boot, sid, bk = who(); a = aead_for(nc, boot, sid)
++def frame(seq, msg=b"ping", aead=a, bid=boot, sess=sid, n=None, b=None):
++    return (struct.pack("<IQ", sess, seq | 1 << 63) + (n or nc) + bytes([bk if b is None else b])
++            + aead.encrypt(b"C2K\0" + struct.pack("<Q", seq), msg, bid))
+ bad = 0
+ s.sendto(frame(1), ep); r1 = s.recvfrom(2048)[0]
+ s.sendto(frame(1), ep); r2 = s.recvfrom(2048)[0]
+ print(("ok  " if r1 == r2 else "FAIL") + " 3 retry of seq 1 -> identical cached reply"); bad |= r1 != r2
+ s.sendto(frame(2), ep); s.recvfrom(2048)
+-def silent(p, what):
+-    s.sendto(p, ep)
+-    try: s.recvfrom(2048); print(f"FAIL {what}: got a reply"); return 1
++def silent(p, what, sock=s):
++    sock.sendto(p, ep)
++    try: sock.recvfrom(2048); print(f"FAIL {what}: got a reply"); return 1
+     except socket.timeout: print(f"ok   {what}: no reply"); return 0
+ bad |= silent(frame(1), "4 replay of an older accepted seq")
+-t = bytearray(frame(3)); t[14] ^= 1; bad |= silent(bytes(t), "5 tampered ciphertext")
++t = bytearray(frame(3)); t[40] ^= 1; bad |= silent(bytes(t), "5 tampered ciphertext")
+ bad |= silent(frame(4, bid=b"\0" * 16), "6 frame for another boot id")
+-bad |= silent(frame(5, sess=sid + 1000), "7 unknown session")
+-# 8: a replayed who reply (old boot+session) with a FRESH client nonce gives a different key: frames are rejected,
+-# so a replayed reply can never make two runs share (key, nonce).
+-bad |= silent(frame(6, aead=aead_for(os.urandom(16), boot, sid)), "8 key from a replayed who reply + new Nc")
+-# 9: flood of who must not evict the live authenticated session
++bad |= silent(frame(5, sess=sid + 1000), "7 unknown session (no cookie)")
++# 8: a replayed who reply (old boot+session) with a FRESH client nonce: the cookie no longer recomputes, rejected.
++n8 = os.urandom(16)
++bad |= silent(frame(1, aead=aead_for(n8, boot, sid), sess=sid, n=n8), "8 key from a replayed who reply + new Nc")
++# 9: flood of who2 must not evict the live authenticated session (who2 creates nothing)
+ for _ in range(40):
+     try: who()
+     except socket.timeout: pass
+ s.sendto(frame(7), ep)
+-try: s.recvfrom(2048); print("ok   9 live session survives a who flood")
+-except socket.timeout: print("FAIL 9 live session evicted by who flood"); bad = 1
+-# 10: a forged frame on a pending session neither consumes nor corrupts it: the real first frame still works
+-nc2, boot2, sid2 = who(); a2 = aead_for(nc2, boot2, sid2)
+-t = bytearray(frame(1, aead=a2, sess=sid2)); t[14] ^= 1; s.sendto(bytes(t), ep)
++try: s.recvfrom(2048); print("ok   9 live session survives a who2 flood")
++except socket.timeout: print("FAIL 9 live session evicted by who2 flood"); bad = 1
++# 10: a forged first frame on a fresh cookie neither consumes nor corrupts it: the real first frame still works
++nc2, boot2, sid2, bk2 = who(); a2 = aead_for(nc2, boot2, sid2)
++t = bytearray(frame(1, aead=a2, sess=sid2, n=nc2, b=bk2)); t[40] ^= 1; s.sendto(bytes(t), ep)
+ try: s.recvfrom(2048); print("FAIL 10 forged first frame got a reply"); bad = 1
+ except socket.timeout: pass
+-s.sendto(frame(1, aead=a2, sess=sid2), ep)
++f10 = frame(1, aead=a2, sess=sid2, n=nc2, b=bk2); s.sendto(f10, ep)
+ try: s.recvfrom(2048); print("ok   10 forged first frame ignored, real first frame then promotes the session")
+-except socket.timeout: print("FAIL 10 pending session lost after a forged frame"); bad = 1
++except socket.timeout: print("FAIL 10 cookie session lost after a forged frame"); bad = 1
++# 11: a cookie is bound to the endpoint: the same frame from another source port is rejected
++s2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s2.settimeout(1.5)
++nc3, b3, sid3, bk3 = who(); bad |= silent(frame(1, aead=aead_for(nc3, b3, sid3), sess=sid3, n=nc3, b=bk3), "11 cookie used from another port", s2)
++# 12: evict session 10 (16 newer authenticated sessions), then replay its first frame: never promoted twice
++for _ in range(17):
++    n_, b_, s_, k_ = who(); s.sendto(frame(1, aead=aead_for(n_, b_, s_), sess=s_, n=n_, b=k_), ep); s.recvfrom(2048)
++bad |= silent(f10, "12 replayed first frame after its session was evicted")
++# 13: an old (v1) client fails loudly against this kernel
++r = subprocess.run(["tools/.venv/bin/python", "tools/bmctl_v1_head.py", "--host", "127.0.0.1", "--port", "15515", "ping"],
++    capture_output=True, text=True, env=dict(os.environ, NC110_KEY="test-keys/client.key"))
++ok13 = r.returncode != 0 and "v2-only" in r.stderr + r.stdout
++print(("ok  " if ok13 else "FAIL") + " 13 v1 client exits naming v2-only: " + (r.stderr + r.stdout).strip()[-90:]); bad |= not ok13
+ sys.exit(bad)
+ PY
+ chk() { r=$($B $2); rc=$?; echo "$1: $r"; [ $rc = 0 ] || { echo "   ^ FAIL (client exit $rc)"; fail=1; }; case "$r" in $3) ;; *) echo "   ^ FAIL (want $3)"; fail=1;; esac; }
+diff --git a/tools/bmctl.py b/tools/bmctl.py
+index 7d985b3..e7a6607 100644
+--- a/tools/bmctl.py
++++ b/tools/bmctl.py
+@@ -58,18 +58,54 @@ def rpc(raw, want=lambda d: True):
+ TIMEOUT = [2.0]
+ 
+ 
++V2 = [None]  # (Nc, bucket) when the kernel speaks protocol v2 (stateless cookie), None for a v1 kernel
++
++
+ def handshake():
+-    """Authenticated session setup; returns (aead, boot_id, session). Exits on a bad/forged reply."""
+-    nc = os.urandom(16)
+-    who = rpc(b"who" + nc, lambda d: d.startswith(b"nc110 boot ")).decode().split()
+-    if len(who) != 7 or who[:2] != ["nc110", "boot"] or who[3] != "session" or who[5] != "check" or len(who[2]) != 32:
+-        sys.exit(f"bad who reply: {who}")
+-    bid, sess = bytes.fromhex(who[2]), int(who[4])
+-    want = hashlib.sha256(b"nc110-bmctl-v1 who" + master + nc + bid + struct.pack("<I", sess)).digest()[:16]
+-    if not hmac.compare_digest(want, bytes.fromhex(who[6])):
+-        sys.exit("who reply failed its check (wrong key, or a forged/replayed reply)")
+-    k = hashlib.sha256(b"nc110-bmctl-v1 session" + master + bid + struct.pack("<I", sess) + nc).digest()
+-    return ChaCha20Poly1305(k), bid, sess
++    """Authenticated session setup; returns (aead, boot_id, session). Sends `who2` (v2) and `who` (v1, for kernels
++    from before 2026-10-21) together and takes the first reply whose check verifies; replies that fail it (forged,
++    or a v2 kernel's refusal of v1) are skipped. A v2 kernel never answers v1 with a session, so no downgrade."""
++    nc2, nc1 = os.urandom(16), os.urandom(16)
++    host = socket.gethostbyname(a.host)
++    bad = []
++    for _ in range(3):
++        s.setblocking(False)
++        try:
++            while True:
++                s.recvfrom(2048)
++        except (BlockingIOError, OSError):
++            pass
++        s.settimeout(TIMEOUT[0])
++        s.sendto(b"who2" + nc2, (a.host, a.port))
++        s.sendto(b"who" + nc1, (a.host, a.port))
++        end = time.monotonic() + TIMEOUT[0]
++        try:
++            while time.monotonic() < end:
++                d, src = s.recvfrom(2048)
++                if src[0] != host:
++                    continue
++                w = d.decode(errors="replace").split()
++                try:
++                    if w[:3] == ["nc110", "v2", "boot"] and len(w) == 10 and w[4] == "session" and w[6] == "bucket" and w[8] == "check":
++                        bid, sess, b = bytes.fromhex(w[3]), int(w[5]), int(w[7])
++                        want = hashlib.sha256(b"nc110-bmctl-v2 who" + master + nc2 + bid + struct.pack("<IB", sess, b)).digest()[:16]
++                        if hmac.compare_digest(want, bytes.fromhex(w[9])):
++                            V2[0] = (nc2, b)
++                            k = hashlib.sha256(b"nc110-bmctl-v2 session" + master + bid + struct.pack("<I", sess) + nc2).digest()
++                            return ChaCha20Poly1305(k), bid, sess
++                    elif w[:2] == ["nc110", "boot"] and len(w) == 7 and w[3] == "session" and w[5] == "check" and len(w[2]) == 32:
++                        bid, sess = bytes.fromhex(w[2]), int(w[4])
++                        want = hashlib.sha256(b"nc110-bmctl-v1 who" + master + nc1 + bid + struct.pack("<I", sess)).digest()[:16]
++                        if hmac.compare_digest(want, bytes.fromhex(w[6])):
++                            V2[0] = None
++                            k = hashlib.sha256(b"nc110-bmctl-v1 session" + master + bid + struct.pack("<I", sess) + nc1).digest()
++                            return ChaCha20Poly1305(k), bid, sess
++                except ValueError:
++                    pass
++                bad.append(w[:4])
++        except socket.timeout:
++            continue
++    sys.exit(f"no verified who reply from {a.host}:{a.port}" + (f" (unverified replies: {bad[:3]}: wrong key, or forged)" if bad else ""))
+ 
+ 
+ aead, boot, sid = handshake()
+@@ -84,7 +120,8 @@ def call_raw(body):
+     SEQ[0] += 1  # per-session counter from 1; a fresh session per run, so (key, nonce) never repeats
+     seq = SEQ[0]
+     ct = aead.encrypt(b"C2K\0" + struct.pack("<Q", seq), body, boot)
+-    r = rpc(struct.pack("<IQ", sid, seq) + ct, lambda d: len(d) >= 24 and d[:8] == struct.pack("<Q", seq))
++    head = struct.pack("<IQ", sid, seq | 1 << 63) + V2[0][0] + bytes([V2[0][1]]) if V2[0] else struct.pack("<IQ", sid, seq)
++    r = rpc(head + ct, lambda d: len(d) >= 24 and d[:8] == struct.pack("<Q", seq))
+     rseq = struct.unpack("<Q", r[:8])[0]
+     if rseq != seq:
+         sys.exit(f"reply seq {rseq} != {seq}")
+diff --git a/tools/flood-q35-test.py b/tools/flood-q35-test.py
+new file mode 100644
+index 0000000..8cffbfb
+--- /dev/null
++++ b/tools/flood-q35-test.py
+@@ -0,0 +1,174 @@
++#!/usr/bin/env python3
++"""q35 flood check on raw Ethernet (control review 2026-10-21): QEMU's dgram netdev hands this script every frame, so it
++plays the whole LAN (ARP for any address, a DHCP server, the key holder at 10.9.0.10, and a flooder that can SPOOF
++source addresses, which QEMU's user networking cannot). A `who` + `who2` flood runs at <pps> from one address
++(single) or from random addresses (spoof) while the key holder pings once a second for <secs>; the run passes if at
++least 80% of its authenticated pings succeed and the kernel does not reset. Speaks protocol v2 and v1, like bmctl.py.
++Usage: flood-q35-test.py [kernel] [pps] [single|spoof] [secs]. Exit 1 on failure."""
++import hashlib, hmac, os, random, socket, struct, subprocess, sys, threading, time
++from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
++
++K = sys.argv[1] if len(sys.argv) > 1 else "target/attended/x86_64-unknown-none/release/nc110-kernel"
++PPS = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
++MODE = sys.argv[3] if len(sys.argv) > 3 else "spoof"
++SECS = int(sys.argv[4]) if len(sys.argv) > 4 else 40
++KIND = os.environ.get("FLOOD_KIND", "both")  # who | who2 | both (alternating)
++QP = 31000 + os.getpid() % 1000; MP = QP + 1000
++GW_MAC, GW, BOARD, CLIENT = bytes.fromhex("020000000001"), bytes([10, 9, 0, 1]), bytes([10, 9, 0, 2]), bytes([10, 9, 0, 10])
++km = open("test-keys/client.key", "rb").read(); master = hashlib.sha256(b"nc110-bmctl-v1" + km[8:40]).digest()
++L = f"/tmp/flood-q35-{os.getpid()}.log"
++net = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); net.bind(("127.0.0.1", MP))
++net.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 22)
++board_mac = [b"\xff" * 6]
++inbox, inbox_cv = [], threading.Condition()
++stat = {"replies_to_flood": 0, "arp": 0, "sent": 0}
++
++
++def csum(b):
++    if len(b) % 2: b += b"\0"
++    s = sum(struct.unpack(f"!{len(b) // 2}H", b)); s = (s >> 16) + (s & 0xFFFF); s += s >> 16
++    return ~s & 0xFFFF
++
++
++def udp_frame(src, dst, sport, dport, payload, dmac=None):
++    u = struct.pack("!HHHH", sport, dport, 8 + len(payload), 0) + payload
++    c = csum(src + dst + struct.pack("!BBH", 0, 17, len(u)) + u) or 0xFFFF
++    u = u[:6] + struct.pack("!H", c) + u[8:]
++    ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(u), 0, 0x4000, 64, 17, 0, src, dst)
++    ip = ip[:10] + struct.pack("!H", csum(ip)) + ip[12:]
++    f = (dmac or board_mac[0]) + GW_MAC + b"\x08\x00" + ip + u
++    return f + b"\0" * max(0, 60 - len(f))
++
++
++def tx(f):
++    net.sendto(f, ("127.0.0.1", QP))
++
++
++def dhcp_reply(req, mtype):
++    xid, chaddr = req[4:8], req[28:44]
++    b = struct.pack("!BBBB", 2, 1, 6, 0) + xid + b"\0" * 8 + BOARD + GW + b"\0" * 4 + chaddr + b"\0" * 192
++    b += b"\x63\x82\x53\x63" + bytes([53, 1, mtype, 54, 4]) + GW + bytes([51, 4, 0, 1, 81, 128, 1, 4, 255, 255, 255, 0, 3, 4]) + GW + b"\xff"
++    tx(udp_frame(GW, b"\xff" * 4, 67, 68, b, dmac=b"\xff" * 6))
++
++
++def rx():
++    while True:
++        f, _ = net.recvfrom(4096)
++        et = f[12:14]
++        if et == b"\x08\x06" and f[20:22] == b"\x00\x01":  # ARP request: we are every address but the board
++            board_mac[0] = f[22:28]; tip = f[38:42]
++            if tip != BOARD:
++                tx(f[6:12] + GW_MAC + b"\x08\x06" + f[14:20] + b"\x00\x02" + GW_MAC + tip + f[22:28] + f[28:32])
++                stat["arp"] += 1
++        elif et == b"\x08\x00" and f[23] == 17:
++            ihl = (f[14] & 15) * 4; u = f[14 + ihl:]; sport, dport = struct.unpack("!HH", u[:4]); dst = f[30:34]
++            if sport == 68 and dport == 67:
++                board_mac[0] = f[6:12]; opts = u[8 + 240:]; i = 0; mt = 0
++                while i < len(opts) and opts[i] != 255:
++                    if opts[i] == 53: mt = opts[i + 2]
++                    i += 2 + opts[i + 1] if opts[i] else 1
++                if mt in (1, 3): dhcp_reply(u[8:], 2 if mt == 1 else 5)
++            elif sport == 5515 and dst == CLIENT:
++                with inbox_cv: inbox.append(u[8:struct.unpack("!H", u[4:6])[0]]); inbox_cv.notify_all()
++            elif sport == 5515:
++                stat["replies_to_flood"] += 1
++
++
++def recv(timeout, want):
++    end = time.time() + timeout
++    with inbox_cv:
++        while True:
++            for i, d in enumerate(inbox):
++                if want(d): return inbox.pop(i)
++            left = end - time.time()
++            if left <= 0: return None
++            inbox_cv.wait(left)
++
++
++CPORT = 40000 + random.randrange(20000)
++send = lambda p: tx(udp_frame(CLIENT, BOARD, CPORT, 5515, p))
++
++
++def session():
++    """bmctl.py's handshake over this rig: who2 + who together, first verified reply wins."""
++    nc2, nc1 = os.urandom(16), os.urandom(16)
++    for _ in range(3):
++        with inbox_cv: inbox.clear()
++        send(b"who2" + nc2); send(b"who" + nc1)
++        end = time.time() + 1
++        while time.time() < end:
++            d = recv(end - time.time(), lambda d: d.startswith(b"nc110 "))
++            if not d: break
++            w = d.decode(errors="replace").split()
++            try:
++                if w[:3] == ["nc110", "v2", "boot"] and len(w) == 10:
++                    bid, sid, bk = bytes.fromhex(w[3]), int(w[5]), int(w[7])
++                    if hmac.compare_digest(hashlib.sha256(b"nc110-bmctl-v2 who" + master + nc2 + bid + struct.pack("<IB", sid, bk)).digest()[:16], bytes.fromhex(w[9])):
++                        k = hashlib.sha256(b"nc110-bmctl-v2 session" + master + bid + struct.pack("<I", sid) + nc2).digest()
++                        return ChaCha20Poly1305(k), bid, struct.pack("<I", sid), (nc2, bk)
++                elif w[:2] == ["nc110", "boot"] and len(w) == 7 and len(w[2]) == 32:
++                    bid, sid = bytes.fromhex(w[2]), int(w[4])
++                    if hmac.compare_digest(hashlib.sha256(b"nc110-bmctl-v1 who" + master + nc1 + bid + struct.pack("<I", sid)).digest()[:16], bytes.fromhex(w[6])):
++                        k = hashlib.sha256(b"nc110-bmctl-v1 session" + master + bid + struct.pack("<I", sid) + nc1).digest()
++                        return ChaCha20Poly1305(k), bid, struct.pack("<I", sid), None
++            except ValueError:
++                pass
++    return None
++
++
++def call(msg):
++    s = session()
++    if not s: return None
++    a, bid, sid, v2 = s
++    head = sid + (struct.pack("<Q", 1 | 1 << 63) + v2[0] + bytes([v2[1]]) if v2 else struct.pack("<Q", 1))
++    f = head + a.encrypt(b"C2K\0" + struct.pack("<Q", 1), msg, bid)
++    for _ in range(3):
++        send(f)
++        d = recv(1, lambda d: d[:8] == struct.pack("<Q", 1))
++        if d:
++            try: return a.decrypt(b"K2C\0" + d[:8], d[8:], bid).decode()
++            except Exception: return None
++    return None
++
++
++stop = threading.Event()
++
++
++def flood():
++    t0, n = time.time(), 0
++    while not stop.is_set():
++        due = int((time.time() - t0) * PPS)
++        while n < due:
++            src = bytes([10, 9, random.randrange(1, 255), random.randrange(1, 255)]) if MODE == "spoof" else bytes([10, 9, 0, 66])
++            if src in (BOARD, CLIENT, GW): src = bytes([10, 9, 0, 77])
++            p = {"who": b"who", "who2": b"who2"}.get(KIND, b"who2" if n % 2 else b"who") + os.urandom(16)
++            tx(udp_frame(src, BOARD, 1024 + n % 60000, 5515, p)); n += 1
++        stat["sent"] = n
++        time.sleep(0.002)
++
++
++threading.Thread(target=rx, daemon=True).start()
++q = subprocess.Popen(["qemu-system-x86_64", "-machine", "q35", "-m", "128", "-display", "none", "-no-reboot",
++    "-global", "ICH9-LPC.noreboot=false", "-serial", f"file:{L}", "-kernel", K, "-initrd", "test-keys/client.key",
++    "-append", "bmctl nic=mmio idle=30", "-netdev", f"dgram,id=n0,local.type=inet,local.host=127.0.0.1,local.port={QP},"
++    f"remote.type=inet,remote.host=127.0.0.1,remote.port={MP}", "-device", "rtl8139,netdev=n0,mac=52:54:00:12:34:56"])
++log = lambda: open(L, errors="replace").read() if os.path.exists(L) else ""
++for _ in range(120):
++    if "bmctl: listening" in log(): break
++    time.sleep(0.25)
++else:
++    q.kill(); sys.exit("FAIL: bmctl never listened (DHCP over the rig?)")
++base = call(b"ping"); print("baseline:", base)
++threading.Thread(target=flood, daemon=True).start()
++ok = tries = 0; t0 = time.time()
++while time.time() - t0 < SECS and q.poll() is None:
++    tries += 1; r = call(b"ping"); ok += bool(r and r.startswith("pong")); time.sleep(1)
++el = time.time() - t0; stop.set(); time.sleep(0.3)
++st = call(b"stats")
++alive = q.poll() is None; q.kill()
++pps = stat["sent"] / el
++print(f"{MODE} flood {pps:.0f} pps for {el:.0f} s: legit pings {ok}/{tries}; kernel {'up' if alive else 'RESET'}; "
++      f"replies to flood sources {stat['replies_to_flood']}, ARP answered {stat['arp']}")
++print("stats:", st)
++good = bool(base) and alive and tries and ok >= 0.8 * tries and pps >= 0.8 * PPS
++print("RESULT:", "PASS" if good else "FAIL"); sys.exit(0 if good else 1)
+
+exec
+/bin/zsh -lc "rg --files -g AGENTS.md -g '*bmctl*' -g '*flood*'" in ~/nc110-baremetal
+ succeeded in 0ms:
+src/bmctl.rs
+tools/flood-q35-test.py
+tools/bmctl.py
+tools/ssh-bmctl-q35-test.sh
+tools/bmctl-q35-test.sh
+tools/bmctl_v1_head.py
+proof/codex-review-bmctl-followup2.txt
+proof/codex-review-bmctl.txt
+proof/codex-review-bmctl-followup.txt
+proof/codex-review-bmctl-ssh.txt
+
+exec
+/bin/zsh -lc "sed -n '1,100p' src/acpi.rs
+sed -n '470,550p' src/bmctl.rs
+rg -n 'poll\\(|step\\(|kernel_end|stack|bss' src/main.rs src/bmctl.rs linker* src/boot* Cargo.toml
+sed -n '1,65p' tools/bmctl.py
+sed -n '1,40p' tools/bmctl-q35-test.sh
+rg -n 'FACS|fn table|fn find' src" in ~/nc110-baremetal
+ succeeded in 0ms:
+//! ACPI tables, read-only: find the RSDP in the BIOS area, walk the RSDT, and hand table bytes to bmctl (`acpi <sig>
+//! <off>`, e.g. FACP, DSDT, FACS), so an agent can read the firmware's description of the battery, the EC and the
+//! sleep states without booting Linux. Nothing is written.
+use core::ptr::read_volatile;
+
+fn rd32(a: u64) -> u32 {
+    unsafe { read_volatile(a as *const u32) }
+}
+
+fn sum_ok(a: u64, len: usize) -> bool {
+    (0..len).fold(0u8, |s, i| s.wrapping_add(unsafe { read_volatile((a + i as u64) as *const u8) })) == 0
+}
+
+fn rsdt() -> Option<u64> {
+    for a in (0xE0000u64..0x100000).step_by(16) {
+        if unsafe { read_volatile(a as *const [u8; 8]) } == *b"RSD PTR " && sum_ok(a, 20) {
+            return Some(rd32(a + 16) as u64);
+        }
+    }
+    None
+}
+
+/// (address, length) of the table with signature `sig`; "DSDT" and "FACS" are found through the FADT.
+pub fn table(sig: &[u8; 4]) -> Option<(u64, u32)> {
+    let r = rsdt()?;
+    if unsafe { read_volatile(r as *const [u8; 4]) } != *b"RSDT" {
+        return None;
+    }
+    let n = (rd32(r + 4) as u64).saturating_sub(36) / 4;
+    let mut fadt = None;
+    for i in 0..n.min(64) {
+        let t = rd32(r + 36 + 4 * i) as u64;
+        let s = unsafe { read_volatile(t as *const [u8; 4]) };
+        if s == *sig {
+            return Some((t, rd32(t + 4)));
+        }
+        if s == *b"FACP" {
+            fadt = Some(t);
+        }
+    }
+    let f = fadt?;
+    let t = match sig {
+        b"DSDT" => rd32(f + 40) as u64,
+        b"FACS" => rd32(f + 36) as u64,
+        _ => return None,
+    };
+    let len = if sig == b"FACS" { rd32(t + 4) } else { rd32(t + 4) };
+    (unsafe { read_volatile(t as *const [u8; 4]) } == *sig).then_some((t, len))
+}
+
+/// Up to `out.len()` bytes of table `sig` from offset `off`; the table length, or None if absent.
+pub fn read(sig: &[u8; 4], off: usize, out: &mut [u8]) -> Option<(u32, usize)> {
+    let (a, len) = table(sig)?;
+    let len = len.min(1 << 20);
+    let n = out.len().min((len as usize).saturating_sub(off));
+    for (i, b) in out[..n].iter_mut().enumerate() {
+        *b = unsafe { read_volatile((a + (off + i) as u64) as *const u8) };
+    }
+    Some((len, n))
+}
+
+/// Zero the FACS waking vectors (offsets 12 and 24) if set; returns the old (32-bit, 64-bit) values. Only an OS about
+/// to sleep sets them; one left over (the 2026-10-21 01:40 S3 attempt left 0x6000) may make the firmware treat a later
+/// reset as a resume from S3.
+pub fn clear_waking_vector() -> Option<(u32, u64)> {
+    let (f, _) = table(b"FACS")?;
+    let (v, x) = unsafe { (read_volatile((f + 12) as *const u32), read_volatile((f + 24) as *const u64)) };
+    if v != 0 || x != 0 {
+        unsafe {
+            core::ptr::write_volatile((f + 12) as *mut u32, 0);
+            core::ptr::write_volatile((f + 24) as *mut u64, 0);
+        }
+    }
+    Some((v, x))
+}
+        let in_sess = sess.iter().position(|x| x.as_ref().is_some_and(|x| x.id == sid && x.peer == Some(from)));
+        let fresh = in_sess.is_none()
+            && [bucket, bucket.wrapping_sub(1)].iter().any(|&b| b as u8 == b8 && cookie(&self.ck, &from, b, &nc) == sid)
+            && !self.promoted[..self.promoted_n.min(64)].contains(&sid);
+        let mut cand = None;
+        let se = match in_sess {
+            Some(i) => sess[i].as_mut().unwrap(),
+            None if fresh => cand.insert(Sess { id: sid, key: session_key2(&self.key, &self.boot_id, sid, &nc), last_seq: 0, peer: Some(from), last_t: t, retx: 0, reply: [0; 8 + 1300 + 16], reply_len: 0 }),
+            None => {
+                self.bad += 1;
+                return None;
+            }
+        };
+        let (body, tg) = buf[29..n].split_at_mut(n - 29 - 16);
+        if !open(&se.key, &nonce(b"C2K\0", seq), &self.boot_id, body, tg) {
+            self.bad += 1;
+            return None;
+        }
+        if seq == se.last_seq && se.reply_len > 0 {
+            if se.retx >= 5 {
+                return None; // cap resends of one reply
+            }
+            se.retx += 1;
+            self.retx += 1; // retry of the last request: same bytes again (to the bound peer), nothing re-executed
+            let _ = sock.send_slice(&se.reply[..se.reply_len], from);
+            return None;
+        }
+        if seq <= se.last_seq {
+            self.replay += 1;
+            return None;
+        }
+        se.last_seq = seq;
+        se.last_t = t;
+        se.retx = 0;
+        self.last_ok = t;
+        let se = if in_sess.is_none() {
+            let dst = (0..sess.len()).find(|&j| sess[j].is_none())
+                .unwrap_or_else(|| (0..sess.len()).min_by_key(|&j| sess[j].as_ref().map_or(i64::MIN, |x| x.last_t)).unwrap());
+            self.promoted[self.promoted_n % 64] = sid;
+            self.promoted_n += 1;
+            sess[dst] = cand.take();
+            sess[dst].as_mut().unwrap()
+        } else {
+            se
+        };
+        self.ok += 1;
+        let mut out = [0u8; 1300];
+        let len = {
+            let mut w = Writer { b: &mut out, n: 0 };
+            let loading = |c: &[u8]| c.starts_with(b"ldat") || c.starts_with(b"lbeg") || c.starts_with(b"lcom"); // incl. lcomlinux
+            if self.jump_at.is_some() && loading(body) {
+                // committed: the staged image is frozen until the hop (Codex loader MUST-FIX 2)
+                let _ = core::fmt::write(&mut w, format_args!("err committed, jump pending"));
+            } else if body.len() >= 8 && &body[..4] == b"ldat" {
+                // binary chunk: "ldat" ++ u32 LE offset ++ bytes (checked before the text parser)
+                let off = u32::from_le_bytes(body[4..8].try_into().unwrap()) as u64;
+                let r = match self.stage.as_mut() {
+                    Some(st) => crate::loader::data(st, off, &body[8..]),
+                    None => Err("no lbeg"),
+                };
+                match r {
+                    Ok(got) => { let _ = core::fmt::write(&mut w, format_args!("ok {}", got)); }
+                    Err(e) => { let _ = core::fmt::write(&mut w, format_args!("err {}", e)); }
+                }
+            }
+            let cmd = if w.n > 0 { "" } else { core::str::from_utf8(body).unwrap_or("") };
+            let mut it = cmd.split(' ');
+            match it.next().unwrap_or("") {
+                "" if w.n > 0 => {} // already answered (ldat)
+                "lbeg" => {
+                    let size: u64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                    match crate::loader::begin(size, it.next().unwrap_or("")) {
+                        Ok(st) => {
+                            self.stage = Some(st);
+                            let _ = core::fmt::write(&mut w, format_args!("ok staging {} B at {:#x}", size, crate::loader::STAGE));
+                        }
+                        Err(e) => { let _ = core::fmt::write(&mut w, format_args!("err {}", e)); }
+                    }
+                }
+                "lcomlinux" => {
+                    let rest = cmd.splitn(2, ' ').nth(1).unwrap_or("");
+src/bmctl.rs:22://! (text, data, bss: stack, session table, keys), NIC registers only inside its 256-byte MMIO window as aligned
+src/bmctl.rs:166:    static __bss_end: u8;
+src/bmctl.rs:179:            let (ks, ke) = (core::ptr::addr_of!(__load_start) as u64, core::ptr::addr_of!(__bss_end) as u64);
+src/bmctl.rs:181:                return Err("refused: kernel image (code, stack, keys)");
+src/bmctl.rs:291:        iface.poll(now(), &mut dev, &mut sockets);
+src/bmctl.rs:292:        if let Some(dhcpv4::Event::Configured(c)) = sockets.get_mut::<dhcpv4::Socket>(dhcp_h).poll() {
+src/bmctl.rs:363:    pub fn step(&mut self, sock: &mut udp::Socket, t: i64) -> Option<Act> {
+src/bmctl.rs:364:        crate::hda::poll(t);
+linker.ld:14:    .bss (NOLOAD) : ALIGN(4096) {
+linker.ld:15:        __bss_start = .;
+linker.ld:16:        *(.bss .bss.*)
+linker.ld:19:        __bss_end = .;
+src/boot.s:21:    .long __bss_end                 /* bss_end_addr  */
+src/boot.s:33:    /* ---- Arm the TCO watchdog FIRST (safety rule 5 rehearsal). No stack, no paging. ----
+src/boot.s:122:    /* zero .bss (page tables + stack live there) */
+src/boot.s:123:    mov $__bss_start, %edi
+src/boot.s:124:    mov $__bss_end, %ecx
+src/boot.s:130:    mov $stack_top, %esp
+src/boot.s:179:    mov $stack_top, %rsp
+src/boot.s:209:.section .bss
+src/boot.s:216:stack_bottom: .skip 2097152
+src/boot.s:217:stack_top:
+src/boot.s:221:   own GDT and stack inside that page. Order matters: the old kernel's page tables live in its .bss at 1 MiB, which
+src/boot.s:223:   params (u64 each, values < 4 GiB): +0 src, +8 dst, +16 len, +24 bss_len, +32 entry, +40 ebx (multiboot info or
+src/boot.s:243:    lea tstack_top(%rip), %rsp
+src/boot.s:271:    rep stosb                      /* zero bss (multiboot) */
+src/boot.s:295:tstack_top:
+#!/usr/bin/env python3
+"""bmctl client for the NC110 kernel's authenticated UDP control port (see src/bmctl.rs).
+
+Usage: tools/.venv/bin/python tools/bmctl.py [--host 192.168.50.120] [--key test-keys/client.key] <command...>
+  commands: ping | stats | log [offset] | logall | peek ... | reboot | rng <total> <outfile>  (raw jitter samples)
+            rec <ms> | aud | audget <out.wav>  (internal-mic clip, cmdline hda; 16 kHz mono)
+            linux <bzImage> [cmdline...]     stage an i386 Linux bzImage and boot it (32-bit protocol, no initrd):
+                                             the remote route back to Slot A Linux, e.g. root=/dev/sda2 rootwait
+            load <kernel.elf> [cmdline...]   stage over the network, verify, chain-load in RAM (nothing on /boot),
+                                             then wait for the new kernel's bmctl (new boot id) and print its ping
+The key file is the same 72-byte multiboot key module the kernel gets (magic 8 + ed25519 seed 32 + pub 32);
+master = SHA-256("nc110-bmctl-v1" + seed). Handshake: send "who" + fresh random 16-byte Nc; the reply carries boot id,
+session and check = SHA-256("nc110-bmctl-v1 who" + master + Nc + boot + session)[:16], verified here; traffic key =
+SHA-256("nc110-bmctl-v1 session" + master + boot + session_u32_le + Nc); seq counts from 1 per session. Uses the `cryptography` package's ChaCha20Poly1305,
+an implementation independent of the kernel's, so agreement is a real interop check.
+"""
+import argparse, hashlib, hmac, os, socket, struct, sys, time
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--host", default="192.168.50.120")
+ap.add_argument("--port", type=int, default=5515)
+_ak = os.path.expanduser("~/.nc110/agentos.key")  # the agent OS key (outside the repo); test key otherwise
+ap.add_argument("--key", default=os.environ.get("NC110_KEY") or (_ak if os.path.exists(_ak) else "test-keys/client.key"))
+ap.add_argument("cmd", nargs="+")
+a = ap.parse_args()
+km = open(a.key, "rb").read()
+assert len(km) == 72, "key module must be 72 bytes"
+master = hashlib.sha256(b"nc110-bmctl-v1" + km[8:40]).digest()
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+
+def rpc(raw, want=lambda d: True):
+    """Send `raw`, return the first reply from the target that `want` accepts. Stale datagrams (late answers to
+    an earlier timed-out attempt) are drained before sending and skipped while waiting, so a resend can never
+    leave the client one reply behind."""
+    host = socket.gethostbyname(a.host)
+    for _ in range(3):  # a retry of the same frame gets the kernel's cached reply, nothing runs twice
+        s.setblocking(False)
+        try:
+            while True:
+                s.recvfrom(2048)
+        except (BlockingIOError, OSError):
+            pass
+        s.settimeout(TIMEOUT[0])
+        s.sendto(raw, (a.host, a.port))
+        end = time.monotonic() + TIMEOUT[0]
+        try:
+            while time.monotonic() < end:
+                d, src = s.recvfrom(2048)
+                if src[0] == host and want(d):
+                    return d
+        except socket.timeout:
+            continue
+    sys.exit(f"no reply from {a.host}:{a.port}")
+
+
+TIMEOUT = [2.0]
+
+
+V2 = [None]  # (Nc, bucket) when the kernel speaks protocol v2 (stateless cookie), None for a v1 kernel
+
+
+def handshake():
+    """Authenticated session setup; returns (aead, boot_id, session). Sends `who2` (v2) and `who` (v1, for kernels
+#!/bin/sh
+# q35 check of bmctl: positive path + wrong key + replay + tamper + other-boot + retry cache. Exit 1 on any failure.
+export NC110_KEY=test-keys/client.key  # q35 kernels get the test key module; the default is the agent-OS key
+K=target/attended/x86_64-unknown-none/release/nc110-kernel; P=tools/.venv/bin/python; fail=0
+qemu-system-x86_64 -machine q35 -m 128 -display none -no-reboot -global ICH9-LPC.noreboot=false -serial file:/tmp/bmctl-q35.log \
+  -kernel $K -initrd test-keys/client.key -append "bmctl nic=mmio" -netdev user,id=n0,hostfwd=udp:127.0.0.1:15515-:5515 -device rtl8139,netdev=n0 &
+Q=$!; trap 'kill $Q 2>/dev/null' EXIT
+for i in $(seq 40); do grep -q 'bmctl: listening' /tmp/bmctl-q35.log 2>/dev/null && break; sleep 0.5; done
+B="$P tools/bmctl.py --host 127.0.0.1 --port 15515"
+r=$($B ping); echo "1 ping:    $r"; case "$r" in pong*) ;; *) fail=1;; esac
+head -c 72 /dev/urandom > /tmp/bmctl-badkey.bin
+r=$($B --key /tmp/bmctl-badkey.bin ping 2>&1); echo "2 bad key: $r"; case "$r" in *"wrong key"*) ;; *) fail=1;; esac
+$P - <<'PY' || fail=1
+import hashlib, os, socket, struct, subprocess, sys
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+km = open("test-keys/client.key", "rb").read(); master = hashlib.sha256(b"nc110-bmctl-v1" + km[8:40]).digest()
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.5); ep = ("127.0.0.1", 15515)
+def who(sock=s):  # protocol v2: stateless cookie; returns (Nc, boot, session, bucket)
+    nc = os.urandom(16); sock.sendto(b"who2" + nc, ep); w = sock.recvfrom(256)[0].split()
+    assert w[:3] == [b"nc110", b"v2", b"boot"], w
+    return nc, bytes.fromhex(w[3].decode()), int(w[5]), int(w[7])
+def aead_for(nc, boot, sid):
+    return ChaCha20Poly1305(hashlib.sha256(b"nc110-bmctl-v2 session" + master + boot + struct.pack("<I", sid) + nc).digest())
+nc, boot, sid, bk = who(); a = aead_for(nc, boot, sid)
+def frame(seq, msg=b"ping", aead=a, bid=boot, sess=sid, n=None, b=None):
+    return (struct.pack("<IQ", sess, seq | 1 << 63) + (n or nc) + bytes([bk if b is None else b])
+            + aead.encrypt(b"C2K\0" + struct.pack("<Q", seq), msg, bid))
+bad = 0
+s.sendto(frame(1), ep); r1 = s.recvfrom(2048)[0]
+s.sendto(frame(1), ep); r2 = s.recvfrom(2048)[0]
+print(("ok  " if r1 == r2 else "FAIL") + " 3 retry of seq 1 -> identical cached reply"); bad |= r1 != r2
+s.sendto(frame(2), ep); s.recvfrom(2048)
+def silent(p, what, sock=s):
+    sock.sendto(p, ep)
+    try: sock.recvfrom(2048); print(f"FAIL {what}: got a reply"); return 1
+    except socket.timeout: print(f"ok   {what}: no reply"); return 0
+bad |= silent(frame(1), "4 replay of an older accepted seq")
+t = bytearray(frame(3)); t[40] ^= 1; bad |= silent(bytes(t), "5 tampered ciphertext")
+bad |= silent(frame(4, bid=b"\0" * 16), "6 frame for another boot id")
+bad |= silent(frame(5, sess=sid + 1000), "7 unknown session (no cookie)")
+src/hda.rs:419:fn find() -> Option<pci::Bdf> {
+src/sleep.rs:2://! FACS waking vector points at a 12-byte real-mode stub that hard-resets (0xCF9), so the firmware's resume path lands
+src/sleep.rs:88:    let (facs, _) = acpi::table(b"FACS").ok_or("no FACS")?;
+src/sleep.rs:103:    // 1. wake stub + FACS waking vector (32-bit real-mode vector; the 64-bit X vector off)
+src/pci.rs:79:pub fn find(vendor: u16, device: u16) -> Option<Bdf> {
+src/acpi.rs:2://! <off>`, e.g. FACP, DSDT, FACS), so an agent can read the firmware's description of the battery, the EC and the
+src/acpi.rs:23:/// (address, length) of the table with signature `sig`; "DSDT" and "FACS" are found through the FADT.
+src/acpi.rs:24:pub fn table(sig: &[u8; 4]) -> Option<(u64, u32)> {
+src/acpi.rs:44:        b"FACS" => rd32(f + 36) as u64,
+src/acpi.rs:47:    let len = if sig == b"FACS" { rd32(t + 4) } else { rd32(t + 4) };
+src/acpi.rs:62:/// Zero the FACS waking vectors (offsets 12 and 24) if set; returns the old (32-bit, 64-bit) values. Only an OS about
+src/acpi.rs:66:    let (f, _) = table(b"FACS")?;
+src/main.rs:84:    // A stale FACS waking vector (only a sleeping OS sets one) must never outlive the boot that set it.
+src/main.rs:87:            Some((v, x)) => kprintln!("acpi: FACS waking vector was {:#x} (X {:#x}){}", v, x, if v != 0 || x != 0 { ", cleared" } else { "" }),
+src/main.rs:88:            None => kprintln!("acpi: no FACS"),
+
+web search: 
+web search: site.uefi.org ACPI FACS version 0 X_Firmware_Waking_Vector 64 byte aligned
+codex
+The 64-entry ring has a concrete replay hole: after 64 later promotions, it forgets a session whose cookie can still be valid. Replaying that session’s first frame then resets its sequence state. I’m checking the FACS compatibility issue and whether the other concerns amount to authentication failures or availability risks.
+exec
+/bin/zsh -lc "rg -n 'iface.poll|ctl.step|bmctl.step|\\.step\\(' src
+cat linker.ld
+sed -n '65,103p' src/bmctl.rs
+sed -n '685,725p' src/bmctl.rs
+sed -n '1,110p' src/time.rs
+rg -n 'STAGE|__bss_end' src/loader.rs
+command -v qemu-system-x86_64
+ls -l target/attended/x86_64-unknown-none/release/nc110-kernel
+ git status --short" in ~/nc110-baremetal
+ succeeded in 0ms:
+src/bmctl.rs:291:        iface.poll(now(), &mut dev, &mut sockets);
+src/ssh.rs:145:        iface.poll(now(), &mut dev, &mut sockets);
+src/ssh.rs:241:        iface.poll(now(), dev, sockets);
+src/ssh.rs:243:            if let Some(a) = c.step(sockets.get_mut::<udp::Socket>(udp_h), time::now_ms()) {
+src/ssh.rs:511:                iface.poll(now(), dev, sockets);
+src/ssh.rs:553:        iface.poll(now(), dev, sockets);
+src/ssh.rs:554:        if let Some(a) = ctl.step(sockets.get_mut::<udp::Socket>(udp_h), time::now_ms()) {
+ENTRY(_start32)
+SECTIONS {
+    . = 0x100000;
+    __load_start = .;
+    .all : {
+        KEEP(*(.multiboot_header))
+        *(.text.boot)
+        *(.text .text.*)
+        *(.rodata .rodata.*)
+        *(.data .data.*)
+        *(.got .got.*)
+    }
+    __load_end = .;
+    .bss (NOLOAD) : ALIGN(4096) {
+        __bss_start = .;
+        *(.bss .bss.*)
+        *(COMMON)
+        . = ALIGN(4096);
+        __bss_end = .;
+    }
+    /DISCARD/ : { *(.eh_frame*) *(.comment) }
+}
+    m.update_padded(aad);
+    m.update_padded(ct);
+    let mut lens = [0u8; 16];
+    lens[..8].copy_from_slice(&(aad.len() as u64).to_le_bytes());
+    lens[8..].copy_from_slice(&(ct.len() as u64).to_le_bytes());
+    m.update_padded(&lens);
+    m.finalize().into()
+}
+
+fn cipher(key: &[u8; 32], n: &[u8; 12]) -> (ChaCha20, [u8; 32]) {
+    let mut c = ChaCha20::new(key.into(), n.into());
+    let mut b0 = [0u8; 64];
+    c.apply_keystream(&mut b0); // block 0 -> Poly1305 key; the stream continues at block 1
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&b0[..32]);
+    (c, pk)
+}
+
+pub fn seal(key: &[u8; 32], n: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
+    let (mut c, pk) = cipher(key, n);
+    c.apply_keystream(buf);
+    tag(&pk, aad, buf)
+}
+
+pub fn open(key: &[u8; 32], n: &[u8; 12], aad: &[u8], buf: &mut [u8], t: &[u8]) -> bool {
+    let (mut c, pk) = cipher(key, n);
+    let want = tag(&pk, aad, buf);
+    if t.len() != 16 {
+        return false;
+    }
+    let diff = want.iter().zip(t).fold(0u8, |a, (x, y)| a | (x ^ y));
+    if diff != 0 {
+        return false;
+    }
+    c.apply_keystream(buf);
+    true
+}
+
+fn session_key2(master: &[u8; 32], boot_id: &[u8; 16], sess: u32, nc: &[u8; 16]) -> [u8; 32] {
+                    let rest = cmd.splitn(2, ' ').nth(1).unwrap_or("");
+                    let n = crate::hda::type_text(rest.as_bytes());
+                    let _ = core::fmt::write(&mut w, format_args!("ok queued {} of {} bytes", n, rest.len()));
+                }
+                "rec" => {
+                    let ms: i64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(5000);
+                    match crate::hda::rec_start(ms) {
+                        Ok(id) => { let _ = core::fmt::write(&mut w, format_args!("ok recording clip {}", id)); }
+                        Err(e) => { let _ = core::fmt::write(&mut w, format_args!("err {}", e)); }
+                    }
+                }
+                "aud" => match it.next().and_then(|x| x.parse::<usize>().ok()) {
+                    None => {
+                        let (id, n, rec, peak, over) = crate::hda::status();
+                        let (ctl, sts, lpib, gctl) = crate::hda::regs();
+                        let _ = core::fmt::write(&mut w, format_args!("clip {} bytes {} recording {} peak {} fmt s16le 16000 mono sd_ctl {:#x} sd_sts {:#x} lpib {} gctl {:#x} overrun {}", id, n, rec as u8, peak, ctl, sts, lpib, gctl, over as u8));
+                    }
+                    Some(off) => {
+                        let c = crate::hda::clip_bytes();
+                        let st = off.min(c.len());
+                        w.put(&c[st..st.saturating_add(1200).min(c.len())]);
+                    }
+                },
+                "sleep" => {
+                    // S3 did not wake on the real NC110 (2026-10-21 01:40, needed a power press; cause unknown): refused.
+                    // sleep_at and src/sleep.rs stay for a future attempt, which must re-enable it here deliberately.
+                    let _ = core::fmt::write(&mut w, format_args!("err sleep disabled: S3 hung the real netbook (see PROVISIONING.md)"));
+                }
+                "reboot" => {
+                    let _ = core::fmt::write(&mut w, format_args!("rebooting in 500 ms"));
+                    self.reboot_at = Some(t + 500);
+                }
+                _ => {
+                    let _ = core::fmt::write(&mut w, format_args!("err unknown command (ping|stats|log <off>|peek ...|rng <n>|rec <ms>|aud [off]|type <text>|say <text>|key <text>|host list/set/del|gma|mouse|lbeg|ldat|lcom|lcomlinux|reboot)"));
+                }
+            }
+            w.n
+        };
+        let pkt = &mut se.reply;
+        pkt[..8].copy_from_slice(&seq.to_le_bytes());
+        pkt[8..8 + len].copy_from_slice(&out[..len]);
+//! Monotonic milliseconds from the TSC, calibrated once against PIT channel 2 (gate via port 0x61).
+use crate::port::{inb, outb, rdtsc};
+
+static mut TSC_PER_MS: u64 = 1_000_000; // fallback guess (1 GHz) if calibration fails
+static mut T0: u64 = 0;
+
+pub fn init() -> u64 {
+    unsafe {
+        // PIT ch2, mode 0, lobyte/hibyte, count for 10 ms at 1.193182 MHz.
+        const COUNT: u16 = 11932;
+        let g = inb(0x61);
+        outb(0x61, (g & 0xFD) | 0x01); // gate on, speaker off
+        outb(0x43, 0b1011_0000);
+        outb(0x42, COUNT as u8);
+        outb(0x42, (COUNT >> 8) as u8);
+        // Re-trigger: toggle gate low->high so mode 0 starts counting now.
+        let g = inb(0x61);
+        outb(0x61, g & 0xFE);
+        outb(0x61, g | 0x01);
+        let a = rdtsc();
+        let mut spins: u64 = 0;
+        while inb(0x61) & 0x20 == 0 && spins < 200_000_000 {
+            spins += 1;
+        }
+        let b = rdtsc();
+        if spins < 200_000_000 && b > a {
+            TSC_PER_MS = ((b - a) / 10).max(1);
+        }
+        T0 = rdtsc();
+        TSC_PER_MS
+    }
+}
+
+/// ms the TSC had counted when `init` ran: time since the last CPU reset (firmware + GRUB + our early boot),
+/// since a hard reset zeroes the TSC; after an in-RAM chain-load it also includes the previous kernel's run.
+pub fn since_reset_ms() -> u64 {
+    unsafe { T0 / TSC_PER_MS }
+}
+
+pub fn tsc_to_ms(t: u64) -> u64 {
+    unsafe { t / TSC_PER_MS }
+}
+
+pub fn ready() -> bool {
+    unsafe { T0 != 0 }
+}
+
+pub fn now_ms() -> i64 {
+    unsafe { ((rdtsc() - T0) / TSC_PER_MS) as i64 }
+}
+
+/// Busy-wait at least `us` microseconds (TSC, after init()).
+pub fn delay_us(us: u64) {
+    unsafe {
+        let t = rdtsc();
+        let n = us * TSC_PER_MS / 1000 + 1;
+        while rdtsc().wrapping_sub(t) < n {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// CMOS RTC hours and minutes (the NC110's RTC keeps local time: Linux there labels HKT as UTC). Waits out an update in
+/// progress (bounded), handles BCD and 12-hour formats. None if the RTC never settles.
+pub fn rtc_hm() -> Option<(u8, u8)> {
+    use crate::port::{inb, outb};
+    let rd = |r: u8| unsafe {
+        outb(0x70, r);
+        inb(0x71)
+    };
+    for _ in 0..1000 {
+        if rd(0x0A) & 0x80 == 0 {
+            let (m, h, b) = (rd(0x02), rd(0x04), rd(0x0B));
+            let bcd = |v: u8| if b & 0x04 == 0 { (v & 0x0F) + (v >> 4) * 10 } else { v };
+            let pm = h & 0x80 != 0;
+            let mut hh = bcd(h & 0x7F);
+            if b & 0x02 == 0 {
+                hh = hh % 12 + if pm { 12 } else { 0 };
+            }
+            return Some((hh, bcd(m)));
+        }
+    }
+    None
+}
+2://! `lbeg <size> <sha256>` opens a staging buffer at STAGE; binary `ldat` ++ u32 offset ++ bytes appends in order;
+15:pub const STAGE: u64 = 0x0400_0000; // 64 MiB
+16:pub const CAP: u64 = 0x0200_0000; // 32 MiB (bzImage-sized; STAGE + CAP = 96 MiB < 128 MiB, so q35 -m 128 works)
+66:    static __bss_end: u8;
+80:    let (s, e) = (core::ptr::addr_of!(__load_start) as u64, core::ptr::addr_of!(__bss_end) as u64);
+89:    if !mb::ram_contains(STAGE, size) || overlaps(STAGE, size, ks, kl) {
+110:    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), (STAGE + off) as *mut u8, bytes.len()) };
+120:    let img = unsafe { core::slice::from_raw_parts(STAGE as *const u8, st.size as usize) };
+147:    if laddr < 0x10_0000 || bend > STAGE || !mb::ram_contains(laddr, bend - laddr) {
+153:    Ok((STAGE + foff, laddr, len, bend - lend, entry))
+224:    let img = unsafe { core::slice::from_raw_parts(STAGE as *const u8, st.size as usize) };
+247:    if dst != 0x10_0000 || dst + len > STAGE || !mb::ram_contains(dst, len) {
+309:    Ok(Plan { params: [STAGE + off, dst, len, 0, dst, BP, 1] })
+/opt/homebrew/bin/qemu-system-x86_64
+-rwxr-xr-x@ 1 evnchn  staff  712328 Oct 21 20:36 target/attended/x86_64-unknown-none/release/nc110-kernel
+ M PROVISIONING.md
+ M proof/nc110-soak.log
+ M src/acpi.rs
+ M src/bmctl.rs
+ M src/main.rs
+ M tools/bmctl-q35-test.sh
+ M tools/bmctl.py
+ A tools/flood-q35-test.py
+?? proof/acpi/nc110-FACP.dsl
+?? proof/codex-review-agentos-followup.txt
+?? proof/codex-review-agentos-followup2.txt
+?? proof/codex-review-agentos-followup3.txt
+?? proof/codex-review-agentos-followup4.txt
+?? proof/codex-review-agentos.txt
+?? proof/codex-review-v2-cookie.txt
+?? proof/looks/cam-real-home-f4b8b3db.jpg
+?? proof/review-home-deepseek.txt
+?? staged/
+?? tools/bmctl_v1_head.py
+?? tools/nc110-wake.py
+
+web search: 
+web search: https://code.googlesource.com/linux/torvalds/linux/+/68ff4a3ccda9f98c74f23c70c8c7c581f9eee931/drivers/acpi/acpica/hwxfsleep.c
+web search: 
+web search: https://raw.githubusercontent.com/torvalds/linux/master/drivers/acpi/acpica/hwxfsleep.c
+exec
+/bin/zsh -lc "nl -ba tools/bmctl.py | sed -n '75,115p'
+nl -ba tools/bmctl-q35-test.sh | sed -n '35,85p'
+nl -ba tools/flood-q35-test.py | tail -30
+sed -n '230,258p' src/ssh.rs
+rg -n 'poll_ingress|fn poll\\(' ~/.cargo/registry/src/*/smoltcp-*/src/iface/interface/mod.rs
+rg -n 'RX_BUF|PEND' src/bmctl.rs
+sed -n '720,735p' src/bmctl.rs" in ~/nc110-baremetal
+ succeeded in 0ms:
+    75	                s.recvfrom(2048)
+    76	        except (BlockingIOError, OSError):
+    77	            pass
+    78	        s.settimeout(TIMEOUT[0])
+    79	        s.sendto(b"who2" + nc2, (a.host, a.port))
+    80	        s.sendto(b"who" + nc1, (a.host, a.port))
+    81	        end = time.monotonic() + TIMEOUT[0]
+    82	        try:
+    83	            while time.monotonic() < end:
+    84	                d, src = s.recvfrom(2048)
+    85	                if src[0] != host:
+    86	                    continue
+    87	                w = d.decode(errors="replace").split()
+    88	                try:
+    89	                    if w[:3] == ["nc110", "v2", "boot"] and len(w) == 10 and w[4] == "session" and w[6] == "bucket" and w[8] == "check":
+    90	                        bid, sess, b = bytes.fromhex(w[3]), int(w[5]), int(w[7])
+    91	                        want = hashlib.sha256(b"nc110-bmctl-v2 who" + master + nc2 + bid + struct.pack("<IB", sess, b)).digest()[:16]
+    92	                        if hmac.compare_digest(want, bytes.fromhex(w[9])):
+    93	                            V2[0] = (nc2, b)
+    94	                            k = hashlib.sha256(b"nc110-bmctl-v2 session" + master + bid + struct.pack("<I", sess) + nc2).digest()
+    95	                            return ChaCha20Poly1305(k), bid, sess
+    96	                    elif w[:2] == ["nc110", "boot"] and len(w) == 7 and w[3] == "session" and w[5] == "check" and len(w[2]) == 32:
+    97	                        bid, sess = bytes.fromhex(w[2]), int(w[4])
+    98	                        want = hashlib.sha256(b"nc110-bmctl-v1 who" + master + nc1 + bid + struct.pack("<I", sess)).digest()[:16]
+    99	                        if hmac.compare_digest(want, bytes.fromhex(w[6])):
+   100	                            V2[0] = None
+   101	                            k = hashlib.sha256(b"nc110-bmctl-v1 session" + master + bid + struct.pack("<I", sess) + nc1).digest()
+   102	                            return ChaCha20Poly1305(k), bid, sess
+   103	                except ValueError:
+   104	                    pass
+   105	                bad.append(w[:4])
+   106	        except socket.timeout:
+   107	            continue
+   108	    sys.exit(f"no verified who reply from {a.host}:{a.port}" + (f" (unverified replies: {bad[:3]}: wrong key, or forged)" if bad else ""))
+   109	
+   110	
+   111	aead, boot, sid = handshake()
+   112	SEQ = [0]
+   113	
+   114	
+   115	def call(cmd):
+    35	    try: sock.recvfrom(2048); print(f"FAIL {what}: got a reply"); return 1
+    36	    except socket.timeout: print(f"ok   {what}: no reply"); return 0
+    37	bad |= silent(frame(1), "4 replay of an older accepted seq")
+    38	t = bytearray(frame(3)); t[40] ^= 1; bad |= silent(bytes(t), "5 tampered ciphertext")
+    39	bad |= silent(frame(4, bid=b"\0" * 16), "6 frame for another boot id")
+    40	bad |= silent(frame(5, sess=sid + 1000), "7 unknown session (no cookie)")
+    41	# 8: a replayed who reply (old boot+session) with a FRESH client nonce: the cookie no longer recomputes, rejected.
+    42	n8 = os.urandom(16)
+    43	bad |= silent(frame(1, aead=aead_for(n8, boot, sid), sess=sid, n=n8), "8 key from a replayed who reply + new Nc")
+    44	# 9: flood of who2 must not evict the live authenticated session (who2 creates nothing)
+    45	for _ in range(40):
+    46	    try: who()
+    47	    except socket.timeout: pass
+    48	s.sendto(frame(7), ep)
+    49	try: s.recvfrom(2048); print("ok   9 live session survives a who2 flood")
+    50	except socket.timeout: print("FAIL 9 live session evicted by who2 flood"); bad = 1
+    51	# 10: a forged first frame on a fresh cookie neither consumes nor corrupts it: the real first frame still works
+    52	nc2, boot2, sid2, bk2 = who(); a2 = aead_for(nc2, boot2, sid2)
+    53	t = bytearray(frame(1, aead=a2, sess=sid2, n=nc2, b=bk2)); t[40] ^= 1; s.sendto(bytes(t), ep)
+    54	try: s.recvfrom(2048); print("FAIL 10 forged first frame got a reply"); bad = 1
+    55	except socket.timeout: pass
+    56	f10 = frame(1, aead=a2, sess=sid2, n=nc2, b=bk2); s.sendto(f10, ep)
+    57	try: s.recvfrom(2048); print("ok   10 forged first frame ignored, real first frame then promotes the session")
+    58	except socket.timeout: print("FAIL 10 cookie session lost after a forged frame"); bad = 1
+    59	# 11: a cookie is bound to the endpoint: the same frame from another source port is rejected
+    60	s2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s2.settimeout(1.5)
+    61	nc3, b3, sid3, bk3 = who(); bad |= silent(frame(1, aead=aead_for(nc3, b3, sid3), sess=sid3, n=nc3, b=bk3), "11 cookie used from another port", s2)
+    62	# 12: evict session 10 (16 newer authenticated sessions), then replay its first frame: never promoted twice
+    63	for _ in range(17):
+    64	    n_, b_, s_, k_ = who(); s.sendto(frame(1, aead=aead_for(n_, b_, s_), sess=s_, n=n_, b=k_), ep); s.recvfrom(2048)
+    65	bad |= silent(f10, "12 replayed first frame after its session was evicted")
+    66	# 13: an old (v1) client fails loudly against this kernel
+    67	r = subprocess.run(["tools/.venv/bin/python", "tools/bmctl_v1_head.py", "--host", "127.0.0.1", "--port", "15515", "ping"],
+    68	    capture_output=True, text=True, env=dict(os.environ, NC110_KEY="test-keys/client.key"))
+    69	ok13 = r.returncode != 0 and "v2-only" in r.stderr + r.stdout
+    70	print(("ok  " if ok13 else "FAIL") + " 13 v1 client exits naming v2-only: " + (r.stderr + r.stdout).strip()[-90:]); bad |= not ok13
+    71	sys.exit(bad)
+    72	PY
+    73	chk() { r=$($B $2); rc=$?; echo "$1: $r"; [ $rc = 0 ] || { echo "   ^ FAIL (client exit $rc)"; fail=1; }; case "$r" in $3) ;; *) echo "   ^ FAIL (want $3)"; fail=1;; esac; }
+    74	chk "p1 mem BIOS data area" "peek mem 0x400 16"        "????????????????????????????????"
+    75	printf '%s' "$r" | grep -Eqx '[0-9a-f]{32}' || { echo "   ^ FAIL (not 32 hex chars)"; fail=1; }
+    76	chk "p2 mem kernel image"   "peek mem 0x100000 16"     "err refused: kernel image*"
+    77	chk "p2b mem straddles image start" "peek mem 0xffff8 16" "err refused: kernel image*"
+    78	chk "p3 mem LAPIC (not RAM)" "peek mem 0xfee00000 4"   "err refused: not inside*"
+    79	chk "p3b mem 4 GiB boundary" "peek mem 0xfffffff8 16"  "err refused: not inside*"
+    80	chk "p4 mem len too big"    "peek mem 0x400 4096"      "err len*"
+    81	chk "p4b mem len zero"      "peek mem 0x400 0"         "err len*"
+    82	chk "p5 mem wraps"          "peek mem 0xffffffffffffffff 16" "err overflow"
+    83	chk "p6 nic regs 0..8"      "peek nic 0x0 8"           "12005452 00005634 "
+    84	chk "p7 nic past window"    "peek nic 0xfc 8"          "err nic*"
+    85	chk "p7b nic misaligned"    "peek nic 0x2 4"           "err nic*"
+   145	            tx(udp_frame(src, BOARD, 1024 + n % 60000, 5515, p)); n += 1
+   146	        stat["sent"] = n
+   147	        time.sleep(0.002)
+   148	
+   149	
+   150	threading.Thread(target=rx, daemon=True).start()
+   151	q = subprocess.Popen(["qemu-system-x86_64", "-machine", "q35", "-m", "128", "-display", "none", "-no-reboot",
+   152	    "-global", "ICH9-LPC.noreboot=false", "-serial", f"file:{L}", "-kernel", K, "-initrd", "test-keys/client.key",
+   153	    "-append", "bmctl nic=mmio idle=30", "-netdev", f"dgram,id=n0,local.type=inet,local.host=127.0.0.1,local.port={QP},"
+   154	    f"remote.type=inet,remote.host=127.0.0.1,remote.port={MP}", "-device", "rtl8139,netdev=n0,mac=52:54:00:12:34:56"])
+   155	log = lambda: open(L, errors="replace").read() if os.path.exists(L) else ""
+   156	for _ in range(120):
+   157	    if "bmctl: listening" in log(): break
+   158	    time.sleep(0.25)
+   159	else:
+   160	    q.kill(); sys.exit("FAIL: bmctl never listened (DHCP over the rig?)")
+   161	base = call(b"ping"); print("baseline:", base)
+   162	threading.Thread(target=flood, daemon=True).start()
+   163	ok = tries = 0; t0 = time.time()
+   164	while time.time() - t0 < SECS and q.poll() is None:
+   165	    tries += 1; r = call(b"ping"); ok += bool(r and r.startswith("pong")); time.sleep(1)
+   166	el = time.time() - t0; stop.set(); time.sleep(0.3)
+   167	st = call(b"stats")
+   168	alive = q.poll() is None; q.kill()
+   169	pps = stat["sent"] / el
+   170	print(f"{MODE} flood {pps:.0f} pps for {el:.0f} s: legit pings {ok}/{tries}; kernel {'up' if alive else 'RESET'}; "
+   171	      f"replies to flood sources {stat['replies_to_flood']}, ARP answered {stat['arp']}")
+   172	print("stats:", st)
+   173	good = bool(base) and alive and tries and ok >= 0.8 * tries and pps >= 0.8 * PPS
+   174	print("RESULT:", "PASS" if good else "FAIL"); sys.exit(0 if good else 1)
+    // `bmctl ssh` drops it: bmctl's idle bound (no fresh authenticated command) plays that role instead.
+    let hard_end = time::now_ms() + 180_000;
+
+    'outer: while (got_output || time::now_ms() < deadline) && (!cfg!(feature = "attended") || ctl.is_some() || time::now_ms() < hard_end) {
+        if wdt::armed() && time::now_ms() - last_pet >= 1000 {
+            wdt::pet(); // the main loop is the liveness signal: a hang anywhere in it stops the petting
+            last_pet = time::now_ms();
+        }
+        if ctl.is_some() {
+            crate::net::rx_budget(Some(64)); // bmctl's deadlines run every pass even under a flood
+        }
+        iface.poll(now(), dev, sockets);
+        if let Some(c) = ctl.as_mut() {
+            if let Some(a) = c.step(sockets.get_mut::<udp::Socket>(udp_h), time::now_ms()) {
+                if !c.act(a, dev) {
+                    bm_idle = true;
+                    break 'outer;
+                }
+            }
+        }
+        let sock = sockets.get_mut::<tcp::Socket>(tcp_h);
+        if !connected {
+            if sock.may_send() {
+                connected = true;
+                kprintln!("tcp: connected to {}:{}", t.ip, t.port);
+            } else if !sock.is_open() {
+                kprintln!("tcp: connection failed");
+                break;
+            }
+84:/// Result returned by [`Interface::poll_ingress_single`].
+91:    /// No packet was processed. You don't need to call [`Interface::poll_ingress_single`]
+98:    /// There may be more packets in the device's RX queue, so you should call [`Interface::poll_ingress_single`] again.
+104:    /// There may be more packets in the device's RX queue, so you should call [`Interface::poll_ingress_single`] again.
+477:    /// and [`poll_ingress_single()`](Self::poll_ingress_single).
+480:    pub fn poll(
+557:    pub fn poll_ingress_single(
+47:static mut RX_BUF: [u8; 65536] = [0; 65536]; // the one real request: room for 64 packets, drained up to 64 per step
+263:        udp::PacketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(RX_META) }[..].as_mut(), unsafe { &mut *core::ptr::addr_of_mut!(RX_BUF) }[..].as_mut()),
+            }
+            w.n
+        };
+        let pkt = &mut se.reply;
+        pkt[..8].copy_from_slice(&seq.to_le_bytes());
+        pkt[8..8 + len].copy_from_slice(&out[..len]);
+        let tg = seal(&se.key, &nonce(b"K2C\0", seq), &self.boot_id, &mut pkt[8..8 + len]);
+        pkt[8 + len..8 + len + 16].copy_from_slice(&tg);
+        se.reply_len = 8 + len + 16;
+        let _ = sock.send_slice(&se.reply[..se.reply_len], from);
+        None
+    }
+}
+
+struct Writer<'a> {
+    b: &'a mut [u8],
+
+codex
+I also found a client crash on malformed replies and a missing tracked fixture for case 13. The FACS concern needs qualification: compliant FACS alignment makes these accesses aligned, and Linux also clears the X vector for version 0 when the length permits it. The stronger issue here is that the new boot-time write ignores the table length.
+exec
+/bin/zsh -lc "python3 -c 'import struct; print(issubclass(struct.error, ValueError)); struct.pack(\"<IB\", 4294967296, 0)'" in ~/nc110-baremetal
+ exited 1 in 0ms:
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import struct; print(issubclass(struct.error, ValueError)); struct.pack("<IB", 4294967296, 0)
+                                                                ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+struct.error: 'I' format requires 0 <= number <= 4294967295
+False
+
+exec
+/bin/zsh -lc "git ls-files --error-unmatch tools/bmctl_v1_head.py
+rg -n 'rx_budget|RX_BUDGET' src/net.rs
+nl -ba src/acpi.rs | tail -19" in ~/nc110-baremetal
+ succeeded in 0ms:
+error: pathspec 'tools/bmctl_v1_head.py' did not match any file(s) known to git
+Did you forget to 'git add'?
+9:/// Frames `receive` may hand out before the next `rx_budget` call. None = unlimited (plain SSH never sets it);
+11:static mut RX_BUDGET: Option<u32> = None;
+13:pub fn rx_budget(n: Option<u32>) {
+14:    unsafe { RX_BUDGET = n };
+51:            match RX_BUDGET {
+53:                Some(n) => RX_BUDGET = Some(n - 1),
+    57	        *b = unsafe { read_volatile((a + (off + i) as u64) as *const u8) };
+    58	    }
+    59	    Some((len, n))
+    60	}
+    61	
+    62	/// Zero the FACS waking vectors (offsets 12 and 24) if set; returns the old (32-bit, 64-bit) values. Only an OS about
+    63	/// to sleep sets them; one left over (the 2026-10-21 01:40 S3 attempt left 0x6000) may make the firmware treat a later
+    64	/// reset as a resume from S3.
+    65	pub fn clear_waking_vector() -> Option<(u32, u64)> {
+    66	    let (f, _) = table(b"FACS")?;
+    67	    let (v, x) = unsafe { (read_volatile((f + 12) as *const u32), read_volatile((f + 24) as *const u64)) };
+    68	    if v != 0 || x != 0 {
+    69	        unsafe {
+    70	            core::ptr::write_volatile((f + 12) as *mut u32, 0);
+    71	            core::ptr::write_volatile((f + 24) as *mut u64, 0);
+    72	        }
+    73	    }
+    74	    Some((v, x))
+    75	}
+
+codex
+Most of the cryptographic structure is sound, but the promoted ring breaks replay protection and can cause response-key/nonce reuse. **6/10 as submitted.** This is a source review; I did not run QEMU.
+
+**MUST-FIX**
+
+1. **The 64-entry ring allows authenticated commands to execute again.** In [bmctl.rs](~/nc110-baremetal/src/bmctl.rs:470):
+
+   ```rust
+   && !self.promoted[..self.promoted_n.min(64)].contains(&sid);
+   ```
+   ```rust
+   self.promoted[self.promoted_n % 64] = sid;
+   self.promoted_n += 1;
+   ```
+
+   Concrete sequence:
+
+   - Capture an accepted first frame, such as `ping` at sequence 1.
+   - Allow 64 other sessions to promote within its cookie’s validity window. Those promotions also evict the original inactive session from the 16-entry live table.
+   - Replay the original frame from its original endpoint, or spoof that endpoint.
+
+   Its cookie still recomputes, its SID has disappeared from the ring, and the candidate starts with `last_seq: 0`. Authentication succeeds and the command runs again. An observer needs legitimate authenticated traffic to supply those promotions; a `who2` flood alone cannot do it.
+
+   This also **reuses the response AEAD key and nonce**: the repeated `ping` produces a different uptime under the same `K2C || 1`. That is more serious than duplicate command execution.
+
+   Keep replay records until their cookies can no longer be accepted, and fail closed if storage fills. Merely increasing 64 postpones the failure. For a robust redesign, bind the full issuance bucket into the traffic key and authenticated header, so a later 32-bit cookie collision cannot recreate an old key.
+
+2. **Unauthenticated malformed replies can crash the client before verification.** [bmctl.py](~/nc110-baremetal/tools/bmctl.py:89):
+
+   ```python
+   bid, sess, b = bytes.fromhex(w[3]), int(w[5]), int(w[7])
+   ... struct.pack("<IB", sess, b) ...
+   ...
+   except ValueError:
+   ```
+
+   A reply containing `session 4294967296` or `bucket 256` raises `struct.error`, which is not a `ValueError`. I confirmed that exception behavior locally. No valid check is needed; the packet only needs to pass the source-IP filter. The v1 branch and flood harness have the same issue.
+
+   Validate integer ranges and boot-ID length, and catch `struct.error`. Match the source port too, although that does not prevent spoofing.
+
+3. **Case 13 depends on an untracked file.** [bmctl-q35-test.sh](~/nc110-baremetal/tools/bmctl-q35-test.sh:67) executes:
+
+   ```python
+   "tools/bmctl_v1_head.py"
+   ```
+
+   That file exists locally but is not tracked. A clean checkout of this patch fails case 13. Include the fixture or make the test self-contained.
+
+**SHOULD**
+
+- **Validate FACS before performing unconditional boot-time accesses.** [acpi.rs](~/nc110-baremetal/src/acpi.rs:66) explicitly discards the length:
+
+  ```rust
+  let (f, _) = table(b"FACS")?;
+  ```
+
+  It then reads through offset 31 and potentially writes both vectors. Reject invalid addresses, insufficient lengths, and invalid alignment before typed volatile accesses; validate the FADT pointer path as well. Moving this into every boot makes malformed firmware tables a startup failure rather than an explicitly requested ACPI-operation failure.
+
+  **Alignment itself is not a demonstrated bug on compliant firmware:** FACS is 64-byte aligned, making offsets 12 and 24 suitable for these accesses. [ACPI specification](https://uefi.org/specs/ACPI/6.6/05_ACPI_Software_Programming_Model.html)
+
+  **Version <1 alone is also not a convincing reason to prohibit zeroing X.** Linux ACPICA clears X even for version 0, guarded by `facs->length > 32`. The missing length guard is the stronger finding here. [ACPICA implementation](https://raw.githubusercontent.com/torvalds/linux/master/drivers/acpi/acpica/hwxfsleep.c)
+
+- **The flood fix improves admission but does not guarantee service.** Every `who2` performs two SHA-256 computations, formatting, and a send attempt, without a rate limit—even when TX is full. Also:
+
+  ```rust
+  RX_META: ... 64
+  TX_META: ... 8
+  ```
+
+  A batch can fill all eight TX slots with unauthenticated replies before processing a legitimate command. Its response is cached, but sending fails; retries help only if they encounter free slots. Reserve response capacity for authenticated traffic or skip handshake work when its reply budget is exhausted. Avoid restoring the globally shared admission bottleneck that motivated this change.
+
+  The receive budget and 64-packet drain bound work per pass. They do not prevent a flood from filling the queue or dropping legitimate packets.
+
+- **Make collision failures recoverable.** Lookup uses:
+
+  ```rust
+  x.id == sid && x.peer == Some(from)
+  ```
+
+  A new cookie colliding with a live SID on the same endpoint selects the old key, so the new client fails authentication. On another endpoint, the global promoted-SID check rejects it while that SID remains recorded. These are availability failures, not automatic cross-session authentication. A fresh-nonce handshake retry would recover; the current client retries the same command frame and eventually exits.
+
+**Security questions that mostly check out**
+
+| Question | Assessment |
+|---|---|
+| Two ordinary sessions have the same 32-bit cookie | Different `Nc` values produce different traffic keys. SID collision alone does not reuse a key. |
+| Can keys repeat? | Yes if boot, SID, and `Nc` repeat. The ring replay above causes this directly. Endpoint and bucket are absent from the KDF. |
+| Can an unrelated session accept a captured frame? | Not merely because its SID collides: the different key rejects the tag. Live-session lookup ignores the supplied `Nc` and bucket, but authentication still uses the stored key and existing sequence state. |
+| Blind cookie forgery | Approximately \(2^{32}\) guesses for a selected endpoint/nonce/bucket. Passing that gate still requires a valid AEAD tag; this is not a 32-bit command-authentication scheme. |
+| Birthday collisions | About 77,000 independent cookies gives a 50% chance of some pair colliding. That is not the cost of hitting a particular live session, nor does an arbitrary pair imply key reuse. |
+| Low-byte bucket wrap | Correctly disambiguated by recomputing with full current/previous `u32` buckets. After 256 buckets, the low byte repeats but the hash input differs; there is no deterministic 128-minute replay. |
+| `bucket-1` at boot | `wrapping_sub(1)` considers `u32::MAX`. No such cookie was previously issued under this boot’s fresh cookie key, so this is not a practical replay hole. Using checked subtraction would express intent better. |
+| Direction and sequence flag | Direction separation and masking the v2 flag are consistent between client and kernel. Sequence 0 is rejected by `seq <= last_seq`. |
+| v1 downgrade | A spoofed or replayed v1 reply cannot pass the fresh `nc1` check. This v2-only kernel cannot supply an authenticated v1 reply. An attacker can suppress v2, but cannot synthesize a valid fallback. There is no remembered minimum-version policy, so genuinely authenticated v1 remains accepted as intended. |
+| Static memory | RX payload storage grows by **56 KiB**, plus metadata, offset partly by removing `PEND`. It is `.bss`, not stack allocation; linker bounds include it. I found no concrete memory overlap introduced here. However, 64 KiB cannot hold 64 maximum-sized Ethernet UDP payloads simultaneously. |
+
+**Test assessment**
+
+The tests catch useful regressions, but miss the principal failure:
+
+- **3–7:** Basic retry, replay and authentication rejection coverage is useful. However, `t[40] ^= 1` changes the **tag**, not ciphertext: with a four-byte `ping`, ciphertext occupies offsets 29–32.
+- **8:** Uses an already-live SID and endpoint. It exercises rejection under the stored key, **not** the fresh-cookie recomputation claimed by its comment.
+- **9:** Forty sequential handshakes check that issuing cookies does not evict sessions. They are not a concurrent flood or queue-pressure test.
+- **10–11:** Useful checks for authentication-before-promotion and endpoint binding.
+- **12:** `range(17)` evicts the session but never overwrites its ring entry. Add **64 subsequent promotions within the cookie window**, then replay the captured frame. Check both command execution and response encryption. Control time so expiration cannot make the test pass accidentally.
+- **13:** Checks old-client refusal, once the fixture is included. It does not test the new client against a v1 kernel, malformed replies, or adversarial reply ordering.
+
+The raw-Ethernet flood harness is useful for spoofed-source pressure and fresh-session availability. Its success metric is weaker than “one successful ping per second”:
+
+```python
+r = call(b"ping")
+...
+time.sleep(1)
+```
+
+Calls can take several seconds, so 80% success among completed attempts can conceal poor throughput and latency. It also counts locally sent packets, not packets received by the kernel. Add latency/throughput requirements, an existing-session workload, invalid authenticated-frame floods, and separate `who2` saturation runs. Neither harness covers bucket boundaries, forced cookie collisions, ring rollover, or FACS compatibility.
+
+**NIT**
+
+Update the v1-only introductory documentation and remove the false claim that a promoted session number is “never promoted again in a boot.” Also rename `who2_n`: it counts attempted replies, including failed enqueue attempts.
+
+**Rating: 6/10.** The stateless admission design and authentication ordering are good; replay-state eviction must be fixed before relying on the protocol’s security guarantees.
+tokens used
+45,202
+Most of the cryptographic structure is sound, but the promoted ring breaks replay protection and can cause response-key/nonce reuse. **6/10 as submitted.** This is a source review; I did not run QEMU.
+
+**MUST-FIX**
+
+1. **The 64-entry ring allows authenticated commands to execute again.** In [bmctl.rs](~/nc110-baremetal/src/bmctl.rs:470):
+
+   ```rust
+   && !self.promoted[..self.promoted_n.min(64)].contains(&sid);
+   ```
+   ```rust
+   self.promoted[self.promoted_n % 64] = sid;
+   self.promoted_n += 1;
+   ```
+
+   Concrete sequence:
+
+   - Capture an accepted first frame, such as `ping` at sequence 1.
+   - Allow 64 other sessions to promote within its cookie’s validity window. Those promotions also evict the original inactive session from the 16-entry live table.
+   - Replay the original frame from its original endpoint, or spoof that endpoint.
+
+   Its cookie still recomputes, its SID has disappeared from the ring, and the candidate starts with `last_seq: 0`. Authentication succeeds and the command runs again. An observer needs legitimate authenticated traffic to supply those promotions; a `who2` flood alone cannot do it.
+
+   This also **reuses the response AEAD key and nonce**: the repeated `ping` produces a different uptime under the same `K2C || 1`. That is more serious than duplicate command execution.
+
+   Keep replay records until their cookies can no longer be accepted, and fail closed if storage fills. Merely increasing 64 postpones the failure. For a robust redesign, bind the full issuance bucket into the traffic key and authenticated header, so a later 32-bit cookie collision cannot recreate an old key.
+
+2. **Unauthenticated malformed replies can crash the client before verification.** [bmctl.py](~/nc110-baremetal/tools/bmctl.py:89):
+
+   ```python
+   bid, sess, b = bytes.fromhex(w[3]), int(w[5]), int(w[7])
+   ... struct.pack("<IB", sess, b) ...
+   ...
+   except ValueError:
+   ```
+
+   A reply containing `session 4294967296` or `bucket 256` raises `struct.error`, which is not a `ValueError`. I confirmed that exception behavior locally. No valid check is needed; the packet only needs to pass the source-IP filter. The v1 branch and flood harness have the same issue.
+
+   Validate integer ranges and boot-ID length, and catch `struct.error`. Match the source port too, although that does not prevent spoofing.
+
+3. **Case 13 depends on an untracked file.** [bmctl-q35-test.sh](~/nc110-baremetal/tools/bmctl-q35-test.sh:67) executes:
+
+   ```python
+   "tools/bmctl_v1_head.py"
+   ```
+
+   That file exists locally but is not tracked. A clean checkout of this patch fails case 13. Include the fixture or make the test self-contained.
+
+**SHOULD**
+
+- **Validate FACS before performing unconditional boot-time accesses.** [acpi.rs](~/nc110-baremetal/src/acpi.rs:66) explicitly discards the length:
+
+  ```rust
+  let (f, _) = table(b"FACS")?;
+  ```
+
+  It then reads through offset 31 and potentially writes both vectors. Reject invalid addresses, insufficient lengths, and invalid alignment before typed volatile accesses; validate the FADT pointer path as well. Moving this into every boot makes malformed firmware tables a startup failure rather than an explicitly requested ACPI-operation failure.
+
+  **Alignment itself is not a demonstrated bug on compliant firmware:** FACS is 64-byte aligned, making offsets 12 and 24 suitable for these accesses. [ACPI specification](https://uefi.org/specs/ACPI/6.6/05_ACPI_Software_Programming_Model.html)
+
+  **Version <1 alone is also not a convincing reason to prohibit zeroing X.** Linux ACPICA clears X even for version 0, guarded by `facs->length > 32`. The missing length guard is the stronger finding here. [ACPICA implementation](https://raw.githubusercontent.com/torvalds/linux/master/drivers/acpi/acpica/hwxfsleep.c)
+
+- **The flood fix improves admission but does not guarantee service.** Every `who2` performs two SHA-256 computations, formatting, and a send attempt, without a rate limit—even when TX is full. Also:
+
+  ```rust
+  RX_META: ... 64
+  TX_META: ... 8
+  ```
+
+  A batch can fill all eight TX slots with unauthenticated replies before processing a legitimate command. Its response is cached, but sending fails; retries help only if they encounter free slots. Reserve response capacity for authenticated traffic or skip handshake work when its reply budget is exhausted. Avoid restoring the globally shared admission bottleneck that motivated this change.
+
+  The receive budget and 64-packet drain bound work per pass. They do not prevent a flood from filling the queue or dropping legitimate packets.
+
+- **Make collision failures recoverable.** Lookup uses:
+
+  ```rust
+  x.id == sid && x.peer == Some(from)
+  ```
+
+  A new cookie colliding with a live SID on the same endpoint selects the old key, so the new client fails authentication. On another endpoint, the global promoted-SID check rejects it while that SID remains recorded. These are availability failures, not automatic cross-session authentication. A fresh-nonce handshake retry would recover; the current client retries the same command frame and eventually exits.
+
+**Security questions that mostly check out**
+
+| Question | Assessment |
+|---|---|
+| Two ordinary sessions have the same 32-bit cookie | Different `Nc` values produce different traffic keys. SID collision alone does not reuse a key. |
+| Can keys repeat? | Yes if boot, SID, and `Nc` repeat. The ring replay above causes this directly. Endpoint and bucket are absent from the KDF. |
+| Can an unrelated session accept a captured frame? | Not merely because its SID collides: the different key rejects the tag. Live-session lookup ignores the supplied `Nc` and bucket, but authentication still uses the stored key and existing sequence state. |
+| Blind cookie forgery | Approximately \(2^{32}\) guesses for a selected endpoint/nonce/bucket. Passing that gate still requires a valid AEAD tag; this is not a 32-bit command-authentication scheme. |
+| Birthday collisions | About 77,000 independent cookies gives a 50% chance of some pair colliding. That is not the cost of hitting a particular live session, nor does an arbitrary pair imply key reuse. |
+| Low-byte bucket wrap | Correctly disambiguated by recomputing with full current/previous `u32` buckets. After 256 buckets, the low byte repeats but the hash input differs; there is no deterministic 128-minute replay. |
+| `bucket-1` at boot | `wrapping_sub(1)` considers `u32::MAX`. No such cookie was previously issued under this boot’s fresh cookie key, so this is not a practical replay hole. Using checked subtraction would express intent better. |
+| Direction and sequence flag | Direction separation and masking the v2 flag are consistent between client and kernel. Sequence 0 is rejected by `seq <= last_seq`. |
+| v1 downgrade | A spoofed or replayed v1 reply cannot pass the fresh `nc1` check. This v2-only kernel cannot supply an authenticated v1 reply. An attacker can suppress v2, but cannot synthesize a valid fallback. There is no remembered minimum-version policy, so genuinely authenticated v1 remains accepted as intended. |
+| Static memory | RX payload storage grows by **56 KiB**, plus metadata, offset partly by removing `PEND`. It is `.bss`, not stack allocation; linker bounds include it. I found no concrete memory overlap introduced here. However, 64 KiB cannot hold 64 maximum-sized Ethernet UDP payloads simultaneously. |
+
+**Test assessment**
+
+The tests catch useful regressions, but miss the principal failure:
+
+- **3–7:** Basic retry, replay and authentication rejection coverage is useful. However, `t[40] ^= 1` changes the **tag**, not ciphertext: with a four-byte `ping`, ciphertext occupies offsets 29–32.
+- **8:** Uses an already-live SID and endpoint. It exercises rejection under the stored key, **not** the fresh-cookie recomputation claimed by its comment.
+- **9:** Forty sequential handshakes check that issuing cookies does not evict sessions. They are not a concurrent flood or queue-pressure test.
+- **10–11:** Useful checks for authentication-before-promotion and endpoint binding.
+- **12:** `range(17)` evicts the session but never overwrites its ring entry. Add **64 subsequent promotions within the cookie window**, then replay the captured frame. Check both command execution and response encryption. Control time so expiration cannot make the test pass accidentally.
+- **13:** Checks old-client refusal, once the fixture is included. It does not test the new client against a v1 kernel, malformed replies, or adversarial reply ordering.
+
+The raw-Ethernet flood harness is useful for spoofed-source pressure and fresh-session availability. Its success metric is weaker than “one successful ping per second”:
+
+```python
+r = call(b"ping")
+...
+time.sleep(1)
+```
+
+Calls can take several seconds, so 80% success among completed attempts can conceal poor throughput and latency. It also counts locally sent packets, not packets received by the kernel. Add latency/throughput requirements, an existing-session workload, invalid authenticated-frame floods, and separate `who2` saturation runs. Neither harness covers bucket boundaries, forced cookie collisions, ring rollover, or FACS compatibility.
+
+**NIT**
+
+Update the v1-only introductory documentation and remove the false claim that a promoted session number is “never promoted again in a boot.” Also rename `who2_n`: it counts attempted replies, including failed enqueue attempts.
+
+**Rating: 6/10.** The stateless admission design and authentication ordering are good; replay-state eviction must be fixed before relying on the protocol’s security guarantees.

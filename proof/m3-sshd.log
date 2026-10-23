@@ -1,0 +1,16 @@
+Server listening on 127.0.0.1 port 2223.
+Connection from 127.0.0.1 port 50581 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 50581 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 50581 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 97313
+Attempt to write login records by non-root user (aborting)
+Starting session: forced-command (config) '/usr/bin/env -i PS1='nc110$ ' /bin/sh -i' on ttys018 for evnchn from 127.0.0.1 port 50581 id 0
+Attempt to write login records by non-root user (aborting)
+Connection closed by 127.0.0.1 port 50581
+Close session: user evnchn from 127.0.0.1 port 50581 id 0
+Transferred: sent 4660, received 3120 bytes
+Closing connection to 127.0.0.1 port 50581
+Received signal 15; terminating.

@@ -1,0 +1,1956 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a14651-d1fe-75b0-8287-b86b273cb14d
+--------
+user
+You are a sharp peer reviewer who WANTS this work to succeed. Review the staged diff in this repo (run `git diff --cached -- src tools/term_test.rs tools/sshd_config.m4`). Context: bare-metal Rust x86_64 kernel; src/term.rs is a VGA text terminal (80x25) emulating the xterm subset ncurses uses (TERM=xterm sent in the SSH pty-req), now with SGR colours, scroll regions, IL/DL/ICH/DCH, SU/SD, REP, save/restore, alternate screen 1049, DEC line drawing, DECCKM; src/kbd.rs sends xterm key sequences (arrows in app mode, F1-F12, PgUp/PgDn). Host tests in tools/term_test.rs (all pass, mutants all killed). QEMU proof ran htop and vim correctly and the grids matched pyte at 0 cells. Look for real bugs: out-of-bounds panics/slice index errors reachable from hostile remote byte streams (a panic in this kernel = abort), wrong xterm semantics that would misdraw ncurses apps, keyboard sequence errors. Rules: SIGNAL OVER VOLUME; quote exact lines; rank MUST-FIX / WORTH-IMPROVING / COSMETIC-SKIP; one line why + concrete fix each; distinguish flaws from defensible choices; most-is-sound is a valid outcome. End with a 0-10 score and the single highest-leverage fix.
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll inspect the staged diff and trace parser bounds, terminal semantics, and keyboard sequences for concrete bugs.
+exec
+/bin/zsh -lc 'git diff --cached -- src tools/term_test.rs tools/sshd_config.m4' in ~/nc110-baremetal
+ succeeded in 0ms:
+diff --git a/src/kbd.rs b/src/kbd.rs
+index 7834f05..2409dce 100644
+--- a/src/kbd.rs
++++ b/src/kbd.rs
+@@ -4,7 +4,8 @@
+ //! on the NC110 the internal keyboard sits behind the EC's i8042 emulation, which is the same 0x60/0x64
+ //! interface; its translation state is unverified until M1-on-hardware). We never reprogram the controller.
+ //! Output is what an xterm would send: Enter = CR, Backspace = DEL (0x7F), Ctrl+letter = letter & 0x1F,
+-//! arrows/Home/End/Delete as CSI sequences. US layout only. Ctrl-Alt-Del is the local escape (poll returns true).
++//! keys as TERM=xterm's terminfo expects: arrows/Home/End as ESC [ x, or ESC O x once the remote set DECCKM (CSI ?1h,
++//! ncurses' smkx); PgUp/PgDn/Insert/Delete ESC [ n ~; F1-F4 ESC O P..S; F5-F12 ESC [ 15/17/18/19/20/21/23/24 ~. US layout only. Ctrl-Alt-Del is the local escape (poll returns true).
+ //! `init` reads the controller command byte: with translation off (raw set 2) the keyboard is left disabled
+ //! rather than decoded wrongly.
+ use crate::port::inb;
+@@ -124,8 +125,8 @@ pub fn init() -> Option<u8> {
+     cfg
+ }
+ 
+-/// Translate one scancode; appends 0..4 bytes to `out` and returns how many.
+-fn translate(sc: u8, out: &mut [u8; 4]) -> usize {
++/// Translate one scancode; appends 0..8 bytes to `out` and returns how many.
++fn translate(sc: u8, out: &mut [u8; 8]) -> usize {
+     unsafe {
+         if sc == 0xE0 {
+             E0 = true;
+@@ -148,19 +149,36 @@ fn translate(sc: u8, out: &mut [u8; 4]) -> usize {
+         if brk {
+             return 0;
+         }
+-        if ext {
+-            let seq: &[u8] = match code {
+-                0x48 => b"\x1b[A",
+-                0x50 => b"\x1b[B",
+-                0x4D => b"\x1b[C",
+-                0x4B => b"\x1b[D",
+-                0x47 => b"\x1b[H",
+-                0x4F => b"\x1b[F",
+-                0x53 => b"\x1b[3~",
+-                0x1C => b"\r", // keypad Enter
+-                0x35 => b"/",  // keypad /
+-                _ => b"",
+-            };
++        let app = crate::term::app_cursor();
++        let seq: &[u8] = match (ext, code) {
++            (true, 0x48) => if app { b"\x1bOA" } else { b"\x1b[A" },
++            (true, 0x50) => if app { b"\x1bOB" } else { b"\x1b[B" },
++            (true, 0x4D) => if app { b"\x1bOC" } else { b"\x1b[C" },
++            (true, 0x4B) => if app { b"\x1bOD" } else { b"\x1b[D" },
++            (true, 0x47) => if app { b"\x1bOH" } else { b"\x1b[H" },
++            (true, 0x4F) => if app { b"\x1bOF" } else { b"\x1b[F" },
++            (true, 0x49) => b"\x1b[5~",
++            (true, 0x51) => b"\x1b[6~",
++            (true, 0x52) => b"\x1b[2~",
++            (true, 0x53) => b"\x1b[3~",
++            (true, 0x1C) => b"\r", // keypad Enter
++            (true, 0x35) => b"/",  // keypad /
++            (true, _) => b"",
++            (false, 0x3B) => b"\x1bOP",
++            (false, 0x3C) => b"\x1bOQ",
++            (false, 0x3D) => b"\x1bOR",
++            (false, 0x3E) => b"\x1bOS",
++            (false, 0x3F) => b"\x1b[15~",
++            (false, 0x40) => b"\x1b[17~",
++            (false, 0x41) => b"\x1b[18~",
++            (false, 0x42) => b"\x1b[19~",
++            (false, 0x43) => b"\x1b[20~",
++            (false, 0x44) => b"\x1b[21~",
++            (false, 0x57) => b"\x1b[23~",
++            (false, 0x58) => b"\x1b[24~",
++            _ => b"",
++        };
++        if ext || !seq.is_empty() {
+             out[..seq.len()].copy_from_slice(seq);
+             return seq.len();
+         }
+@@ -214,7 +232,7 @@ pub fn poll(buf: &mut [u8], len: &mut usize) -> bool {
+             if E0 && sc == 0x53 && (CTRL_L || CTRL_R) && (ALT_L || ALT_R) {
+                 return true;
+             }
+-            let mut tmp = [0u8; 4];
++            let mut tmp = [0u8; 8];
+             let n = translate(sc, &mut tmp);
+             if buf.len() - *len >= n {
+                 buf[*len..*len + n].copy_from_slice(&tmp[..n]);
+diff --git a/src/ssh.rs b/src/ssh.rs
+index cbc95b0..13a9e63 100644
+--- a/src/ssh.rs
++++ b/src/ssh.rs
+@@ -300,7 +300,7 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+                 }
+                 Event::Cli(CliEvent::SessionOpened(mut o)) => {
+                     let mut tn = heapless::String::new();
+-                    let _ = tn.push_str("xterm");
++                    let _ = tn.push_str("xterm"); // xterm: its terminfo advertises the subset term.rs implements (vt100 has no colour, il/dl, ich/dch or alt screen)
+                     let pty = Pty { term: tn, cols: 80, rows: 25, width: 0, height: 0, modes: heapless::Vec::new() };
+                     let rp = o.pty(pty);
+                     let rs = o.shell();
+@@ -372,7 +372,7 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+                 }
+             }
+             if drew {
+-                term::sync_cursor();
++                term::flush();
+             }
+ 
+             // keyboard -> channel (whatever does not fit now stays queued; the i8042 holds the rest)
+diff --git a/src/term.rs b/src/term.rs
+index 6e700a4..a6e7300 100644
+--- a/src/term.rs
++++ b/src/term.rs
+@@ -1,271 +1,561 @@
+-//! VGA text terminal (80x25 at 0xB8000) with the VT100/xterm subset a /bin/sh session needs:
+-//! CR LF BS TAB BEL, deferred autowrap, scrolling, CSI A B C D G d H f J K P @ X L M, ESC 7/8/M/c.
+-//! SGR (colours) and modes (?h/?l, bracketed paste) are parsed and ignored; OSC titles are swallowed;
+-//! UTF-8 multibyte characters show as one '?'. The hardware cursor follows the text cursor.
+-use crate::port::outb;
++//! VGA text terminal (80x25 at 0xB8000), the xterm subset that ncurses uses with TERM=xterm (htop, vi):
++//! CR LF BS TAB BEL SO SI, deferred autowrap (DECAWM), scroll region (CSI r) with LF/IND/RI/S/T/L/M inside it,
++//! cursor CSI A B C D E F G ` d e a H f Z, erase J K X with the current background (bce), P @ (and IRM 4h),
++//! REP (CSI b), SGR 0/1/2/22/7/27/30-37/39/40-47/49/90-97/100-107 (+38/48;5;n) -> VGA attributes,
++//! ESC 7/8 + CSI s/u + ?1048, alternate screen ?47/?1047/?1049, ?25 cursor, ?1 DECCKM (read by kbd),
++//! DEC line drawing (ESC ( 0 / ESC ) 0 + SO/SI) -> CP437 box characters, DECSTR (CSI ! p), ESC c.
++//! OSC/DCS/APC/PM/SOS strings are swallowed. UTF-8 multibyte characters show as one '?'. DSR gets no reply.
++//! The grid lives in RAM (`Term`); `flush` copies it to VGA memory and moves the hardware cursor once per batch.
++//! Host tests: `sh tools/test-term.sh`.
+ 
+-const VGA: *mut u16 = 0xB8000 as *mut u16;
+-const W: usize = 80;
+-const H: usize = 25;
+-const ATTR: u16 = 0x0700; // light grey on black (the log console before the shell is white on blue)
+-const BLANK: u16 = ATTR | b' ' as u16;
++pub const W: usize = 80;
++pub const H: usize = 25;
++const N: usize = W * H;
++const DEF_FG: u8 = 7; // light grey on black
++const BLANK: u16 = 0x0700 | b' ' as u16;
++const ANSI_TO_VGA: [u8; 8] = [0, 4, 2, 6, 1, 5, 3, 7]; // VGA swaps the red and blue bits
+ 
+ #[derive(Clone, Copy, PartialEq)]
+ enum St {
+     Ground,
+     Esc,
+-    EscSkip, // ESC ( B and friends: one charset byte follows
++    Charset(u8), // ESC ( or ESC ): one designator byte follows
++    EscSkip,     // ESC # % * + ...: one byte follows, ignored
+     Csi,
+-    Osc,
+-    OscEsc,
++    Str,    // OSC / DCS / APC / PM / SOS: swallowed until BEL or ST
++    StrEsc, // ESC seen inside a string
+ }
+ 
+-struct T {
++#[derive(Clone, Copy)]
++struct Saved {
++    row: usize,
++    col: usize,
++    wrap: bool,
++    fg: u8,
++    bg: u8,
++    bold: bool,
++    rev: bool,
++    g: [bool; 2],
++    gl: usize,
++}
++const SAVED0: Saved = Saved { row: 0, col: 0, wrap: false, fg: DEF_FG, bg: 0, bold: false, rev: false, g: [false; 2], gl: 0 };
++
++pub struct Term {
++    cells: [u16; N],
++    other: [u16; N], // the inactive screen (main while the alternate one is shown)
++    alt: bool,
+     row: usize,
+     col: usize,
+     wrap: bool, // deferred wrap: last column written, next printable goes to the next line
+     st: St,
+-    p: [u16; 8],
++    p: [u16; 16],
+     np: usize,
+     private: bool,
+-    saved: (usize, usize),
++    inter: u8, // CSI intermediate byte (0 = none)
++    fg: u8,    // VGA colour 0..15
++    bg: u8,    // VGA colour 0..7 (bit 7 of the attribute is blink)
++    bold: bool,
++    rev: bool,
++    g: [bool; 2], // G0/G1 designated as DEC special graphics
++    gl: usize,    // 0 = G0 (SI), 1 = G1 (SO)
++    top: usize,
++    bot: usize,
++    saved: Saved,
++    last: u8, // last printable byte, for REP
++    cursor_on: bool,
++    app_cursor: bool,
++    insert: bool,
++    autowrap: bool,
+ }
+ 
+-static mut T: T = T { row: 0, col: 0, wrap: false, st: St::Ground, p: [0; 8], np: 0, private: false, saved: (0, 0) };
++impl Term {
++    pub const fn new() -> Term {
++        Term {
++            cells: [BLANK; N],
++            other: [BLANK; N],
++            alt: false,
++            row: 0,
++            col: 0,
++            wrap: false,
++            st: St::Ground,
++            p: [0; 16],
++            np: 0,
++            private: false,
++            inter: 0,
++            fg: DEF_FG,
++            bg: 0,
++            bold: false,
++            rev: false,
++            g: [false; 2],
++            gl: 0,
++            top: 0,
++            bot: H - 1,
++            saved: SAVED0,
++            last: b' ',
++            cursor_on: true,
++            app_cursor: false,
++            insert: false,
++            autowrap: true,
++        }
++    }
+ 
+-fn put(r: usize, c: usize, v: u16) {
+-    unsafe { VGA.add(r * W + c).write_volatile(v) }
+-}
+-fn get(r: usize, c: usize) -> u16 {
+-    unsafe { VGA.add(r * W + c).read_volatile() }
+-}
+-fn clear_range(from: usize, to: usize) {
+-    for i in from..to {
+-        unsafe { VGA.add(i).write_volatile(BLANK) }
++    #[cfg_attr(not(test), allow(dead_code))]
++    pub fn cell(&self, r: usize, c: usize) -> u16 {
++        self.cells[r * W + c]
+     }
+-}
+-fn scroll_up(top: usize) {
+-    for r in top..H - 1 {
+-        for c in 0..W {
+-            put(r, c, get(r + 1, c));
+-        }
++    #[cfg_attr(not(test), allow(dead_code))]
++    pub fn cursor(&self) -> (usize, usize) {
++        (self.row, self.col.min(W - 1))
+     }
+-    clear_range((H - 1) * W, H * W);
+-}
+-fn scroll_down(top: usize) {
+-    for r in (top + 1..H).rev() {
+-        for c in 0..W {
+-            put(r, c, get(r - 1, c));
+-        }
++    #[cfg_attr(not(test), allow(dead_code))]
++    pub fn cursor_visible(&self) -> bool {
++        self.cursor_on
+     }
+-    clear_range(top * W, top * W + W);
+-}
+-
+-fn hw_cursor(t: &T) {
+-    let pos = (t.row * W + t.col.min(W - 1)) as u16;
+-    unsafe {
+-        outb(0x3D4, 0x0A);
+-        outb(0x3D5, 13); // cursor scanlines 13..14, enabled
+-        outb(0x3D4, 0x0B);
+-        outb(0x3D5, 14);
+-        outb(0x3D4, 0x0F);
+-        outb(0x3D5, pos as u8);
+-        outb(0x3D4, 0x0E);
+-        outb(0x3D5, (pos >> 8) as u8);
++    pub fn app_cursor(&self) -> bool {
++        self.app_cursor
+     }
+-}
+ 
+-/// Take over the screen: clear it and home the cursor.
+-pub fn init() {
+-    clear_range(0, W * H);
+-    unsafe {
+-        let t = &mut *core::ptr::addr_of_mut!(T);
+-        *t = T { row: 0, col: 0, wrap: false, st: St::Ground, p: [0; 8], np: 0, private: false, saved: (0, 0) };
+-        hw_cursor(t);
++    fn attr(&self) -> u16 {
++        let (mut f, mut b) = (self.fg | if self.bold { 8 } else { 0 }, self.bg);
++        if self.rev {
++            (f, b) = (b, f & 7);
++        }
++        ((b as u16) << 12) | ((f as u16) << 8)
+     }
+-}
+-
+-fn lf(t: &mut T) {
+-    if t.row == H - 1 {
+-        scroll_up(0);
+-    } else {
+-        t.row += 1;
++    fn blank(&self) -> u16 {
++        self.attr() | b' ' as u16 // bce: erased cells take the current background
+     }
+-}
+-
+-fn arg(t: &T, i: usize, def: u16) -> usize {
+-    let v = if i < t.np { t.p[i] } else { 0 };
+-    (if v == 0 { def } else { v }) as usize
+-}
+-
+-fn csi(t: &mut T, f: u8) {
+-    if t.private {
+-        return; // ?25h/l, ?2004h/l, ?1h ... : modes we do not model
++    fn fill(&mut self, from: usize, to: usize) {
++        let b = self.blank();
++        self.cells[from.min(N)..to.min(N)].fill(b);
+     }
+-    if !matches!(f, b'A' | b'B' | b'e' | b'C' | b'a' | b'D' | b'G' | b'`' | b'd' | b'H' | b'f' | b'J' | b'K' | b'P' | b'@' | b'X' | b'L' | b'M') {
+-        return; // 'm' (SGR), 'r', 'h'/'l', 'n' (DSR: no reply), ...: ignored, and they keep a pending wrap
++    /// Scroll rows top..=bot by n, up (content moves up, blank rows at the bottom) or down.
++    fn scroll(&mut self, top: usize, bot: usize, n: usize, up: bool) {
++        let n = n.min(bot + 1 - top);
++        if up {
++            self.cells.copy_within((top + n) * W..(bot + 1) * W, top * W);
++            self.fill((bot + 1 - n) * W, (bot + 1) * W);
++        } else {
++            self.cells.copy_within(top * W..(bot + 1 - n) * W, (top + n) * W);
++            self.fill(top * W, (top + n) * W);
++        }
+     }
+-    let n = arg(t, 0, 1);
+-    match f {
+-        b'A' => t.row = t.row.saturating_sub(n),
+-        b'B' | b'e' => t.row = (t.row + n).min(H - 1),
+-        b'C' | b'a' => t.col = (t.col + n).min(W - 1),
+-        b'D' => t.col = t.col.saturating_sub(n),
+-        b'G' | b'`' => t.col = (n - 1).min(W - 1),
+-        b'd' => t.row = (n - 1).min(H - 1),
+-        b'H' | b'f' => {
+-            t.row = (arg(t, 0, 1) - 1).min(H - 1);
+-            t.col = (arg(t, 1, 1) - 1).min(W - 1);
++    fn lf(&mut self) {
++        if self.row == self.bot {
++            self.scroll(self.top, self.bot, 1, true);
++        } else if self.row < H - 1 {
++            self.row += 1;
+         }
+-        b'J' => {
+-            let cur = t.row * W + t.col;
+-            match arg(t, 0, 0) {
+-                0 => clear_range(cur, W * H),
+-                1 => clear_range(0, cur + 1),
+-                _ => clear_range(0, W * H),
+-            }
++    }
++    fn ri(&mut self) {
++        if self.row == self.top {
++            self.scroll(self.top, self.bot, 1, false);
++        } else if self.row > 0 {
++            self.row -= 1;
+         }
+-        b'K' => {
+-            let s = t.row * W;
+-            match arg(t, 0, 0) {
+-                0 => clear_range(s + t.col, s + W),
+-                1 => clear_range(s, s + t.col + 1),
+-                _ => clear_range(s, s + W),
++    }
++    fn save(&mut self) {
++        self.saved = Saved { row: self.row, col: self.col, wrap: self.wrap, fg: self.fg, bg: self.bg, bold: self.bold, rev: self.rev, g: self.g, gl: self.gl };
++    }
++    fn restore(&mut self) {
++        let s = self.saved;
++        (self.row, self.col, self.wrap, self.fg, self.bg, self.bold, self.rev, self.g, self.gl) = (s.row, s.col, s.wrap, s.fg, s.bg, s.bold, s.rev, s.g, s.gl);
++    }
++    fn set_alt(&mut self, on: bool, clear: bool) {
++        if on != self.alt {
++            core::mem::swap(&mut self.cells, &mut self.other);
++            self.alt = on;
++            if on && clear {
++                self.fill(0, N);
+             }
+         }
+-        b'P' => {
+-            // delete n chars, shift the rest of the line left
+-            let n = n.min(W - t.col);
+-            for c in t.col..W {
+-                put(t.row, c, if c + n < W { get(t.row, c + n) } else { BLANK });
+-            }
++    }
++    /// DECSTR soft reset: modes, attributes, margins and charsets; the screen is kept.
++    fn soft_reset(&mut self) {
++        (self.fg, self.bg, self.bold, self.rev, self.g, self.gl) = (DEF_FG, 0, false, false, [false; 2], 0);
++        (self.top, self.bot, self.insert, self.autowrap, self.app_cursor, self.cursor_on) = (0, H - 1, false, true, false, true);
++        self.saved = SAVED0;
++    }
++    /// RIS (ESC c), in place (no 8 KiB temporary on the kernel stack): main screen, cleared, cursor home.
++    pub fn reset(&mut self) {
++        self.set_alt(false, false);
++        self.soft_reset();
++        self.fill(0, N);
++        self.other.fill(BLANK);
++        (self.row, self.col, self.wrap, self.st, self.last) = (0, 0, false, St::Ground, b' ');
++    }
++
++    fn print(&mut self, b: u8) {
++        let ch = if self.g[self.gl] && (0x5F..=0x7E).contains(&b) {
++            DEC_GRAPHICS[(b - 0x5F) as usize]
++        } else if b >= 0x80 {
++            b'?'
++        } else {
++            b
++        };
++        if self.wrap {
++            self.col = 0;
++            self.lf();
++            self.wrap = false;
+         }
+-        b'@' => {
+-            let n = n.min(W - t.col);
+-            for c in (t.col..W).rev() {
+-                put(t.row, c, if c >= t.col + n { get(t.row, c - n) } else { BLANK });
+-            }
++        let s = self.row * W;
++        if self.insert {
++            self.cells.copy_within(s + self.col..s + W - 1, s + self.col + 1);
+         }
+-        b'X' => {
+-            let s = t.row * W + t.col;
+-            clear_range(s, s + n.min(W - t.col));
++        self.cells[s + self.col] = self.attr() | ch as u16;
++        self.last = b;
++        if self.col == W - 1 {
++            self.wrap = self.autowrap;
++        } else {
++            self.col += 1;
+         }
+-        b'L' => {
+-            for _ in 0..n.min(H - t.row) {
+-                scroll_down(t.row);
++    }
++
++    fn arg(&self, i: usize, def: u16) -> usize {
++        let v = if i < self.np { self.p[i] } else { 0 };
++        (if v == 0 { def } else { v }) as usize
++    }
++
++    fn sgr(&mut self) {
++        let np = self.np.max(1).min(self.p.len());
++        let mut i = 0;
++        while i < np {
++            let v = self.p[i];
++            match v {
++                0 => (self.fg, self.bg, self.bold, self.rev) = (DEF_FG, 0, false, false),
++                1 => self.bold = true,
++                22 => self.bold = false,
++                7 => self.rev = true,
++                27 => self.rev = false,
++                30..=37 => self.fg = ANSI_TO_VGA[(v - 30) as usize],
++                39 => self.fg = DEF_FG,
++                40..=47 => self.bg = ANSI_TO_VGA[(v - 40) as usize],
++                49 => self.bg = 0,
++                90..=97 => self.fg = ANSI_TO_VGA[(v - 90) as usize] | 8,
++                100..=107 => self.bg = ANSI_TO_VGA[(v - 100) as usize],
++                38 | 48 => {
++                    let sub = if i + 1 < np { self.p[i + 1] } else { 0 };
++                    if sub == 5 && i + 2 < np {
++                        let n = self.p[i + 2];
++                        if n < 16 {
++                            let c = ANSI_TO_VGA[(n & 7) as usize];
++                            if v == 38 {
++                                self.fg = c | if n >= 8 { 8 } else { 0 };
++                            } else {
++                                self.bg = c;
++                            }
++                        }
++                        i += 2;
++                    } else if sub == 2 {
++                        i += 4; // truecolour: not representable, skipped
++                    }
++                }
++                _ => {} // 2 dim, 4 underline, 5 blink, 8 invisible, 3/23 italic, ...: no VGA equivalent
+             }
++            i += 1;
+         }
+-        b'M' => {
+-            for _ in 0..n.min(H - t.row) {
+-                scroll_up(t.row);
++    }
++
++    fn mode(&mut self, on: bool) {
++        for i in 0..self.np.min(self.p.len()) {
++            match (self.private, self.p[i]) {
++                (false, 4) => self.insert = on,
++                (true, 1) => self.app_cursor = on,
++                (true, 7) => {
++                    self.autowrap = on;
++                    self.wrap = false;
++                }
++                (true, 25) => self.cursor_on = on,
++                (true, 47) => self.set_alt(on, false),
++                (true, 1047) => self.set_alt(on, true),
++                (true, 1048) => {
++                    if on {
++                        self.save()
++                    } else {
++                        self.restore()
++                    }
++                }
++                (true, 1049) => {
++                    if on {
++                        self.save();
++                        self.set_alt(true, true);
++                    } else {
++                        self.set_alt(false, false);
++                        self.restore();
++                    }
++                }
++                _ => {} // ?12 blink, ?1000.. mouse, ?2004 paste, 20 LNM, ...: not modelled
+             }
+         }
+-        _ => {}
+     }
+-    t.wrap = false;
+-}
+ 
+-/// Feed one byte of the remote's output.
+-pub fn feed(b: u8) {
+-    let t = unsafe { &mut *core::ptr::addr_of_mut!(T) };
+-    match t.st {
+-        St::Ground => match b {
+-            0x1B => t.st = St::Esc,
+-            b'\r' => {
+-                t.col = 0;
+-                t.wrap = false;
++    fn csi(&mut self, f: u8) {
++        if self.inter != 0 {
++            if self.inter == b'!' && f == b'p' {
++                self.soft_reset();
+             }
+-            b'\n' | 0x0B | 0x0C => {
+-                lf(t);
+-                t.wrap = false;
++            return; // CSI SP q (cursor style), CSI " q, ...: ignored
++        }
++        if f == b'h' || f == b'l' {
++            return self.mode(f == b'h');
++        }
++        if self.private {
++            return; // CSI ? s/r (save/restore modes), CSI > c, CSI > 4;2 m, CSI ? u, ...
++        }
++        let n = self.arg(0, 1);
++        let (row, col) = (self.row, self.col);
++        match f {
++            b'm' => return self.sgr(),
++            b'b' => {
++                for _ in 0..n.min(N) {
++                    self.print(self.last);
++                }
++                return;
+             }
+-            0x08 => {
+-                t.col = t.col.saturating_sub(1);
+-                t.wrap = false;
++            b'A' | b'F' => self.row = if row >= self.top { row.saturating_sub(n).max(self.top) } else { row.saturating_sub(n) },
++            b'B' | b'e' | b'E' => self.row = if row <= self.bot { (row + n).min(self.bot) } else { (row + n).min(H - 1) },
++            b'C' | b'a' => self.col = (col + n).min(W - 1),
++            b'D' => self.col = col.min(W - 1).saturating_sub(n),
++            b'G' | b'`' => self.col = (n - 1).min(W - 1),
++            b'd' => self.row = (n - 1).min(H - 1),
++            b'H' | b'f' => {
++                self.row = (self.arg(0, 1) - 1).min(H - 1);
++                self.col = (self.arg(1, 1) - 1).min(W - 1);
+             }
+-            b'\t' => t.col = ((t.col + 8) & !7).min(W - 1),
+-            0x80..=0xBF => {} // UTF-8 continuation byte
+-            _ if b < 0x20 || b == 0x7F => {} // BEL and other controls
+-            _ => {
+-                if t.wrap {
+-                    t.col = 0;
+-                    lf(t);
+-                    t.wrap = false;
+-                }
+-                let ch = if b >= 0x80 { b'?' } else { b };
+-                put(t.row, t.col, ATTR | ch as u16);
+-                if t.col == W - 1 {
+-                    t.wrap = true;
+-                } else {
+-                    t.col += 1;
++            b'Z' => {
++                for _ in 0..n.min(W) {
++                    self.col = self.col.min(W - 1).saturating_sub(1) & !7;
+                 }
+             }
+-        },
+-        St::Esc => {
+-            t.st = St::Ground;
+-            match b {
+-                b'[' => {
+-                    t.st = St::Csi;
+-                    t.p = [0; 8];
+-                    t.np = 0;
+-                    t.private = false;
++            b'J' => {
++                let cur = row * W + col.min(W - 1);
++                match self.arg(0, 0) {
++                    0 => self.fill(cur, N),
++                    1 => self.fill(0, cur + 1),
++                    _ => self.fill(0, N),
+                 }
+-                b']' => t.st = St::Osc,
+-                b'(' | b')' | b'*' | b'+' | b'#' | b'%' => t.st = St::EscSkip,
+-                b'7' => t.saved = (t.row, t.col),
+-                b'8' => (t.row, t.col) = t.saved,
+-                b'D' => lf(t),
+-                b'E' => {
+-                    t.col = 0;
+-                    lf(t);
++            }
++            b'K' => {
++                let (s, c) = (row * W, col.min(W - 1));
++                match self.arg(0, 0) {
++                    0 => self.fill(s + c, s + W),
++                    1 => self.fill(s, s + c + 1),
++                    _ => self.fill(s, s + W),
+                 }
+-                b'M' => {
+-                    if t.row == 0 {
+-                        scroll_down(0);
+-                    } else {
+-                        t.row -= 1;
++            }
++            b'P' | b'@' | b'X' => {
++                let (s, c) = (row * W, col.min(W - 1));
++                let n = n.min(W - c);
++                match f {
++                    b'P' => {
++                        self.cells.copy_within(s + c + n..s + W, s + c);
++                        self.fill(s + W - n, s + W);
++                    }
++                    b'@' => {
++                        self.cells.copy_within(s + c..s + W - n, s + c + n);
++                        self.fill(s + c, s + c + n);
+                     }
++                    _ => self.fill(s + c, s + c + n),
+                 }
+-                b'c' => init(),
+-                _ => {} // '=', '>', ...
+             }
+-        }
+-        St::EscSkip => t.st = St::Ground,
+-        St::Csi => match b {
+-            b'0'..=b'9' => {
+-                if t.np == 0 {
+-                    t.np = 1;
++            b'L' | b'M' => {
++                if row >= self.top && row <= self.bot {
++                    self.scroll(row, self.bot, n, f == b'M');
++                    self.col = 0;
+                 }
+-                let i = t.np - 1;
+-                if i < t.p.len() {
+-                    t.p[i] = t.p[i].saturating_mul(10).saturating_add((b - b'0') as u16);
++            }
++            b'S' => self.scroll(self.top, self.bot, n, true),
++            b'T' if self.np <= 1 => self.scroll(self.top, self.bot, n, false),
++            b'r' => {
++                let (t, b) = (self.arg(0, 1) - 1, self.arg(1, H as u16).min(H) - 1);
++                if t < b {
++                    (self.top, self.bot, self.row, self.col) = (t, b, 0, 0);
+                 }
+             }
+-            b';' => {
+-                if t.np == 0 {
+-                    t.np = 1;
++            b's' => self.save(),
++            b'u' => self.restore(),
++            _ => return, // 'n' (DSR: no reply), 't' (window ops), 'c' (DA), 'g' (tabs), ...: ignored, keep a pending wrap
++        }
++        if f != b'u' {
++            self.wrap = false;
++        }
++        if matches!(f, b'E' | b'F') {
++            self.col = 0;
++        }
++    }
++
++    pub fn feed(&mut self, b: u8) {
++        match self.st {
++            St::Ground => match b {
++                0x1B => self.st = St::Esc,
++                b'\r' => {
++                    self.col = 0;
++                    self.wrap = false;
++                }
++                b'\n' | 0x0B | 0x0C => {
++                    self.lf();
++                    self.wrap = false;
++                }
++                0x08 => {
++                    self.col = self.col.min(W - 1).saturating_sub(1);
++                    self.wrap = false;
++                }
++                b'\t' => self.col = ((self.col + 8) & !7).min(W - 1),
++                0x0E => self.gl = 1,
++                0x0F => self.gl = 0,
++                0x80..=0xBF => {} // UTF-8 continuation byte
++                _ if b < 0x20 || b == 0x7F => {} // BEL and other controls
++                _ => self.print(b),
++            },
++            St::Esc => {
++                self.st = St::Ground;
++                match b {
++                    b'[' => {
++                        self.st = St::Csi;
++                        (self.p, self.np, self.private, self.inter) = ([0; 16], 0, false, 0);
++                    }
++                    b']' | b'P' | b'_' | b'^' | b'X' => self.st = St::Str,
++                    b'(' => self.st = St::Charset(0),
++                    b')' => self.st = St::Charset(1),
++                    b'*' | b'+' | b'-' | b'.' | b'/' | b'#' | b'%' | b' ' => self.st = St::EscSkip,
++                    b'7' => self.save(),
++                    b'8' => self.restore(),
++                    b'D' => self.lf(),
++                    b'E' => {
++                        self.col = 0;
++                        self.lf();
++                    }
++                    b'M' => self.ri(),
++                    b'c' => self.reset(),
++                    0x1B => self.st = St::Esc,
++                    _ => {} // '=', '>' (keypad modes), 'H' (tab set), ...
++                }
++                if matches!(b, b'D' | b'E' | b'M') {
++                    self.wrap = false;
+                 }
+-                t.np += 1;
+             }
+-            b'?' | b'>' | b'<' | b'=' => t.private = true,
+-            0x20..=0x2F => {} // intermediates
+-            0x40..=0x7E => {
+-                t.st = St::Ground;
+-                csi(t, b);
++            St::Charset(i) => {
++                self.g[i as usize] = b == b'0';
++                self.st = St::Ground;
+             }
+-            0x1B => t.st = St::Esc,
+-            _ => {} // controls inside CSI: ignored
+-        },
+-        St::Osc => match b {
+-            0x07 => t.st = St::Ground,
+-            0x1B => t.st = St::OscEsc,
+-            _ => {}
+-        },
+-        St::OscEsc => t.st = if b == b'\\' { St::Ground } else { St::Osc },
++            St::EscSkip => self.st = St::Ground,
++            St::Csi => match b {
++                b'0'..=b'9' => {
++                    if self.np == 0 {
++                        self.np = 1;
++                    }
++                    if let Some(v) = self.p.get_mut(self.np - 1) {
++                        *v = v.saturating_mul(10).saturating_add((b - b'0') as u16);
++                    }
++                }
++                b';' | b':' => self.np = self.np.max(1) + 1,
++                b'?' | b'>' | b'<' | b'=' => self.private = true,
++                0x20..=0x2F => self.inter = b,
++                0x40..=0x7E => {
++                    self.st = St::Ground;
++                    self.csi(b);
++                }
++                0x1B => self.st = St::Esc,
++                _ => {} // controls inside CSI: ignored
++            },
++            St::Str => match b {
++                0x07 => self.st = St::Ground,
++                0x1B => self.st = St::StrEsc,
++                _ => {}
++            },
++            St::StrEsc => self.st = if b == b'\\' { St::Ground } else { St::Str },
++        }
++    }
++}
++
++/// DEC special graphics 0x5F..0x7E -> CP437. Glyphs CP437 lacks fall back to the nearest one.
++const DEC_GRAPHICS: [u8; 32] = [
++    b' ', // _ blank
++    0x04, // ` diamond
++    0xB1, // a checkerboard
++    b' ', // b HT symbol
++    b' ', // c FF symbol
++    b' ', // d CR symbol
++    b' ', // e LF symbol
++    0xF8, // f degree
++    0xF1, // g plus/minus
++    b' ', // h NL symbol
++    b' ', // i VT symbol
++    0xD9, // j lower right corner
++    0xBF, // k upper right corner
++    0xDA, // l upper left corner
++    0xC0, // m lower left corner
++    0xC5, // n crossing lines
++    0xC4, // o scan line 1
++    0xC4, // p scan line 3
++    0xC4, // q horizontal line (scan line 5)
++    0xC4, // r scan line 7
++    b'_', // s scan line 9
++    0xC3, // t left tee
++    0xB4, // u right tee
++    0xC1, // v bottom tee
++    0xC2, // w top tee
++    0xB3, // x vertical line
++    0xF3, // y less-or-equal
++    0xF2, // z greater-or-equal
++    0xE3, // { pi
++    b'#', // | not-equal (none in CP437)
++    0x9C, // } pound sign
++    0xFA, // ~ centred dot
++];
++
++#[cfg(not(test))]
++mod hw {
++    use super::{Term, N, W};
++    use crate::port::outb;
++
++    const VGA: *mut u16 = 0xB8000 as *mut u16;
++    static mut TERM: Term = Term::new();
++
++    pub fn t() -> &'static mut Term {
++        unsafe { &mut *core::ptr::addr_of_mut!(TERM) }
+     }
++
++    pub fn flush() {
++        let t = t();
++        for i in 0..N {
++            unsafe { VGA.add(i).write_volatile(t.cells[i]) }
++        }
++        let pos = (t.row * W + t.col.min(W - 1)) as u16;
++        unsafe {
++            outb(0x3D4, 0x0A);
++            outb(0x3D5, if t.cursor_on { 13 } else { 0x20 }); // scanlines 13..14; bit 5 = cursor off
++            outb(0x3D4, 0x0B);
++            outb(0x3D5, 14);
++            outb(0x3D4, 0x0F);
++            outb(0x3D5, pos as u8);
++            outb(0x3D4, 0x0E);
++            outb(0x3D5, (pos >> 8) as u8);
++        }
++    }
++}
++
++/// Take over the screen: reset the terminal, clear the screen, home the cursor.
++#[cfg(not(test))]
++pub fn init() {
++    hw::t().reset();
++    hw::flush();
++}
++
++/// Feed one byte of the remote's output (drawn on the next `flush`).
++#[cfg(not(test))]
++pub fn feed(b: u8) {
++    hw::t().feed(b);
++}
++
++/// Copy the grid to VGA memory and move the hardware cursor (once per batch of output, not per byte).
++#[cfg(not(test))]
++pub fn flush() {
++    hw::flush();
+ }
+ 
+-/// Move the hardware cursor to the text cursor (once per batch of output, not per byte).
+-pub fn sync_cursor() {
+-    hw_cursor(unsafe { &*core::ptr::addr_of!(T) });
++/// DECCKM (CSI ?1h): the keyboard sends ESC O A.. for arrows instead of ESC [ A..
++#[cfg(not(test))]
++pub fn app_cursor() -> bool {
++    hw::t().app_cursor()
+ }
+diff --git a/tools/sshd_config.m4 b/tools/sshd_config.m4
+new file mode 100644
+index 0000000..9c4b51b
+--- /dev/null
++++ b/tools/sshd_config.m4
+@@ -0,0 +1,18 @@
++ListenAddress 127.0.0.1:2223
++HostKey ~/nc110-baremetal/test-keys/host_ed25519
++HostKeyAlgorithms ssh-ed25519
++KexAlgorithms curve25519-sha256
++Ciphers chacha20-poly1305@openssh.com
++PubkeyAcceptedAlgorithms ssh-ed25519
++AuthorizedKeysFile ~/nc110-baremetal/test-keys/authorized_keys
++AuthenticationMethods publickey
++PubkeyAuthentication yes
++PasswordAuthentication no
++KbdInteractiveAuthentication no
++UsePAM no
++StrictModes no
++PermitRootLogin no
++AllowUsers evnchn
++ForceCommand /usr/bin/env -i TERM="$TERM" HOME=/tmp/nc110-m4-home PS1='nc110$ ' /bin/sh -i
++PidFile ~/nc110-baremetal/test-keys/sshd-m4.pid
++LogLevel VERBOSE
+diff --git a/tools/term_test.rs b/tools/term_test.rs
+new file mode 100644
+index 0000000..12af374
+--- /dev/null
++++ b/tools/term_test.rs
+@@ -0,0 +1,221 @@
++//! Host-side tests for src/term.rs: feed byte strings, assert the 80x25 cell grid (char + VGA attribute).
++//! Run: sh tools/test-term.sh  (also runs tools/term-mutants.py: each feature's stub must turn a test red).
++#[path = "../src/term.rs"]
++#[allow(dead_code)]
++mod term;
++
++use term::{Term, H, W};
++
++fn run(s: &[u8]) -> Box<Term> {
++    let mut t = Box::new(Term::new());
++    for &b in s {
++        t.feed(b);
++    }
++    t
++}
++fn row(t: &Term, r: usize) -> String {
++    (0..W).map(|c| (t.cell(r, c) & 0xFF) as u8 as char).collect::<String>().trim_end().to_string()
++}
++fn attr(t: &Term, r: usize, c: usize) -> u8 {
++    (t.cell(r, c) >> 8) as u8
++}
++/// Rows 0..n labelled "r0".."rN" via CUP, so scroll tests can see which row moved where.
++fn labelled(n: usize) -> Vec<u8> {
++    let mut v = Vec::new();
++    for r in 0..n {
++        v.extend(format!("\x1b[{};1Hr{}", r + 1, r).bytes());
++    }
++    v
++}
++fn with(a: Vec<u8>, b: &[u8]) -> Vec<u8> {
++    let mut a = a;
++    a.extend_from_slice(b);
++    a
++}
++
++#[test]
++fn sgr_colours_map_to_vga() {
++    let t = run(b"\x1b[31mR\x1b[1;32mG\x1b[0;44mB\x1b[93mY\x1b[39;49mD\x1b[100mE");
++    assert_eq!(row(&t, 0), "RGBYDE");
++    assert_eq!(attr(&t, 0, 0), 0x04, "31 red -> VGA 4");
++    assert_eq!(attr(&t, 0, 1), 0x0A, "1;32 bold green -> bright green");
++    assert_eq!(attr(&t, 0, 2), 0x17, "0;44 grey on blue");
++    assert_eq!(attr(&t, 0, 3), 0x1E, "93 bright yellow keeps bg");
++    assert_eq!(attr(&t, 0, 4), 0x07, "39;49 default");
++    assert_eq!(attr(&t, 0, 5), 0x07, "100 folds onto bg 0 (black), never sets the blink bit");
++}
++
++#[test]
++fn sgr_256_and_private_m_do_not_misparse() {
++    let t = run(b"\x1b[38;5;4mA\x1b[0m\x1b[>4;2mB\x1b[38;2;255;0;0;1mC");
++    assert_eq!(attr(&t, 0, 0), 0x01, "38;5;4 -> blue");
++    assert_eq!(attr(&t, 0, 1), 0x07, "CSI > 4;2 m is modifyOtherKeys, not SGR");
++    assert_eq!(attr(&t, 0, 2), 0x0F, "truecolour skipped, the trailing 1 (bold) still applies");
++    assert_eq!(row(&run(b"keep\x1b[?2J\x1b[?1K"), 0), "keep", "DECSED/DECSEL (private) are not ED/EL");
++}
++
++#[test]
++fn reverse_video() {
++    let t = run(b"\x1b[31;7mX\x1b[27mY\x1b[0;7mZ");
++    assert_eq!(attr(&t, 0, 0), 0x40, "red reversed: black on red");
++    assert_eq!(attr(&t, 0, 1), 0x04);
++    assert_eq!(attr(&t, 0, 2), 0x70, "default reversed: black on grey");
++}
++
++#[test]
++fn erase_uses_current_background_bce() {
++    let t = run(b"\x1b[44m\x1b[2J\x1b[41mAB\x1b[1D\x1b[K");
++    assert_eq!(attr(&t, 10, 10), 0x17, "ED 2 fills with blue background");
++    assert_eq!(attr(&t, 0, 0), 0x47);
++    assert_eq!(attr(&t, 0, 1), 0x47, "EL from the cursor fills with red background");
++    assert_eq!(attr(&t, 0, 79), 0x47);
++    assert_eq!(row(&t, 0), "A");
++}
++
++#[test]
++fn scroll_region_lf_scrolls_only_the_region() {
++    let t = run(&with(labelled(6), b"\x1b[2;4r\x1b[4;1H\n"));
++    assert_eq!((row(&t, 0), row(&t, 1), row(&t, 2), row(&t, 3), row(&t, 4)), ("r0".into(), "r2".into(), "r3".into(), "".into(), "r4".into()));
++    assert_eq!(t.cursor(), (3, 0));
++}
++
++#[test]
++fn decstbm_homes_the_cursor() {
++    let t = run(b"\x1b[10;10H\x1b[3;20r");
++    assert_eq!(t.cursor(), (0, 0));
++}
++
++#[test]
++fn reverse_index_at_region_top_scrolls_region_down() {
++    let t = run(&with(labelled(6), b"\x1b[2;4r\x1b[2;1H\x1bM"));
++    assert_eq!((row(&t, 0), row(&t, 1), row(&t, 2), row(&t, 3), row(&t, 4)), ("r0".into(), "".into(), "r1".into(), "r2".into(), "r4".into()));
++}
++
++#[test]
++fn insert_delete_line_stay_inside_region() {
++    let t = run(&with(labelled(6), b"\x1b[2;4r\x1b[3;5H\x1b[L"));
++    assert_eq!((row(&t, 1), row(&t, 2), row(&t, 3), row(&t, 4)), ("r1".into(), "".into(), "r2".into(), "r4".into()));
++    assert_eq!(t.cursor(), (2, 0), "IL moves to column 0");
++    let t = run(&with(labelled(6), b"\x1b[2;4r\x1b[2;1H\x1b[2M"));
++    assert_eq!((row(&t, 1), row(&t, 2), row(&t, 3), row(&t, 4)), ("r3".into(), "".into(), "".into(), "r4".into()));
++}
++
++#[test]
++fn scroll_up_down_su_sd() {
++    let t = run(&with(labelled(4), b"\x1b[2S"));
++    assert_eq!((row(&t, 0), row(&t, 1), row(&t, 2)), ("r2".into(), "r3".into(), "".into()));
++    let t = run(&with(labelled(4), b"\x1b[T"));
++    assert_eq!((row(&t, 0), row(&t, 1), row(&t, 4)), ("".into(), "r0".into(), "r3".into()));
++}
++
++#[test]
++fn insert_delete_char() {
++    let t = run(b"ABCDE\x1b[1;2H\x1b[2@");
++    assert_eq!(row(&t, 0), "A  BCDE");
++    let t = run(b"ABCDE\x1b[1;2H\x1b[2P");
++    assert_eq!(row(&t, 0), "ADE");
++    let t = run(b"ABCDE\r\x1b[4hX");
++    assert_eq!(row(&t, 0), "XABCDE", "IRM insert mode");
++}
++
++#[test]
++fn save_restore_cursor_and_attributes() {
++    let t = run(b"\x1b[5;10H\x1b[32m\x1b7\x1b[1;1H\x1b[0mX\x1b8Y");
++    assert_eq!((t.cell(4, 9) & 0xFF) as u8, b'Y');
++    assert_eq!(attr(&t, 4, 9), 0x02, "ESC 8 restores the SGR state");
++    let t = run(b"\x1b[3;3H\x1b[s\x1b[9;9H\x1b[uZ");
++    assert_eq!(row(&t, 2), "  Z", "CSI s/u");
++}
++
++#[test]
++fn alternate_screen_1049_restores_main_grid_and_cursor() {
++    let mut t = run(b"main\x1b[3;3H\x1b[?1049h");
++    assert_eq!(row(&t, 0), "", "alternate screen starts clear");
++    for &b in b"ALT\x1b[10;10Hjunk" {
++        t.feed(b);
++    }
++    for &b in b"\x1b[?1049l" {
++        t.feed(b);
++    }
++    assert_eq!(row(&t, 0), "main");
++    assert_eq!(row(&t, 2), "", "nothing drawn on the alternate screen leaks");
++    assert_eq!(row(&t, 9), "");
++    assert_eq!(t.cursor(), (2, 2));
++}
++
++#[test]
++fn cursor_visibility() {
++    assert!(!run(b"\x1b[?25l").cursor_visible());
++    assert!(run(b"\x1b[?25l\x1b[?12l\x1b[?25h").cursor_visible());
++}
++
++#[test]
++fn dec_line_drawing_to_cp437() {
++    let t = run(b"\x1b(0lqkx\x1b(Bq");
++    let cells: Vec<u8> = (0..5).map(|c| (t.cell(0, c) & 0xFF) as u8).collect();
++    assert_eq!(cells, [0xDA, 0xC4, 0xBF, 0xB3, b'q']);
++    let t = run(b"\x1b)0\x0eq\x0fq");
++    assert_eq!(((t.cell(0, 0) & 0xFF) as u8, (t.cell(0, 1) & 0xFF) as u8), (0xC4, b'q'), "G1 via SO/SI");
++}
++
++#[test]
++fn rep_repeats_last_char() {
++    let t = run(b"\x1b[32m-\x1b[4b|");
++    assert_eq!(row(&t, 0), "-----|");
++    assert_eq!(attr(&t, 0, 4), 0x02);
++}
++
++#[test]
++fn dcs_and_osc_are_swallowed() {
++    let t = run(b"\x1bP+q544e\x1b\\\x1b]11;?\x07\x1b_apc\x1b\\X");
++    assert_eq!(row(&t, 0), "X");
++}
++
++#[test]
++fn decckm_for_the_keyboard() {
++    assert!(run(b"\x1b[?1h\x1b=").app_cursor());
++    assert!(!run(b"\x1b[?1h\x1b[?1l").app_cursor());
++}
++
++#[test]
++fn autowrap_off_overwrites_last_column() {
++    let t = run(&with(vec![b'a'; 80], b"\x1b[?7lXY"));
++    assert_eq!(row(&t, 1), "", "no wrap with ?7l");
++    let t2 = run(&with(with(vec![], b"\x1b[?7l"), &[b'a'; 82]));
++    assert_eq!(row(&t2, 1), "");
++    assert_eq!((t.cell(0, 79) & 0xFF) as u8, b'Y');
++}
++
++#[test]
++fn deferred_wrap_survives_sgr() {
++    let t = run(&with(vec![b'0'; 80], b"\x1b[0mB"));
++    assert_eq!(row(&t, 1), "B");
++}
++
++#[test]
++fn intermediate_csi_is_not_misread() {
++    let t = run(b"ABC\x1b[1;1H\x1b[1 @\x1b[2 q");
++    assert_eq!(row(&t, 0), "ABC", "CSI SP @ (scroll left) is not ICH");
++}
++
++#[test]
++fn soft_and_hard_reset() {
++    let t = run(b"\x1b[2;5r\x1b[?1h\x1b[31m\x1b[!pX");
++    assert_eq!(attr(&t, 0, 0), 0x07);
++    assert!(!t.app_cursor());
++    let t = run(b"\x1b[44mhello\x1b[?1049h\x1bc");
++    assert_eq!(row(&t, 0), "");
++    assert_eq!(attr(&t, 0, 0), 0x07);
++    assert_eq!(t.cursor(), (0, 0));
++}
++
++#[test]
++fn full_screen_scroll_still_works() {
++    let mut v = Vec::new();
++    for i in 0..30 {
++        v.extend(format!("{i}\r\n").bytes());
++    }
++    let t = run(&v);
++    assert_eq!(row(&t, 0), "6");
++    assert_eq!(row(&t, H - 2), "29");
++}
+
+exec
+/bin/zsh -lc 'git show :src/term.rs | nl -ba' in ~/nc110-baremetal
+ succeeded in 0ms:
+     1	//! VGA text terminal (80x25 at 0xB8000), the xterm subset that ncurses uses with TERM=xterm (htop, vi):
+     2	//! CR LF BS TAB BEL SO SI, deferred autowrap (DECAWM), scroll region (CSI r) with LF/IND/RI/S/T/L/M inside it,
+     3	//! cursor CSI A B C D E F G ` d e a H f Z, erase J K X with the current background (bce), P @ (and IRM 4h),
+     4	//! REP (CSI b), SGR 0/1/2/22/7/27/30-37/39/40-47/49/90-97/100-107 (+38/48;5;n) -> VGA attributes,
+     5	//! ESC 7/8 + CSI s/u + ?1048, alternate screen ?47/?1047/?1049, ?25 cursor, ?1 DECCKM (read by kbd),
+     6	//! DEC line drawing (ESC ( 0 / ESC ) 0 + SO/SI) -> CP437 box characters, DECSTR (CSI ! p), ESC c.
+     7	//! OSC/DCS/APC/PM/SOS strings are swallowed. UTF-8 multibyte characters show as one '?'. DSR gets no reply.
+     8	//! The grid lives in RAM (`Term`); `flush` copies it to VGA memory and moves the hardware cursor once per batch.
+     9	//! Host tests: `sh tools/test-term.sh`.
+    10	
+    11	pub const W: usize = 80;
+    12	pub const H: usize = 25;
+    13	const N: usize = W * H;
+    14	const DEF_FG: u8 = 7; // light grey on black
+    15	const BLANK: u16 = 0x0700 | b' ' as u16;
+    16	const ANSI_TO_VGA: [u8; 8] = [0, 4, 2, 6, 1, 5, 3, 7]; // VGA swaps the red and blue bits
+    17	
+    18	#[derive(Clone, Copy, PartialEq)]
+    19	enum St {
+    20	    Ground,
+    21	    Esc,
+    22	    Charset(u8), // ESC ( or ESC ): one designator byte follows
+    23	    EscSkip,     // ESC # % * + ...: one byte follows, ignored
+    24	    Csi,
+    25	    Str,    // OSC / DCS / APC / PM / SOS: swallowed until BEL or ST
+    26	    StrEsc, // ESC seen inside a string
+    27	}
+    28	
+    29	#[derive(Clone, Copy)]
+    30	struct Saved {
+    31	    row: usize,
+    32	    col: usize,
+    33	    wrap: bool,
+    34	    fg: u8,
+    35	    bg: u8,
+    36	    bold: bool,
+    37	    rev: bool,
+    38	    g: [bool; 2],
+    39	    gl: usize,
+    40	}
+    41	const SAVED0: Saved = Saved { row: 0, col: 0, wrap: false, fg: DEF_FG, bg: 0, bold: false, rev: false, g: [false; 2], gl: 0 };
+    42	
+    43	pub struct Term {
+    44	    cells: [u16; N],
+    45	    other: [u16; N], // the inactive screen (main while the alternate one is shown)
+    46	    alt: bool,
+    47	    row: usize,
+    48	    col: usize,
+    49	    wrap: bool, // deferred wrap: last column written, next printable goes to the next line
+    50	    st: St,
+    51	    p: [u16; 16],
+    52	    np: usize,
+    53	    private: bool,
+    54	    inter: u8, // CSI intermediate byte (0 = none)
+    55	    fg: u8,    // VGA colour 0..15
+    56	    bg: u8,    // VGA colour 0..7 (bit 7 of the attribute is blink)
+    57	    bold: bool,
+    58	    rev: bool,
+    59	    g: [bool; 2], // G0/G1 designated as DEC special graphics
+    60	    gl: usize,    // 0 = G0 (SI), 1 = G1 (SO)
+    61	    top: usize,
+    62	    bot: usize,
+    63	    saved: Saved,
+    64	    last: u8, // last printable byte, for REP
+    65	    cursor_on: bool,
+    66	    app_cursor: bool,
+    67	    insert: bool,
+    68	    autowrap: bool,
+    69	}
+    70	
+    71	impl Term {
+    72	    pub const fn new() -> Term {
+    73	        Term {
+    74	            cells: [BLANK; N],
+    75	            other: [BLANK; N],
+    76	            alt: false,
+    77	            row: 0,
+    78	            col: 0,
+    79	            wrap: false,
+    80	            st: St::Ground,
+    81	            p: [0; 16],
+    82	            np: 0,
+    83	            private: false,
+    84	            inter: 0,
+    85	            fg: DEF_FG,
+    86	            bg: 0,
+    87	            bold: false,
+    88	            rev: false,
+    89	            g: [false; 2],
+    90	            gl: 0,
+    91	            top: 0,
+    92	            bot: H - 1,
+    93	            saved: SAVED0,
+    94	            last: b' ',
+    95	            cursor_on: true,
+    96	            app_cursor: false,
+    97	            insert: false,
+    98	            autowrap: true,
+    99	        }
+   100	    }
+   101	
+   102	    #[cfg_attr(not(test), allow(dead_code))]
+   103	    pub fn cell(&self, r: usize, c: usize) -> u16 {
+   104	        self.cells[r * W + c]
+   105	    }
+   106	    #[cfg_attr(not(test), allow(dead_code))]
+   107	    pub fn cursor(&self) -> (usize, usize) {
+   108	        (self.row, self.col.min(W - 1))
+   109	    }
+   110	    #[cfg_attr(not(test), allow(dead_code))]
+   111	    pub fn cursor_visible(&self) -> bool {
+   112	        self.cursor_on
+   113	    }
+   114	    pub fn app_cursor(&self) -> bool {
+   115	        self.app_cursor
+   116	    }
+   117	
+   118	    fn attr(&self) -> u16 {
+   119	        let (mut f, mut b) = (self.fg | if self.bold { 8 } else { 0 }, self.bg);
+   120	        if self.rev {
+   121	            (f, b) = (b, f & 7);
+   122	        }
+   123	        ((b as u16) << 12) | ((f as u16) << 8)
+   124	    }
+   125	    fn blank(&self) -> u16 {
+   126	        self.attr() | b' ' as u16 // bce: erased cells take the current background
+   127	    }
+   128	    fn fill(&mut self, from: usize, to: usize) {
+   129	        let b = self.blank();
+   130	        self.cells[from.min(N)..to.min(N)].fill(b);
+   131	    }
+   132	    /// Scroll rows top..=bot by n, up (content moves up, blank rows at the bottom) or down.
+   133	    fn scroll(&mut self, top: usize, bot: usize, n: usize, up: bool) {
+   134	        let n = n.min(bot + 1 - top);
+   135	        if up {
+   136	            self.cells.copy_within((top + n) * W..(bot + 1) * W, top * W);
+   137	            self.fill((bot + 1 - n) * W, (bot + 1) * W);
+   138	        } else {
+   139	            self.cells.copy_within(top * W..(bot + 1 - n) * W, (top + n) * W);
+   140	            self.fill(top * W, (top + n) * W);
+   141	        }
+   142	    }
+   143	    fn lf(&mut self) {
+   144	        if self.row == self.bot {
+   145	            self.scroll(self.top, self.bot, 1, true);
+   146	        } else if self.row < H - 1 {
+   147	            self.row += 1;
+   148	        }
+   149	    }
+   150	    fn ri(&mut self) {
+   151	        if self.row == self.top {
+   152	            self.scroll(self.top, self.bot, 1, false);
+   153	        } else if self.row > 0 {
+   154	            self.row -= 1;
+   155	        }
+   156	    }
+   157	    fn save(&mut self) {
+   158	        self.saved = Saved { row: self.row, col: self.col, wrap: self.wrap, fg: self.fg, bg: self.bg, bold: self.bold, rev: self.rev, g: self.g, gl: self.gl };
+   159	    }
+   160	    fn restore(&mut self) {
+   161	        let s = self.saved;
+   162	        (self.row, self.col, self.wrap, self.fg, self.bg, self.bold, self.rev, self.g, self.gl) = (s.row, s.col, s.wrap, s.fg, s.bg, s.bold, s.rev, s.g, s.gl);
+   163	    }
+   164	    fn set_alt(&mut self, on: bool, clear: bool) {
+   165	        if on != self.alt {
+   166	            core::mem::swap(&mut self.cells, &mut self.other);
+   167	            self.alt = on;
+   168	            if on && clear {
+   169	                self.fill(0, N);
+   170	            }
+   171	        }
+   172	    }
+   173	    /// DECSTR soft reset: modes, attributes, margins and charsets; the screen is kept.
+   174	    fn soft_reset(&mut self) {
+   175	        (self.fg, self.bg, self.bold, self.rev, self.g, self.gl) = (DEF_FG, 0, false, false, [false; 2], 0);
+   176	        (self.top, self.bot, self.insert, self.autowrap, self.app_cursor, self.cursor_on) = (0, H - 1, false, true, false, true);
+   177	        self.saved = SAVED0;
+   178	    }
+   179	    /// RIS (ESC c), in place (no 8 KiB temporary on the kernel stack): main screen, cleared, cursor home.
+   180	    pub fn reset(&mut self) {
+   181	        self.set_alt(false, false);
+   182	        self.soft_reset();
+   183	        self.fill(0, N);
+   184	        self.other.fill(BLANK);
+   185	        (self.row, self.col, self.wrap, self.st, self.last) = (0, 0, false, St::Ground, b' ');
+   186	    }
+   187	
+   188	    fn print(&mut self, b: u8) {
+   189	        let ch = if self.g[self.gl] && (0x5F..=0x7E).contains(&b) {
+   190	            DEC_GRAPHICS[(b - 0x5F) as usize]
+   191	        } else if b >= 0x80 {
+   192	            b'?'
+   193	        } else {
+   194	            b
+   195	        };
+   196	        if self.wrap {
+   197	            self.col = 0;
+   198	            self.lf();
+   199	            self.wrap = false;
+   200	        }
+   201	        let s = self.row * W;
+   202	        if self.insert {
+   203	            self.cells.copy_within(s + self.col..s + W - 1, s + self.col + 1);
+   204	        }
+   205	        self.cells[s + self.col] = self.attr() | ch as u16;
+   206	        self.last = b;
+   207	        if self.col == W - 1 {
+   208	            self.wrap = self.autowrap;
+   209	        } else {
+   210	            self.col += 1;
+   211	        }
+   212	    }
+   213	
+   214	    fn arg(&self, i: usize, def: u16) -> usize {
+   215	        let v = if i < self.np { self.p[i] } else { 0 };
+   216	        (if v == 0 { def } else { v }) as usize
+   217	    }
+   218	
+   219	    fn sgr(&mut self) {
+   220	        let np = self.np.max(1).min(self.p.len());
+   221	        let mut i = 0;
+   222	        while i < np {
+   223	            let v = self.p[i];
+   224	            match v {
+   225	                0 => (self.fg, self.bg, self.bold, self.rev) = (DEF_FG, 0, false, false),
+   226	                1 => self.bold = true,
+   227	                22 => self.bold = false,
+   228	                7 => self.rev = true,
+   229	                27 => self.rev = false,
+   230	                30..=37 => self.fg = ANSI_TO_VGA[(v - 30) as usize],
+   231	                39 => self.fg = DEF_FG,
+   232	                40..=47 => self.bg = ANSI_TO_VGA[(v - 40) as usize],
+   233	                49 => self.bg = 0,
+   234	                90..=97 => self.fg = ANSI_TO_VGA[(v - 90) as usize] | 8,
+   235	                100..=107 => self.bg = ANSI_TO_VGA[(v - 100) as usize],
+   236	                38 | 48 => {
+   237	                    let sub = if i + 1 < np { self.p[i + 1] } else { 0 };
+   238	                    if sub == 5 && i + 2 < np {
+   239	                        let n = self.p[i + 2];
+   240	                        if n < 16 {
+   241	                            let c = ANSI_TO_VGA[(n & 7) as usize];
+   242	                            if v == 38 {
+   243	                                self.fg = c | if n >= 8 { 8 } else { 0 };
+   244	                            } else {
+   245	                                self.bg = c;
+   246	                            }
+   247	                        }
+   248	                        i += 2;
+   249	                    } else if sub == 2 {
+   250	                        i += 4; // truecolour: not representable, skipped
+   251	                    }
+   252	                }
+   253	                _ => {} // 2 dim, 4 underline, 5 blink, 8 invisible, 3/23 italic, ...: no VGA equivalent
+   254	            }
+   255	            i += 1;
+   256	        }
+   257	    }
+   258	
+   259	    fn mode(&mut self, on: bool) {
+   260	        for i in 0..self.np.min(self.p.len()) {
+   261	            match (self.private, self.p[i]) {
+   262	                (false, 4) => self.insert = on,
+   263	                (true, 1) => self.app_cursor = on,
+   264	                (true, 7) => {
+   265	                    self.autowrap = on;
+   266	                    self.wrap = false;
+   267	                }
+   268	                (true, 25) => self.cursor_on = on,
+   269	                (true, 47) => self.set_alt(on, false),
+   270	                (true, 1047) => self.set_alt(on, true),
+   271	                (true, 1048) => {
+   272	                    if on {
+   273	                        self.save()
+   274	                    } else {
+   275	                        self.restore()
+   276	                    }
+   277	                }
+   278	                (true, 1049) => {
+   279	                    if on {
+   280	                        self.save();
+   281	                        self.set_alt(true, true);
+   282	                    } else {
+   283	                        self.set_alt(false, false);
+   284	                        self.restore();
+   285	                    }
+   286	                }
+   287	                _ => {} // ?12 blink, ?1000.. mouse, ?2004 paste, 20 LNM, ...: not modelled
+   288	            }
+   289	        }
+   290	    }
+   291	
+   292	    fn csi(&mut self, f: u8) {
+   293	        if self.inter != 0 {
+   294	            if self.inter == b'!' && f == b'p' {
+   295	                self.soft_reset();
+   296	            }
+   297	            return; // CSI SP q (cursor style), CSI " q, ...: ignored
+   298	        }
+   299	        if f == b'h' || f == b'l' {
+   300	            return self.mode(f == b'h');
+   301	        }
+   302	        if self.private {
+   303	            return; // CSI ? s/r (save/restore modes), CSI > c, CSI > 4;2 m, CSI ? u, ...
+   304	        }
+   305	        let n = self.arg(0, 1);
+   306	        let (row, col) = (self.row, self.col);
+   307	        match f {
+   308	            b'm' => return self.sgr(),
+   309	            b'b' => {
+   310	                for _ in 0..n.min(N) {
+   311	                    self.print(self.last);
+   312	                }
+   313	                return;
+   314	            }
+   315	            b'A' | b'F' => self.row = if row >= self.top { row.saturating_sub(n).max(self.top) } else { row.saturating_sub(n) },
+   316	            b'B' | b'e' | b'E' => self.row = if row <= self.bot { (row + n).min(self.bot) } else { (row + n).min(H - 1) },
+   317	            b'C' | b'a' => self.col = (col + n).min(W - 1),
+   318	            b'D' => self.col = col.min(W - 1).saturating_sub(n),
+   319	            b'G' | b'`' => self.col = (n - 1).min(W - 1),
+   320	            b'd' => self.row = (n - 1).min(H - 1),
+   321	            b'H' | b'f' => {
+   322	                self.row = (self.arg(0, 1) - 1).min(H - 1);
+   323	                self.col = (self.arg(1, 1) - 1).min(W - 1);
+   324	            }
+   325	            b'Z' => {
+   326	                for _ in 0..n.min(W) {
+   327	                    self.col = self.col.min(W - 1).saturating_sub(1) & !7;
+   328	                }
+   329	            }
+   330	            b'J' => {
+   331	                let cur = row * W + col.min(W - 1);
+   332	                match self.arg(0, 0) {
+   333	                    0 => self.fill(cur, N),
+   334	                    1 => self.fill(0, cur + 1),
+   335	                    _ => self.fill(0, N),
+   336	                }
+   337	            }
+   338	            b'K' => {
+   339	                let (s, c) = (row * W, col.min(W - 1));
+   340	                match self.arg(0, 0) {
+   341	                    0 => self.fill(s + c, s + W),
+   342	                    1 => self.fill(s, s + c + 1),
+   343	                    _ => self.fill(s, s + W),
+   344	                }
+   345	            }
+   346	            b'P' | b'@' | b'X' => {
+   347	                let (s, c) = (row * W, col.min(W - 1));
+   348	                let n = n.min(W - c);
+   349	                match f {
+   350	                    b'P' => {
+   351	                        self.cells.copy_within(s + c + n..s + W, s + c);
+   352	                        self.fill(s + W - n, s + W);
+   353	                    }
+   354	                    b'@' => {
+   355	                        self.cells.copy_within(s + c..s + W - n, s + c + n);
+   356	                        self.fill(s + c, s + c + n);
+   357	                    }
+   358	                    _ => self.fill(s + c, s + c + n),
+   359	                }
+   360	            }
+   361	            b'L' | b'M' => {
+   362	                if row >= self.top && row <= self.bot {
+   363	                    self.scroll(row, self.bot, n, f == b'M');
+   364	                    self.col = 0;
+   365	                }
+   366	            }
+   367	            b'S' => self.scroll(self.top, self.bot, n, true),
+   368	            b'T' if self.np <= 1 => self.scroll(self.top, self.bot, n, false),
+   369	            b'r' => {
+   370	                let (t, b) = (self.arg(0, 1) - 1, self.arg(1, H as u16).min(H) - 1);
+   371	                if t < b {
+   372	                    (self.top, self.bot, self.row, self.col) = (t, b, 0, 0);
+   373	                }
+   374	            }
+   375	            b's' => self.save(),
+   376	            b'u' => self.restore(),
+   377	            _ => return, // 'n' (DSR: no reply), 't' (window ops), 'c' (DA), 'g' (tabs), ...: ignored, keep a pending wrap
+   378	        }
+   379	        if f != b'u' {
+   380	            self.wrap = false;
+   381	        }
+   382	        if matches!(f, b'E' | b'F') {
+   383	            self.col = 0;
+   384	        }
+   385	    }
+   386	
+   387	    pub fn feed(&mut self, b: u8) {
+   388	        match self.st {
+   389	            St::Ground => match b {
+   390	                0x1B => self.st = St::Esc,
+   391	                b'\r' => {
+   392	                    self.col = 0;
+   393	                    self.wrap = false;
+   394	                }
+   395	                b'\n' | 0x0B | 0x0C => {
+   396	                    self.lf();
+   397	                    self.wrap = false;
+   398	                }
+   399	                0x08 => {
+   400	                    self.col = self.col.min(W - 1).saturating_sub(1);
+   401	                    self.wrap = false;
+   402	                }
+   403	                b'\t' => self.col = ((self.col + 8) & !7).min(W - 1),
+   404	                0x0E => self.gl = 1,
+   405	                0x0F => self.gl = 0,
+   406	                0x80..=0xBF => {} // UTF-8 continuation byte
+   407	                _ if b < 0x20 || b == 0x7F => {} // BEL and other controls
+   408	                _ => self.print(b),
+   409	            },
+   410	            St::Esc => {
+   411	                self.st = St::Ground;
+   412	                match b {
+   413	                    b'[' => {
+   414	                        self.st = St::Csi;
+   415	                        (self.p, self.np, self.private, self.inter) = ([0; 16], 0, false, 0);
+   416	                    }
+   417	                    b']' | b'P' | b'_' | b'^' | b'X' => self.st = St::Str,
+   418	                    b'(' => self.st = St::Charset(0),
+   419	                    b')' => self.st = St::Charset(1),
+   420	                    b'*' | b'+' | b'-' | b'.' | b'/' | b'#' | b'%' | b' ' => self.st = St::EscSkip,
+   421	                    b'7' => self.save(),
+   422	                    b'8' => self.restore(),
+   423	                    b'D' => self.lf(),
+   424	                    b'E' => {
+   425	                        self.col = 0;
+   426	                        self.lf();
+   427	                    }
+   428	                    b'M' => self.ri(),
+   429	                    b'c' => self.reset(),
+   430	                    0x1B => self.st = St::Esc,
+   431	                    _ => {} // '=', '>' (keypad modes), 'H' (tab set), ...
+   432	                }
+   433	                if matches!(b, b'D' | b'E' | b'M') {
+   434	                    self.wrap = false;
+   435	                }
+   436	            }
+   437	            St::Charset(i) => {
+   438	                self.g[i as usize] = b == b'0';
+   439	                self.st = St::Ground;
+   440	            }
+   441	            St::EscSkip => self.st = St::Ground,
+   442	            St::Csi => match b {
+   443	                b'0'..=b'9' => {
+   444	                    if self.np == 0 {
+   445	                        self.np = 1;
+   446	                    }
+   447	                    if let Some(v) = self.p.get_mut(self.np - 1) {
+   448	                        *v = v.saturating_mul(10).saturating_add((b - b'0') as u16);
+   449	                    }
+   450	                }
+   451	                b';' | b':' => self.np = self.np.max(1) + 1,
+   452	                b'?' | b'>' | b'<' | b'=' => self.private = true,
+   453	                0x20..=0x2F => self.inter = b,
+   454	                0x40..=0x7E => {
+   455	                    self.st = St::Ground;
+   456	                    self.csi(b);
+   457	                }
+   458	                0x1B => self.st = St::Esc,
+   459	                _ => {} // controls inside CSI: ignored
+   460	            },
+   461	            St::Str => match b {
+   462	                0x07 => self.st = St::Ground,
+   463	                0x1B => self.st = St::StrEsc,
+   464	                _ => {}
+   465	            },
+   466	            St::StrEsc => self.st = if b == b'\\' { St::Ground } else { St::Str },
+   467	        }
+   468	    }
+   469	}
+   470	
+   471	/// DEC special graphics 0x5F..0x7E -> CP437. Glyphs CP437 lacks fall back to the nearest one.
+   472	const DEC_GRAPHICS: [u8; 32] = [
+   473	    b' ', // _ blank
+   474	    0x04, // ` diamond
+   475	    0xB1, // a checkerboard
+   476	    b' ', // b HT symbol
+   477	    b' ', // c FF symbol
+   478	    b' ', // d CR symbol
+   479	    b' ', // e LF symbol
+   480	    0xF8, // f degree
+   481	    0xF1, // g plus/minus
+   482	    b' ', // h NL symbol
+   483	    b' ', // i VT symbol
+   484	    0xD9, // j lower right corner
+   485	    0xBF, // k upper right corner
+   486	    0xDA, // l upper left corner
+   487	    0xC0, // m lower left corner
+   488	    0xC5, // n crossing lines
+   489	    0xC4, // o scan line 1
+   490	    0xC4, // p scan line 3
+   491	    0xC4, // q horizontal line (scan line 5)
+   492	    0xC4, // r scan line 7
+   493	    b'_', // s scan line 9
+   494	    0xC3, // t left tee
+   495	    0xB4, // u right tee
+   496	    0xC1, // v bottom tee
+   497	    0xC2, // w top tee
+   498	    0xB3, // x vertical line
+   499	    0xF3, // y less-or-equal
+   500	    0xF2, // z greater-or-equal
+   501	    0xE3, // { pi
+   502	    b'#', // | not-equal (none in CP437)
+   503	    0x9C, // } pound sign
+   504	    0xFA, // ~ centred dot
+   505	];
+   506	
+   507	#[cfg(not(test))]
+   508	mod hw {
+   509	    use super::{Term, N, W};
+   510	    use crate::port::outb;
+   511	
+   512	    const VGA: *mut u16 = 0xB8000 as *mut u16;
+   513	    static mut TERM: Term = Term::new();
+   514	
+   515	    pub fn t() -> &'static mut Term {
+   516	        unsafe { &mut *core::ptr::addr_of_mut!(TERM) }
+   517	    }
+   518	
+   519	    pub fn flush() {
+   520	        let t = t();
+   521	        for i in 0..N {
+   522	            unsafe { VGA.add(i).write_volatile(t.cells[i]) }
+   523	        }
+   524	        let pos = (t.row * W + t.col.min(W - 1)) as u16;
+   525	        unsafe {
+   526	            outb(0x3D4, 0x0A);
+   527	            outb(0x3D5, if t.cursor_on { 13 } else { 0x20 }); // scanlines 13..14; bit 5 = cursor off
+   528	            outb(0x3D4, 0x0B);
+   529	            outb(0x3D5, 14);
+   530	            outb(0x3D4, 0x0F);
+   531	            outb(0x3D5, pos as u8);
+   532	            outb(0x3D4, 0x0E);
+   533	            outb(0x3D5, (pos >> 8) as u8);
+   534	        }
+   535	    }
+   536	}
+   537	
+   538	/// Take over the screen: reset the terminal, clear the screen, home the cursor.
+   539	#[cfg(not(test))]
+   540	pub fn init() {
+   541	    hw::t().reset();
+   542	    hw::flush();
+   543	}
+   544	
+   545	/// Feed one byte of the remote's output (drawn on the next `flush`).
+   546	#[cfg(not(test))]
+   547	pub fn feed(b: u8) {
+   548	    hw::t().feed(b);
+   549	}
+   550	
+   551	/// Copy the grid to VGA memory and move the hardware cursor (once per batch of output, not per byte).
+   552	#[cfg(not(test))]
+   553	pub fn flush() {
+   554	    hw::flush();
+   555	}
+   556	
+   557	/// DECCKM (CSI ?1h): the keyboard sends ESC O A.. for arrows instead of ESC [ A..
+   558	#[cfg(not(test))]
+   559	pub fn app_cursor() -> bool {
+   560	    hw::t().app_cursor()
+   561	}
+
+exec
+/bin/zsh -lc "git status --short; rg --files -g AGENTS.md -g '*term*' tools; cat tools/test-term.sh" in ~/nc110-baremetal
+ succeeded in 0ms:
+A  run-m4.py
+M  src/kbd.rs
+M  src/ssh.rs
+M  src/term.rs
+A  tools/sshd_config.m4
+A  tools/term-mutants.py
+A  tools/term-vs-pyte.py
+A  tools/term_replay.rs
+A  tools/term_test.rs
+A  tools/test-term.sh
+?? proof/m4-htop-down.png
+?? proof/m4-htop-exit.png
+?? proof/m4-htop.png
+?? proof/m4-net.pcap
+?? proof/m4-serial.log
+?? proof/m4-sshd.log
+?? proof/m4-term-vs-pyte.txt
+?? proof/m4-vi-exit.png
+?? proof/m4-vi.png
+tools/term_test.rs
+tools/term-mutants.py
+tools/term_replay.rs
+tools/test-term.sh
+tools/term-vs-pyte.py
+#!/bin/sh
+# Host unit tests for src/term.rs (the kernel's VGA terminal), then the mutant check (each feature stubbed -> red).
+set -e
+D=$(cd "$(dirname "$0")" && pwd)
+mkdir -p "$D/../target/host"
+rustc --edition 2021 --test "$D/term_test.rs" -o "$D/../target/host/term_test"
+"$D/../target/host/term_test" --test-threads 1
+python3 "$D/term-mutants.py"
+
+web search: 
+web search: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+exec
+/bin/zsh -lc "git show :src/kbd.rs | nl -ba | sed -n '125,225p'; ls target/host" in ~/nc110-baremetal
+ succeeded in 0ms:
+   125	    cfg
+   126	}
+   127	
+   128	/// Translate one scancode; appends 0..8 bytes to `out` and returns how many.
+   129	fn translate(sc: u8, out: &mut [u8; 8]) -> usize {
+   130	    unsafe {
+   131	        if sc == 0xE0 {
+   132	            E0 = true;
+   133	            return 0;
+   134	        }
+   135	        let ext = E0;
+   136	        E0 = false;
+   137	        let brk = sc & 0x80 != 0;
+   138	        let code = sc & 0x7F;
+   139	        match (ext, code) {
+   140	            (false, 0x2A) => SHIFT_L = !brk,
+   141	            (false, 0x36) => SHIFT_R = !brk,
+   142	            (false, 0x1D) => CTRL_L = !brk,
+   143	            (true, 0x1D) => CTRL_R = !brk,
+   144	            (false, 0x38) => ALT_L = !brk,
+   145	            (true, 0x38) => ALT_R = !brk,
+   146	            (false, 0x3A) if !brk => CAPS = !CAPS,
+   147	            _ => {}
+   148	        }
+   149	        if brk {
+   150	            return 0;
+   151	        }
+   152	        let app = crate::term::app_cursor();
+   153	        let seq: &[u8] = match (ext, code) {
+   154	            (true, 0x48) => if app { b"\x1bOA" } else { b"\x1b[A" },
+   155	            (true, 0x50) => if app { b"\x1bOB" } else { b"\x1b[B" },
+   156	            (true, 0x4D) => if app { b"\x1bOC" } else { b"\x1b[C" },
+   157	            (true, 0x4B) => if app { b"\x1bOD" } else { b"\x1b[D" },
+   158	            (true, 0x47) => if app { b"\x1bOH" } else { b"\x1b[H" },
+   159	            (true, 0x4F) => if app { b"\x1bOF" } else { b"\x1b[F" },
+   160	            (true, 0x49) => b"\x1b[5~",
+   161	            (true, 0x51) => b"\x1b[6~",
+   162	            (true, 0x52) => b"\x1b[2~",
+   163	            (true, 0x53) => b"\x1b[3~",
+   164	            (true, 0x1C) => b"\r", // keypad Enter
+   165	            (true, 0x35) => b"/",  // keypad /
+   166	            (true, _) => b"",
+   167	            (false, 0x3B) => b"\x1bOP",
+   168	            (false, 0x3C) => b"\x1bOQ",
+   169	            (false, 0x3D) => b"\x1bOR",
+   170	            (false, 0x3E) => b"\x1bOS",
+   171	            (false, 0x3F) => b"\x1b[15~",
+   172	            (false, 0x40) => b"\x1b[17~",
+   173	            (false, 0x41) => b"\x1b[18~",
+   174	            (false, 0x42) => b"\x1b[19~",
+   175	            (false, 0x43) => b"\x1b[20~",
+   176	            (false, 0x44) => b"\x1b[21~",
+   177	            (false, 0x57) => b"\x1b[23~",
+   178	            (false, 0x58) => b"\x1b[24~",
+   179	            _ => b"",
+   180	        };
+   181	        if ext || !seq.is_empty() {
+   182	            out[..seq.len()].copy_from_slice(seq);
+   183	            return seq.len();
+   184	        }
+   185	        if (code as usize) >= MAP.len() {
+   186	            return 0;
+   187	        }
+   188	        let (lo, hi) = MAP[code as usize];
+   189	        if lo == 0 {
+   190	            return 0;
+   191	        }
+   192	        let shift = SHIFT_L || SHIFT_R;
+   193	        let mut c = if shift { hi } else { lo };
+   194	        if CAPS && lo.is_ascii_lowercase() {
+   195	            c = if shift { lo } else { hi };
+   196	        }
+   197	        if CTRL_L || CTRL_R {
+   198	            c = match c {
+   199	                b'a'..=b'z' | b'A'..=b'Z' => c & 0x1F,
+   200	                b'@' | b' ' | b'2' => 0x00,
+   201	                b'[' => 0x1B,
+   202	                b'\\' => 0x1C,
+   203	                b']' => 0x1D,
+   204	                b'_' | b'-' => 0x1F,
+   205	                _ => c,
+   206	            };
+   207	        }
+   208	        out[0] = c;
+   209	        1
+   210	    }
+   211	}
+   212	
+   213	/// Poll the controller and append the bytes typed so far to `buf[*len..]`. Mouse (AUX) bytes are dropped.
+   214	/// Always drains the controller so modifier releases are never missed; if `buf` is full (the SSH channel is not
+   215	/// taking input), the key's bytes are dropped and counted rather than left to overflow the controller.
+   216	/// Returns true on Ctrl-Alt-Del.
+   217	pub fn poll(buf: &mut [u8], len: &mut usize) -> bool {
+   218	    unsafe {
+   219	        if !ENABLED {
+   220	            drain();
+   221	            return false;
+   222	        }
+   223	        for _ in 0..64 {
+   224	            let st = inb(STATUS);
+   225	            if st & 1 == 0 {
+nic_regs_test
+term_replay
+term_test
+
+codex
+The slice operations appear bounded by the cursor and margin invariants; I haven’t found a practical remote-triggered panic. I’m checking an alternate-screen save/restore collision that the current tests don’t cover. The unmodified key sequences look correct.
+exec
+/bin/zsh -lc 'cat tools/term_replay.rs; target/host/term_test --test-threads 1' in ~/nc110-baremetal
+ succeeded in 0ms:
+//! Replay a byte stream through src/term.rs on the host and print the grid as hex cells (one row per line).
+//! Usage: term_replay <file> [<byte offset to stop at>]. Used by tools/term-vs-pyte.py.
+#[path = "../src/term.rs"]
+#[allow(dead_code)]
+mod term;
+
+fn main() {
+    let a: Vec<String> = std::env::args().collect();
+    let data = std::fs::read(&a[1]).unwrap();
+    let end = a.get(2).map(|s| s.parse().unwrap()).unwrap_or(data.len());
+    let mut t = Box::new(term::Term::new());
+    for &b in &data[..end] {
+        t.feed(b);
+    }
+    for r in 0..term::H {
+        println!("{}", (0..term::W).map(|c| format!("{:04x}", t.cell(r, c))).collect::<Vec<_>>().join(" "));
+    }
+    let (r, c) = t.cursor();
+    println!("cursor {r} {c} {}", t.cursor_visible());
+}
+
+running 22 tests
+test alternate_screen_1049_restores_main_grid_and_cursor ... ok
+test autowrap_off_overwrites_last_column ... ok
+test cursor_visibility ... ok
+test dcs_and_osc_are_swallowed ... ok
+test dec_line_drawing_to_cp437 ... ok
+test decckm_for_the_keyboard ... ok
+test decstbm_homes_the_cursor ... ok
+test deferred_wrap_survives_sgr ... ok
+test erase_uses_current_background_bce ... ok
+test full_screen_scroll_still_works ... ok
+test insert_delete_char ... ok
+test insert_delete_line_stay_inside_region ... ok
+test intermediate_csi_is_not_misread ... ok
+test rep_repeats_last_char ... ok
+test reverse_index_at_region_top_scrolls_region_down ... ok
+test reverse_video ... ok
+test save_restore_cursor_and_attributes ... ok
+test scroll_region_lf_scrolls_only_the_region ... ok
+test scroll_up_down_su_sd ... ok
+test sgr_256_and_private_m_do_not_misparse ... ok
+test sgr_colours_map_to_vga ... ok
+test soft_and_hard_reset ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+web search: 
+web search: 'saved cursor'
+web search: 
+web search: https://raw.githubusercontent.com/ThomasDickey/xterm-snapshots/master/charproc.c
+exec
+/bin/zsh -lc "python3 -c 'import subprocess; s=b\"\\x1b[3;3H\\x1b[?1049h\\x1b[10;10H\\x1b7\\x1b[?1049l\"; p=subprocess.run([\"target/host/term_replay\",\"/dev/stdin\"],input=s,capture_output=True); print(p.stdout.decode().splitlines()[-1])'" in ~/nc110-baremetal
+ succeeded in 0ms:
+cursor 9 9 true
+
+web search: 
+web search: https://raw.githubusercontent.com/ThomasDickey/xterm-snapshots/master/cursor.c
+codex
+Most is sound. I found one must-fix interaction; no practical remote-triggered out-of-bounds panic. Cursor/margin bounds protect the slice operations, and the unmodified keyboard sequences look correct.
+
+- **MUST-FIX — Save cursor state separately for each screen.** [src/term.rs:63](~/nc110-baremetal/src/term.rs:63): `saved: Saved,` is shared, and line 280 calls `self.save();` before entering alternate screen. An application’s subsequent `ESC 7` overwrites the main-screen return position and attributes. Reproducer: `\x1b[3;3H\x1b[?1049h\x1b[10;10H\x1b7\x1b[?1049l` returns to `(9,9)` instead of `(2,2)`, zero-based. **Fix:** use `[Saved; 2]`, indexed by active screen, including soft-reset handling; add this regression test. [Xterm itself saves/restores per screen](https://raw.githubusercontent.com/ThomasDickey/xterm-snapshots/master/cursor.c).
+
+- **WORTH-IMPROVING — Preserve colon subparameter boundaries.** [src/term.rs:451](~/nc110-baremetal/src/term.rs:451): `b';' | b':' => self.np = self.np.max(1) + 1,` flattens colon-form colours into independent SGR commands. For example, `38:2::0:0:31m` skips only through the second zero, then interprets the blue component `31` as foreground red. **Fix:** consume colon groups as units, or ignore unsupported colon-form SGR entirely. Skipping truecolour is defensible; applying its components as unrelated attributes is not. [Xterm SGR syntax](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html).
+
+**COSMETIC-SKIP:** VGA colour folding, approximate graphics glyphs, and documented Unicode limitations are reasonable scope choices.
+
+The existing host-test binary passed all 22 tests; I also reproduced the save-state collision with the existing replay binary. I did not rebuild or rerun QEMU.
+
+**Score: 8/10. Highest-leverage fix: separate main/alternate saved cursor state.**
+tokens used
+50,153
+Most is sound. I found one must-fix interaction; no practical remote-triggered out-of-bounds panic. Cursor/margin bounds protect the slice operations, and the unmodified keyboard sequences look correct.
+
+- **MUST-FIX — Save cursor state separately for each screen.** [src/term.rs:63](~/nc110-baremetal/src/term.rs:63): `saved: Saved,` is shared, and line 280 calls `self.save();` before entering alternate screen. An application’s subsequent `ESC 7` overwrites the main-screen return position and attributes. Reproducer: `\x1b[3;3H\x1b[?1049h\x1b[10;10H\x1b7\x1b[?1049l` returns to `(9,9)` instead of `(2,2)`, zero-based. **Fix:** use `[Saved; 2]`, indexed by active screen, including soft-reset handling; add this regression test. [Xterm itself saves/restores per screen](https://raw.githubusercontent.com/ThomasDickey/xterm-snapshots/master/cursor.c).
+
+- **WORTH-IMPROVING — Preserve colon subparameter boundaries.** [src/term.rs:451](~/nc110-baremetal/src/term.rs:451): `b';' | b':' => self.np = self.np.max(1) + 1,` flattens colon-form colours into independent SGR commands. For example, `38:2::0:0:31m` skips only through the second zero, then interprets the blue component `31` as foreground red. **Fix:** consume colon groups as units, or ignore unsupported colon-form SGR entirely. Skipping truecolour is defensible; applying its components as unrelated attributes is not. [Xterm SGR syntax](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html).
+
+**COSMETIC-SKIP:** VGA colour folding, approximate graphics glyphs, and documented Unicode limitations are reasonable scope choices.
+
+The existing host-test binary passed all 22 tests; I also reproduced the save-state collision with the existing replay binary. I did not rebuild or rerun QEMU.
+
+**Score: 8/10. Highest-leverage fix: separate main/alternate saved cursor state.**

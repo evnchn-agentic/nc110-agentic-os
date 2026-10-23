@@ -1,0 +1,6 @@
+NC110 bare-metal M0: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+nic: rtl8139 (10ec:8139) C+ mode [stand-in for RTL8101E 10ec:8136] io=0xc000 mac=52:54:00:4e:43:11
+dhcp: DISCOVER sent (342 bytes, xid=0x4e433131)
+dhcp: OFFER 10.0.2.15 from 10.0.2.2
+DONE

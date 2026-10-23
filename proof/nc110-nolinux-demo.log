@@ -1,0 +1,31 @@
+== /boot before: c500c0af89a851afdc6160687ee0a6e41020ed229bd07e2a2be4667f32b98361  /boot/grub/grub.cfg
+175cafd2aafe808f8467a5906f8629cf40855d30e55340b88ca53869835c1458  -
+== 1. kick (the only Linux touch: one-shot next_entry, no file written)
+kicked at 10:57:06: one-shot nc110-bm-netloader
+netloader up: pong uptime_ms=7974 ip=192.168.50.120
+== 2. build nolinux-demo-1-105727 (34968740e4a370f7), never written to /boot; load over the network
+ok staging 582696 B at 0x4000000
+staged 582696 B in 12.0 s
+ok jumping in 300 ms
+new kernel up: boot 9225d7b225391d0e5382190c153ffb32 after 21.6 s; pong uptime_ms=7698 ip=192.168.50.120
+wdt: inherited: GCS 0x440 NO_REBOOT=0 TCO1_CNT=0x1000 HLT=0 TMR=50 RLD=50 (inherited enabled: NO_REBOOT clear, timer running)
+build: nolinux-demo-1-105727
+wdt: ATTENDED build: TCO armed by us with NO_REBOOT cleared (one-shot boot, Slot A on any reset)
+keymod: client key from module 0 at 0x9000 (72 B), public key verified, module wiped
+cmdline: bmctl demo=1
+== 3. build nolinux-demo-2-105757 (da3f040792859c71), never written to /boot; load over the network
+ok staging 582696 B at 0x4000000
+staged 582696 B in 10.5 s
+ok jumping in 300 ms
+new kernel up: boot 60c2f7a1b707513e1d7949754a521696 after 20.1 s; pong uptime_ms=7712 ip=192.168.50.120
+wdt: inherited: GCS 0x440 NO_REBOOT=0 TCO1_CNT=0x1000 HLT=0 TMR=50 RLD=50 (inherited enabled: NO_REBOOT clear, timer running)
+build: nolinux-demo-2-105757
+wdt: ATTENDED build: TCO armed by us with NO_REBOOT cleared (one-shot boot, Slot A on any reset)
+keymod: client key from module 0 at 0x9000 (72 B), public key verified, module wiped
+cmdline: bmctl demo=2
+== 4. back to Linux over the network
+rebooting in 500 ms
+== /boot after:  c500c0af89a851afdc6160687ee0a6e41020ed229bd07e2a2be4667f32b98361  /boot/grub/grub.cfg
+175cafd2aafe808f8467a5906f8629cf40855d30e55340b88ca53869835c1458  -
+== grubenv: saved_entry=0 next_entry= 
+RESULT: PASS, /boot unchanged across the session

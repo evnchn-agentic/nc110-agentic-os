@@ -1,0 +1,133 @@
+nano-ask: model=deepseek/deepseek-v4.1-flash quota_tokens=14912 out=6000
+## Review
+
+I traced the four hard-rule questions against the diff plus the full-text `session`/`home`. The dominant facts:
+
+- `Ctl::step` is the *only* function that calls `Act::Idle`. `bm_idle` is only set when `c.act(a, dev)` returns false, and `act(Act::Idle)` is the sole path (the other Acts — `Reboot`/`Jump` — call `wdt::hard_reset`/`jump` and never return).
+- `session()` pets the watchdog on a timer (`last_pet`, 1 s) *independent of* bmctl, and its `'outer` loop condition does not include any bmctl-derived bound.
+- `Ctl::step`'s idle test is `t - self.last_ok > self.idle_ms`, and `last_ok` is only updated on an authenticated command.
+- `t6` sets `color_normal=black/black` at the top of the `menuentry`; GRUB `menuentry` bodies run in a fresh scope each time the entry is selected, so a second boot re-enters with the default global `color_normal` (`light-gray/black` on a stock GRUB). The entry also keeps the existing escape/fallback paths. `--set-default` now matches `t5|t6` legacy entries.
+
+Verdict: the bmctl/watchdog invariant holds. Keyboard, splash, and stamping have several real defects but none break the reset bound. Score below.
+
+---
+
+### MUST-FIX
+
+**M1 — `session()` is not bounded by bmctl's idle timer once connected.**
+In `session()`:
+```
+let mut last_pet = time::now_ms();
+...
+'outer: while (got_output || time::now_ms() < deadline)
+        && (!cfg!(feature = "attended") || ctl.is_some() || time::now_ms() < hard_end) {
+    if wdt::armed() && time::now_ms() - last_pet >= 1000 {
+        wdt::pet();
+        ...
+```
+The loop's exit conditions are: `got_output==false && now>=deadline` (60 s no-output cap) OR (`attended` features only) `ctl.is_none()` guard OR `hard_end` only applies when `!attended` is false — but in the `bmctl`-mode path `ctl.is_some()` is `true`, so `hard_end` is skipped (per comment: "`bmctl ssh` drops it; bmctl's idle bound plays that role instead"). That role is only realized if `c.step()` fires `Act::Idle`, i.e. only when *no authenticated command* arrives. But `session()` is petting on its own 1 s timer regardless of whether `Ctl::step` has been reached. So the claim "only the caller resets" holds — but only if the session loop is actually exiting on the idle deadline, which it does *not* while `got_output` and TCP stay alive, because bmctl's idle deadline only becomes `Act::Idle` when `c.step` returns it and `c.act` returns false. That is fine *provided* `step` runs. It does. So where's the bug?
+
+The bug: **keyboard escalation via an SSH shell that hangs after output but never closes, in the default (non-attended) build**, is protected by "^bmctl idle drops it" — but `bmctl` idle only fires on `time::now_ms() - last_ok > idle_ms` where `last_ok` is bumped by *authenticated bmctl command*. Once `Ctl::new` is running and the operator stops issuing commands, that *does* fire. So M1 as a "petting forever" claim is **false** in normal operation, **false** if the DHCP-offer host never answers (60 s deadline covers no-output), **false** if connected but silent.
+
+**The real gap is narrower:** when `cfg!(feature = "attended")` and `ctl.is_none()` (the standalone `ssh::run` path where bmctl is not present), the guard is `time::now_ms() < hard_end` = 180 s — fine. But when `ctl.is_some()` and the operator *keeps authenticated traffic flowing* (`last_ok` refreshed every < `idle_ms`), `last_pet` keeps the TCO fed while `Ctl::step` is also being called — that's the intended invariant, not a bug. So M1 is actually a **SO** (see below).
+
+Strike M1. The resolution: I could not produce a scenario in which `session()` pets while `Ctl::step` is not reached, because every iteration of `'outer` calls `iface.poll` then `c.step` — the two are in the same loop body. The only way `step` is skipped after petting is if `iface.poll` panics (`expect("tcp connect")` is before the loop; no panic in poll path observed). So the bmctl/watchdog invariant is **sound as written**.
+
+Let me re-enter MUST-FIX with the actual concrete defects.
+
+**M1 — `console::footer`/`status`/`menu` gate on `splash_shown()` which reads VGA memory; the log path that tries to draw can race the splash check across panics.**
+`show_log()` sets `VGA_LOG = true` *after* replay; if a panic fires *during* replay (before `VGA_LOG=true`), `splash_shown()` returns false and the subsequent `console::status("...")` calls in the panic path are benign. But `show_log` also calls `vga_putc(b)` for each captured byte — if `CAP` is large (look at `captured()` cap, not shown but bounded at compile time), the replay loop is bounded, no panic path there. Not this.
+
+**M1 (real) — `console::menu` width math can underflow and write off-screen.**
+```
+let w: usize = items.iter().map(|(k, l)| k.len() + 2 + 1 + l.len()).sum::<usize>()
+              + 6 * items.len().saturating_sub(1);
+...
+let mut x = W.saturating_sub(w) / 2;
+for (k, l) in items {
+    put(row, x, BAR, b" ");
+    ...
+    x += 1 + l.len() + 6;
+}
+```
+`put` clamps to `W - col` inside its `take`, **but** `x` can exceed `W` (`x = W + …`), and `VGA.add(row*W + col + i)` does NOT clamp `col + i < W` when `col > W - 1` — `put` does `W.saturating_sub(col)` which is `0` for `col >= W`, so `take(0)` writes nothing. So overflow-to-write is prevented. But: with a wide menu (`S`+`SSH terminal`, `L`+`log`, `R`+`restart`: `w ≈ 1+2+1+12 + 1+2+1+3 + 1+2+1+7 + 6*2 = 19+8+12+12 = 51`), x0=14 — fits. **No bug** for the shipped `MENU`. Callers passing a longer list could silently go off-screen but not corrupt memory.
+
+I'm spending the MUST-FIX budget on mirages. The honest answer: I found **no MUST-FIX** for rules 1–5. Downgrade to SO.
+
+Let me pull the *actual* shut-able problems:
+
+**M1 — `--set-default` picks any `tN` entry, including a stale kernel whose file may have been removed.**
+`E=$(S "grep -o '^menuentry \"nc110-bm-agentos-t[0-9]*-$2\"' …` — it matches *any* `tN` (t5, t6, future t7) whose sha8 collides with `$2`. If two versions share a sha8 prefix (8 hex chars, birthday ~2^32 — plausible only in a corpus of thousands of kernels; but if `$2` is the *old* kernel's sha8 and both t5 and t6 were installed with distinct shas, this finds the *last* — `tail -1` — which is the newest matching `tN`. If the newest is not actually on disk (kernel file was deleted but grub.cfg entry stayed), GRUB will fail to `multiboot` and the entry's own fallback (Slot A Linux) fires. So the netbook boots — but the operator thinks it will boot the agent OS and it silently falls back. Not unbootable, but the "GRUB entry change must never leave it unbootable" hard rule is met only via the existing fallback. Borderline MUST-FIX by the letter of the rule: a `--set-default` on a stale entry can leave the board unable to *reach bmctl* until manual intervention, which is within "must reset back to default boot" (Slot A Linux *is* a boot, just not bmctl). SHOULD.
+
+**M1 — resume-after-splash re-draws `status("ready")` before `home`'s loop calls `Ctl::step`.** Harmless.
+
+**M1 — `session()` on early failure leaves VGA in terminal mode without restoring.** After `console::vga_log_off()` in `SessionOpened`, if `session()` exits with `stop_all = true` *before* `SessionExit`/`Defunct` but after `shell_open=true`, `console::splash()` in the caller restores the splash — but `VGA_LOG` was set false by `vga_log_off`, so subsequent `status`/`menu` calls are gated off by `if unsafe { VGA_LOG }` — actually they return if `VGA_LOG` is true; here `VGA_LOG == false` so they draw. Good. But `home()` calls `console::splash()` then `status()` then `menu()` — all fine.
+
+OK. I am going to be honest: **I cannot produce a MUST-FIX.** The safety properties all hold. That is the answer, and I should not manufacture one.
+
+---
+
+### SHOULD
+
+**S1 — `session()` bypasses the interactive bound when `got_output` and TCP is alive but `Ctl::step` never sees a datagram, and the operator *also* never authenticates.** Then `Ctl::step` fires `Act::Idle` after `idle_ms` and `session()` returns `bm_idle=true` → `home()` returns → `bmctl::run` caller returns → `kmain` proceeds to `DONE`/`cli;hlt` (non-attended) — **no hard reset in the non-attended build.** Inspect `kmain`: `ssh::run(...)` returns `!`, then falls into `kprintln!("DONE"); if cfg!(feature="attended") { … hard_reset() } loop { cli; hlt }`. **In the non-attended build, `bmctl::run` returning means `home` returning means `kmain` returns via the `cli;hlt` loop — but the TCO was armed by GRUB, so the TCO fires ~60 s later** (the attended path hard-resets; non-attended relies on TCO). This is the existing design (TCO reset), preserved. Not a regression. Fine.
+
+**S2 — `home()` re-inits the keyboard every `S`→`session`→return cycle, and `session()` also calls `kbd::init()` at `SessionOpened`. Double init is benign on i8042 but redraws `drop` counters? No — only `kbd::poll` returns droppped. No leak observed from the snippet. OK.
+
+**S3 — `[s.ms] log stamps` in `Console::write_str`.** The stamp is emitted *before* the first non-`\r`/`\n` byte of every line. If a caller writes `"a\nb"` in one `write_str`, the stamp fires at `a`, then `\n` sets `AT_LINE_START=true`, then `b` fires another stamp — correct. If a caller writes `"\nfoo"`, no stamp at `\n`, then `foo` gets one — correct. If a caller writes `"foo\rbar"` (no `\n`), the `\r` does not clear or set `AT_LINE_START`, and `bar` gets no stamp — minor inconsistency, but `\r` without `\n` is unusual. The bigger issue: `kprintln!` presumably calls `writeln!` → writes the message and `\n` — one stamp per line, correct.
+
+```
+if unsafe { AT_LINE_START } && crate::time::ready() && !s.is_empty() && !s.starts_with(['\r', '\n']) {
+```
+`time::ready()` gates on `T0 != 0`. `time::init()` sets `T0` (pre-init lines have no stamp — correct). Recursion: `write!` inside `write_str` calls `self` again, which re-enters `write_str` with `s = "[12.345] "`, `AT_LINE_START` already false — no stamp, falls through to the byte loop. **No infinite recursion.** The unused `(i, _)` in the loop is a NIT. **Overflow:** `t % 1000` with negative `t`? `now_ms()` returns `i64` cast from unsigned subtraction; if `rdtsc() < T0` (TSC wrap or noise post-init) `t` is negative, `t % 1000` is negative, `write!` prints `-xxx`. Cosmetic. `since_reset_ms()` returns `u64` but `T0 / TSC_PER_MS` — `T0` divide-by-zero if `TSC_PER_MS == 0` — however `init` sets `TSC_PER_MS` and it must be >0 to compute `T0`; **if PIT calibration chose 0**, `now_ms` already divides by zero everywhere pre-diff. Pre-existing. No new panic path in stamping except `write!` failing which is `let _`-ignored only at top level; inside `write!` recursion failures propagate through `?` — no panic. OK.
+
+**S4 — `footer` writes `[b' '; W]` to `put(H-1, 0, …)` and then `put(H-1, 1, BAR, left)` — if `left.len() > W-1`, `put` clamps via `.take(W - col)`. Safe. `put(H-1, W.saturating_sub(right.len()+1), BAR, right)` — if `right.len() >= W`, col=0, `take(W)` ok. Safe.
+
+**S5 — `show_log()` replay logic reads `c[..st.saturating_sub(1)]`.** If `st=0`, `sat_sub(1)=0`, `rposition` on empty → None → st=0, break. Then `for &b in &c[0..]` dumps *everything* — this is the "no newline in capture" case, dumps the whole ring (bounded by `CAP`). Then the terminal scrolls; fine. But if `CAP` is unbounded (not from diff), memory clock burn. Assume bounded.
+
+**S6 — `t6` `color_normal=black/black` scope.** GRUB `menuentry` script bodies are executed in a **subshell-like scope where `set` (including `color_normal`) persists only while the effect is visible**. In GRUB 2.02–2.06 the `menuentry` body runs via `function`-like mechanism and `set color_normal` inside it **does persist to the enclosing environment** in some versions when the entry *succeeds*. If `boot` fails inside the `if multiboot` branch, control falls to `echo "…kernel or key module failed…"` — but that `echo` runs after `set color_normal=light-gray/black` right above it, so text is visible. **Recovery is intact.** But on the *success* path (`boot` runs), `boot` never returns — so no issue. On the *failure* path, `set nc110_fallback=$H; nc110_linux_now2` — visibly restores color and boots Linux. On the **`wdt_ok != yes`** branch (`GRUB did NOT arm the TCO`), `set color_normal=light-gray/black` precedes the `echo` — visible. On the earlier **6th-boot-escape / grubenv-unwritable / no-DHCP** echo branches — each has the appropriate `set color_normal=light-gray/black` before its `echo` in the diff. **All recovery echoes are legible.** t6's success-path blackness is cosmetic, recovery preserved. **NO black screen with no recovery** — the answer to (3) is: refuted, safe.
+
+But there's a subtle one: **`--set-default`'s `tail -1`** matches the *last* `tN` for `$2`. If `t7` gets installed with the *same* sha8 prefix as a stale `t5` (birthday, or operator re-uses a sha8 for a re-built kernel), `--set-default <sha8>` picks `t7` while the operator intends `t5`. That's operator error, not a hard failure — the entry exists and will boot. Not MUST. Is a SHOULD (add a `--set-default` version selector).
+
+**S7 — `Ctl` `last_footer: t - 1000` initialization.** `time::now_ms()` immediately after `Ctl::new` returns near 0, so `t - 1000` is negative; first `step` at `t≈0` has `0 - (-1000) = 1000 >= 1000` so footer draws immediately — correct. If `now_ms()` returns negative post-init (see S3), the initializer is `negative - 1000`, and `t - last_footer` could exceed `1000` on every pass, spamming `footer()`. Bounded by loop period. **NIT.**
+
+**S8 — `home()` `kbd::poll` returns `Ctrl-Alt-Del` on any single poll returning `true`. `kbd::poll` signature not shown, but the pattern `if kbd::poll(&mut k, &mut n) { hard_reset }` implies `poll` returns a `bool` meaning "escalation detected" (ctrl-alt-del), not "keys present". Matches `session()` usage. Assume correct. If `poll` returns `true` on *any* key when the ring is full, that's a MUST — but both call sites treat `true` as escalation, and `n` as the count, so the API clearly is "escalation, count". Assume consistent with pre-diff `session`.
+
+**S9 — `session()` returns `(bm_idle, got_output)`; on `bm_idle=false` with `got_output=false` (e.g. 60 s deadline), `home()` redraws splash and shows "SSH host did not answer" — informative. On `got_output=true, bm_idle=false` → "SSH session ended". Fine. But `session()` on `stop_all` (hostkey mismatch) returns `(false, false)` — reported as "did not answer". Misleading but not a safety issue. NIT.
+
+**S10 — `menu()` is called before the first `Ctl::step`, so on boot the splash briefly lacks the status footer until 1 s passes. Cosmetic.
+
+**S11 — `session()` in the DHCP-offer window**: `Dbg` — the initial `tcp.abort()` clears the previous session's socket but does not `dhcpv4`-reset; the interface reuses the lease. Fine.
+
+**S12 — `bmctl::run` no longer has a `serve()` public function; the diff replaces it with `ssh::home`. Any external caller (e.g. `ssh::run` when `bmctl` cmdline is set) — from the full `session()` and `home()` listings, `ssh::run` itself calls `session` then, if `!bm_idle && ctl.is_some()`, `home`. So `bmctl` operates fully inside `home`. **Behavioral change**: previously `bmctl::run` was bmctl-only; the "attended" branch in `kmain` calls `bmctl::run` when `bmctl` is set and `ssh` is not — `bmctl::run` now ends in `home` which has a keyboard menu. In a headless attended run, `home` calls `kbd::init()` and polls a nonexistent PS/2 controller — if `kbd::init` blocks waiting for ACK from a missing 8042, the **watchdog stops**. This is a real regression path: attended + `bmctl` + no keyboard. Inspect `kbd::init` — not in diff, must assume it is timeout-bounded; if it is, no issue. Flag as **SHOULD: verify `kbd::init` is timeout-bounded; `home()` unconditionally calls it and pets only *after* returning.**
+
+**S13 — idle bound preservation across `S`/`session`.** `Ctl::last_ok` is untouched by `session()` (bmctl commands inside `session` refresh it as before). `Act::Idle` inside `session` breaks `'outer` with `bm_idle=true`, `session` returns, `home` sees `idle=true` and returns; `ssh::run`'s post-session call `if let (Some(c), false) = (ctl.as_mut(), bm_idle) { home(…) }` is skipped, so control returns to `kmain` → non-attended → `cli;hlt` + TCO reset. **Bound preserved.** SAFE.
+
+**S14 — `dhcp_probe` removed.** Attended boot no longer proves RX DMA on real silicon before starting ssh/bmctl. If RX is dead, the whole log-only run *silently* carries no bmctl (and no SSH) — then attended TCO reset fires at 60 s, board bootloops. **Regresses observability, not safety.** SHOULD: keep a lightweight RX self-test or `wdt=probe`-style diagnostic. Not a MUST, since `udplog::dump(1)` still exercises TX.
+
+---
+
+### NIT
+
+- `for (i, &b) in s.as_bytes().iter().enumerate() { let _ = i; … }` — dead variable, drop it.
+- `menu()`'s `W.saturating_sub(w) / 2` when `w > W` starts at 0 and clips on the right; log a warning or clamp caller.
+- `footer`'s `s / 3600` in `String::<48>` — `s` is `i64`; hours can exceed 99999 after years of uptime; 48 chars is plenty.
+- `status("network")` in `main.rs` overwrites the previous `status("starting")` without clearing region — fine since same row.
+- `kbd: Ctrl-Alt-Del` message in `home()` prints before `wdt::hard_reset()`; if the hard reset is instant, message may not flush to VGA. Acceptable.
+- Comment in `session` says "bmctl's idle bound plays that role instead" (of `hard_end`); this is true **because** bmctl's idle timer fires inside `c.step` in the same loop — verify with a test, but comment is accurate.
+- `t6` naming: `t6: t5 minus the success-path echo` — also removes a `wdt_ok` echo line? Re-reading diff: the removed line is the `echo "…TCO armed by GRUB, loading /baremetal/…"` inside the `wdt_ok=yes` branch — yes, that is the success echo. Falls through to `if multiboot …` with no visible echo. Good.
+- `--set-default`'s regex `t[0-9]*` — matches `t` alone (zero digits). Clamp to `[0-9][0-9]*` or `+`.
+
+---
+
+### Score
+
+**8 / 10.**
+
+Refutations:
+- **(1)** Cannot refute: `session()` pets on a wall clock in `'outer`, but `'outer` *also* calls `c.step` every iteration; `Act::Idle` propagates through `bm_idle` and `home()` returns. The invariant (idle stops petting) holds because `Ctl::step` and `wdt::pet` are in the same loop; there is no path in `session()` that pets after last `Ctl::step`. `home()`'s idle exit → `kmain` → `cli;hlt` + TCO reset in non-attended, hard-reset in attended. **Refuted.**
+- **(2)** Keyboard: `S` in `session()` overlapping — `session()` returns before `home()` can `poll` again; `kbd::poll` drains to 16 bytes per pass, keys beyond that are held in i8042 and picked up next pass (with `dropped` counter in `session`). `R`/Ctrl-Alt-Del can fire mid-`session` (escalation, hard reset). No path bypasses the idle bound except the pre-existing attended 180 s cap. **Refuted** except S12 verifies `kbd::init` is timeout-bounded.
+- **(3)** `t6`: every `echo` on a recovery/failure path is preceded by `set color_normal=light-gray/black`, and the scope of `set color_normal=black/black` inside `menuentry` does not leak out of the entry. **Refuted** — no black screen without a readable recovery message.
+- **(4)** Stamp recursion: `write!` inside `write_str` re-enters but `AT_LINE_START` is cleared before the recursive call. No overflow: `i64` `% 1000` never panics. **Refuted**; negative-`t` cosmetics only.
+- **(5)** Plain bmctl semantics preserved; `SOCKS` grew 2→3 to accommodate the TCP socket, `serve()` replaced by `home()` — the "idle → return → caller resets" contract is honored. `dhcp_probe` removal is a diagnostics regression, not a semantic one. **Refuted** at the margin (S14).
+
+Deductions: S6 (ambiguous `tail -1`), S12 (unbounded `kbd::init` in headless attended — verify), S14 (loss of RX self-test), the `(i, _)` dead loop, and the `t[0-9]*` regex. None crosses MUST-FIX; all are contained and fix

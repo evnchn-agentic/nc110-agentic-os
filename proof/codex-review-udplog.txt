@@ -1,0 +1,1113 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a149e1-a21c-7f30-a325-598fa7a9bbf4
+--------
+user
+Calibrated adversarial review, brief. Commit HEAD (git show HEAD) adds src/udplog.rs and a console capture buffer to a bare-metal Rust kernel that is about to boot ONCE on a real Samsung NC110 netbook (RTL8102E NIC, operator at the machine, one-shot GRUB, power cycle returns to the safe Linux slot). Look only for: memory-safety/out-of-bounds (frame lengths vs tx_with/BUFSZ, chunk header digits, rx_buf/rx_release misuse after rx_poll), anything that could write outside RAM/NIC (no disk access allowed), and malformed IPv4/UDP. Tier MUST-FIX/SHOULD-FIX/NIT, 'most is sound' valid, end with 0-10. Do not edit.
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll inspect HEAD and the NIC buffer contracts, focusing only on the safety and packet-format risks you listed.
+exec
+/bin/zsh -lc 'git show HEAD' in ~/nc110-baremetal
+ succeeded in 0ms:
+commit e6a82ec9f53e55c6bc2e99147a5c338c6ed7e576
+Author: evnchn <user1@example.invalid>
+Date:   Sat Oct 17 20:41:10 2026 +0800
+
+    attended: console capture + UDP broadcast log (5514) + raw DHCP probe on the real NIC; q35 rtl8139 proof
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/proof/attended-udplog-serial.log b/proof/attended-udplog-serial.log
+new file mode 100644
+index 0000000..b6a3413
+--- /dev/null
++++ b/proof/attended-udplog-serial.log
+@@ -0,0 +1,19 @@
++NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
++multiboot magic=0x2badb002 info=0x9500 -> long mode OK
++wdt: armed by boot.s (result=0)
++wdt: TCOBASE=0x660 GCS 0x00000000 -> 0x00000000 NO_REBOOT=0 TCO1_CNT=0x0000 HLT=0 LOCK=0
++wdt: before-clear TCO1_STS=0x0000 TCO2_STS=0x0000 SECOND_TO_STS=0 BOOT_STS=0
++wdt: TCO_TMR=5 ticks x 0.6 s, reset expected after 2nd expiry (~6000 ms)
++wdt: ATTENDED build: no watchdog, the operator is the safety net (power cycle -> Slot A)
++wdt: halt: TCO1_CNT 0x0000 -> 0x0800, RLD 5 -> 5 (halted)
++keymod: no multiboot module
++cmdline: target/attended/x86_64-unknown-none/release/nc110-kernel 
++time: TSC 998800 ticks/ms (PIT ch2 calibrated)
++nic: rtl8139 C+ (10ec:8139) at 00:02.0 io=0xc000 mac=52:54:00:12:34:56
++udplog: broadcasting this log to UDP 5514
++dhcp: DISCOVER sent, waiting 4 s for an OFFER
++dhcp: OFFER 10.0.2.15 from 10.0.2.2 after 0 ms (1 frames seen)
++attended: log round 2, then reset
++DONE
++attended: hard reset via 0xCF9 in 60 s
++wdt: hard reset via 0xCF9
+diff --git a/proof/attended-udplog.pcap b/proof/attended-udplog.pcap
+new file mode 100644
+index 0000000..8b35f0c
+Binary files /dev/null and b/proof/attended-udplog.pcap differ
+diff --git a/src/console.rs b/src/console.rs
+index 7ee4fb0..65926fd 100644
+--- a/src/console.rs
++++ b/src/console.rs
+@@ -71,6 +71,14 @@ fn vga_putc(b: u8) {
+     }
+ }
+ 
++/// RAM copy of everything printed (first 8 KB), so the attended build can ship its log over UDP.
++static mut CAP: [u8; 8192] = [0; 8192];
++static mut CAP_LEN: usize = 0;
++
++pub fn captured() -> &'static [u8] {
++    unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(CAP) as *const u8, CAP_LEN) }
++}
++
+ pub struct Console;
+ impl fmt::Write for Console {
+     fn write_str(&mut self, s: &str) -> fmt::Result {
+@@ -79,6 +87,12 @@ impl fmt::Write for Console {
+                 serial_putc(b'\r');
+             }
+             serial_putc(b);
++            unsafe {
++                if CAP_LEN < 8192 {
++                    (*core::ptr::addr_of_mut!(CAP))[CAP_LEN] = b;
++                    CAP_LEN += 1;
++                }
++            }
+             if unsafe { VGA_LOG } {
+                 vga_putc(b);
+             }
+diff --git a/src/dhcp.rs b/src/dhcp.rs
+index 4c3b3bb..52bedf7 100644
+--- a/src/dhcp.rs
++++ b/src/dhcp.rs
+@@ -15,7 +15,7 @@ impl fmt::Display for Ip {
+     }
+ }
+ 
+-fn csum(b: &[u8]) -> u16 {
++pub(crate) fn csum(b: &[u8]) -> u16 {
+     let mut s: u32 = 0;
+     for c in b.chunks(2) {
+         s += (c[0] as u32) << 8 | *c.get(1).unwrap_or(&0) as u32;
+diff --git a/src/main.rs b/src/main.rs
+index 41de519..7059e08 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -21,6 +21,7 @@ mod rng;
+ mod ssh;
+ mod term;
+ mod time;
++mod udplog;
+ mod wdt;
+ 
+ struct SerialLog;
+@@ -64,6 +65,13 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
+         Ok(mut n) => {
+             kprintln!("nic: {} at {} {} mac={}", n.name(), n.bdf, n.bus, dhcp::Mac(n.mac));
+             match n.init() {
++                Ok(()) if cfg!(feature = "attended") => {
++                    kprintln!("udplog: broadcasting this log to UDP 5514");
++                    udplog::dump(&n, 1);
++                    udplog::dhcp_probe(&mut n);
++                    kprintln!("attended: log round 2, then reset");
++                    udplog::dump(&n, 2);
++                }
+                 Ok(()) => ssh::run(n, client_seed, cmdline.contains("rng=dump")),
+                 Err(e) => kprintln!("nic: init failed: {} (bus mastering left off)", e),
+             }
+diff --git a/src/udplog.rs b/src/udplog.rs
+new file mode 100644
+index 0000000..050432d
+--- /dev/null
++++ b/src/udplog.rs
+@@ -0,0 +1,64 @@
++//! Attended build: broadcast the captured console log as UDP (192.168.50.118:5514 -> 255.255.255.255:5514).
++//! Broadcast needs no ARP and no DHCP lease. Static source IP = the netbook's Slot A address.
++use crate::nic::{self, Rtl};
++use crate::{console, dhcp, kprintln, wdt};
++
++const SRC_IP: [u8; 4] = [192, 168, 50, 118];
++const PORT: u16 = 5514;
++
++fn send(n: &Rtl, data: &[u8]) {
++    let len = 42 + data.len();
++    nic::tx_with(n.bus, n.regs, len, |f| {
++        f[0..6].copy_from_slice(&[0xff; 6]);
++        f[6..12].copy_from_slice(&n.mac);
++        f[12..14].copy_from_slice(&[0x08, 0x00]);
++        let ip = &mut f[14..34];
++        ip.copy_from_slice(&[0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, 17, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255]);
++        ip[2..4].copy_from_slice(&((20 + 8 + data.len()) as u16).to_be_bytes());
++        ip[12..16].copy_from_slice(&SRC_IP);
++        let c = dhcp::csum(ip);
++        ip[10..12].copy_from_slice(&c.to_be_bytes());
++        f[34..36].copy_from_slice(&PORT.to_be_bytes());
++        f[36..38].copy_from_slice(&PORT.to_be_bytes());
++        f[38..40].copy_from_slice(&((8 + data.len()) as u16).to_be_bytes());
++        f[40..42].copy_from_slice(&[0, 0]); // UDP checksum 0 = none (IPv4)
++        f[42..].copy_from_slice(data);
++    });
++}
++
++/// Send the whole captured log, 1000-byte chunks, each prefixed "nc110 <round> <i>/<n> ".
++pub fn dump(n: &Rtl, round: u8) {
++    let log = console::captured();
++    let total = log.len().div_ceil(1000).max(1);
++    for (i, c) in log.chunks(1000).enumerate() {
++        let mut b = [0u8; 1024];
++        let h = [b'n', b'c', b'1', b'1', b'0', b' ', b'0' + round, b' ', b'0' + (i / 10) as u8, b'0' + (i % 10) as u8,
++                 b'/', b'0' + (total / 10) as u8, b'0' + (total % 10) as u8, b' '];
++        b[..h.len()].copy_from_slice(&h);
++        b[h.len()..h.len() + c.len()].copy_from_slice(c);
++        send(n, &b[..h.len() + c.len()]);
++        wdt::delay_ms(20);
++    }
++}
++
++/// One raw DHCPDISCOVER, then poll RX for 4 s for an OFFER (proves RX DMA on the real NIC).
++pub fn dhcp_probe(n: &mut Rtl) {
++    let xid = 0x4e433131; // "NC11"
++    nic::tx_with(n.bus, n.regs, 342, |f| dhcp::build_discover(f, n.mac, xid));
++    kprintln!("dhcp: DISCOVER sent, waiting 4 s for an OFFER");
++    let (mut frames, mut t) = (0u32, 0u32);
++    while t < 4000 {
++        while let Some((i, len)) = n.rx_poll() {
++            frames += 1;
++            let off = dhcp::parse_offer(nic::rx_buf(i, len), xid);
++            nic::rx_release(n.regs, i);
++            if let Some((ip, srv)) = off {
++                kprintln!("dhcp: OFFER {} from {} after {} ms ({} frames seen)", dhcp::Ip(ip), dhcp::Ip(srv), t, frames);
++                return;
++            }
++        }
++        wdt::delay_ms(10);
++        t += 10;
++    }
++    kprintln!("dhcp: no OFFER in 4 s ({} frames received)", frames);
++}
+
+exec
+/bin/zsh -lc "rg --files -g AGENTS.md -g '*rtl*' -g '*net*' -g '*udp*' -g '*console*'" in ~/nc110-baremetal
+ succeeded in 0ms:
+src/udplog.rs
+src/console.rs
+src/net.rs
+proof/codex-review-udplog.txt
+proof/m2-net.pcap
+proof/m3-net.pcap
+proof/m25-qemu64-net.pcap
+proof/m3-peerkill-net.pcap
+proof/m4-net.pcap
+proof/m45-net.pcap
+proof/attended-udplog-serial.log
+proof/m3-cad-net.pcap
+proof/attended-udplog.pcap
+
+exec
+/bin/zsh -lc 'cat src/nic.rs src/dhcp.rs src/console.rs src/main.rs' in ~/nc110-baremetal
+ succeeded in 0ms:
+//! Realtek C+ descriptor-ring NIC driver, two chips behind a PCI device-id match (M2.5):
+//!   10ec:8136 RTL8101E family (the NC110's wired NIC): MMIO only, r8169-style init. NOT RUNNABLE IN QEMU.
+//!   10ec:8139 rtl8139 in C+ mode (QEMU stand-in): port I/O BAR0, or MMIO BAR1 with cmdline `nic=mmio`.
+//! Both use the same 16-byte descriptors and ring registers; the per-chip deltas live in nic_regs.rs and are
+//! checked against pinned Linux v6.12 sources on the host (tools/test-nic-regs.sh).
+//!
+//! Safety rules this file keeps (spec rule 4: no disk access, ever):
+//! - The only PCI config write is to the matched NIC's command register (low 16 bits; status written as 0).
+//! - MMIO base must be a 32-bit-reachable memory BAR, 256-byte aligned, outside multiboot RAM, and unable to
+//!   overlap any mass-storage (class 01h, e.g. SATA/AHCI) BAR (span bounded by its alignment, read-only).
+//!   Otherwise the NIC is refused.
+//! - Bus mastering is OFF across the chip reset and ring programming (iPXE leaves the NIC DMAing), and only
+//!   turned on after the rings point at our buffers.
+use crate::nic_regs::{self as R, Regs};
+use crate::pci::{self, Bdf};
+use crate::port::{inb, inl, inw, outb, outl, outw, rdtsc};
+use crate::{kprintln, time};
+use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
+use core::sync::atomic::{fence, Ordering};
+
+const NRX: usize = 16;
+const BUFSZ: usize = 1536;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Desc {
+    opts1: u32,
+    opts2: u32,
+    addr: u64,
+}
+
+#[repr(C, align(256))]
+struct Ring<const N: usize>([Desc; N]);
+
+#[repr(C, align(16))]
+struct Bufs<const N: usize>([[u8; BUFSZ]; N]);
+
+const Z: Desc = Desc { opts1: 0, opts2: 0, addr: 0 };
+static mut TX_DESC: Ring<1> = Ring([Z; 1]);
+static mut RX_DESC: Ring<NRX> = Ring([Z; NRX]);
+static mut TX_BUF: Bufs<1> = Bufs([[0; BUFSZ]; 1]);
+static mut RX_BUF: Bufs<NRX> = Bufs([[0; BUFSZ]; NRX]);
+
+#[derive(Clone, Copy)]
+pub enum Bus {
+    Pio(u16),
+    Mmio(u64),
+}
+
+impl Bus {
+    unsafe fn r8(self, o: u16) -> u8 {
+        match self {
+            Bus::Pio(p) => inb(p + o),
+            Bus::Mmio(m) => read_volatile((m + o as u64) as *const u8),
+        }
+    }
+    unsafe fn r16(self, o: u16) -> u16 {
+        match self {
+            Bus::Pio(p) => inw(p + o),
+            Bus::Mmio(m) => read_volatile((m + o as u64) as *const u16),
+        }
+    }
+    unsafe fn r32(self, o: u16) -> u32 {
+        match self {
+            Bus::Pio(p) => inl(p + o),
+            Bus::Mmio(m) => read_volatile((m + o as u64) as *const u32),
+        }
+    }
+    unsafe fn w8(self, o: u16, v: u8) {
+        match self {
+            Bus::Pio(p) => outb(p + o, v),
+            Bus::Mmio(m) => write_volatile((m + o as u64) as *mut u8, v),
+        }
+    }
+    unsafe fn w16(self, o: u16, v: u16) {
+        match self {
+            Bus::Pio(p) => outw(p + o, v),
+            Bus::Mmio(m) => write_volatile((m + o as u64) as *mut u16, v),
+        }
+    }
+    unsafe fn w32(self, o: u16, v: u32) {
+        match self {
+            Bus::Pio(p) => outl(p + o, v),
+            Bus::Mmio(m) => write_volatile((m + o as u64) as *mut u32, v),
+        }
+    }
+}
+
+impl core::fmt::Display for Bus {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            Bus::Pio(p) => write!(f, "io={:#x}", p),
+            Bus::Mmio(m) => write!(f, "mmio={:#x} (UC)", m),
+        }
+    }
+}
+
+pub struct Rtl {
+    pub bus: Bus,
+    pub regs: &'static Regs,
+    pub bdf: Bdf,
+    pub mac: [u8; 6],
+    rx_next: usize,
+    rx_cfg: u32,
+}
+
+const PCI_CMD_IO: u32 = 1 << 0;
+const PCI_CMD_MEM: u32 = 1 << 1;
+const PCI_CMD_BM: u32 = 1 << 2;
+
+/// The one PCI config write: the NIC's command register. Upper half (status, RW1C) written as 0.
+fn set_pci_cmd(b: Bdf, set: u32, clear: u32) {
+    let cmd = pci::read32(b, 0x04) & 0xFFFF;
+    pci::write32(b, 0x04, (cmd & !clear) | set);
+}
+
+extern "C" {
+    static mut pd: [u64; 2048]; // boot.s: 4 x 512 2-MiB identity entries covering 0..4 GiB
+}
+
+#[repr(C, align(4096))]
+struct Pt([u64; 512]);
+static mut UC_PT: Pt = Pt([0; 512]);
+
+/// Make ONLY the 4 KiB page holding the NIC registers uncached (PCD|PWT): split the 2 MiB identity PDE that
+/// covers it into 512 identity 4 KiB entries with the PDE's own flags, so nothing else in that 2 MiB (on the
+/// NM10 possibly the AHCI ABAR) changes attributes. Review fix (GLM-5.2 B1): previously the whole 2 MiB went UC.
+fn map_uc_4k(base: u64) {
+    unsafe {
+        let pde = addr_of_mut!(pd[(base >> 21) as usize]);
+        let old = read_volatile(pde);
+        let region = base & !0x1F_FFFF;
+        let flags = old & 0x1F & !(1 << 7); // P, RW, US, PWT, PCD from the PDE; PS dropped for a PTE
+        let pt = &mut *addr_of_mut!(UC_PT);
+        for (i, e) in pt.0.iter_mut().enumerate() {
+            *e = (region + (i as u64) * 4096) | flags;
+        }
+        pt.0[((base >> 12) & 0x1FF) as usize] |= (1 << 4) | (1 << 3);
+        fence(Ordering::SeqCst);
+        write_volatile(pde, (addr_of!(UC_PT) as u64) | 0x3); // present | rw, points at UC_PT
+        core::arch::asm!("mov {t}, cr3", "mov cr3, {t}", t = out(reg) _, options(nostack)); // flush incl. the 2 MiB entry
+    }
+}
+
+/// Validate a memory BAR for use as the NIC register window, then map its 2 MiB page uncached (PCD|PWT).
+fn mmio_window(b: Bdf) -> Result<u64, &'static str> {
+    let (base, _is64) = pci::first_mem_bar(b).ok_or("no memory BAR")?;
+    if base == 0 {
+        return Err("memory BAR unassigned (0)");
+    }
+    if base & 0xFF != 0 || base + 0x100 > 0x1_0000_0000 {
+        return Err("memory BAR not 256-byte aligned or not below 4 GiB");
+    }
+    if crate::ram_overlaps(base, 0x100) {
+        return Err("memory BAR overlaps RAM in the multiboot memory map");
+    }
+    let mut st = [0u64; 16];
+    let n = pci::storage_mem_bars(&mut st);
+    for &x in &st[..n] {
+        kprintln!("nic: mass-storage memory BAR {:#x} (max span {:#x}), NIC window {:#x}+0x100", x, 1u64 << x.trailing_zeros().min(32), base);
+    }
+    if !R::clear_of_storage(base, &st[..n]) {
+        return Err("NIC register window could overlap a storage controller BAR");
+    }
+    map_uc_4k(base);
+    Ok(base)
+}
+
+/// Subset of rtl8169_get_mac_version (r8169_main.c:2318-2325, first match wins): the 8101E/8102E/8103E
+/// versions whose init this file implements. Anything else on 10ec:8136 (8105E, 8106E, 8402, ...) is refused.
+fn xid_version(xid: u32) -> Option<u8> {
+    const T: [(u32, u32, u8); 8] = [
+        (0x7cf, 0x349, 8),
+        (0x7cf, 0x249, 8),
+        (0x7cf, 0x348, 7),
+        (0x7cf, 0x248, 7),
+        (0x7cf, 0x240, 14), // RTL8401: listed only so it is NOT mistaken for VER_09 below
+        (0x7c8, 0x348, 9),
+        (0x7c8, 0x248, 9),
+        (0x7c8, 0x340, 10),
+    ];
+    T.iter().find(|&&(m, v, _)| xid & m == v).map(|t| t.2).filter(|&v| v != 14)
+}
+
+pub fn probe(prefer_mmio: bool) -> Result<Rtl, &'static str> {
+    if let Some(b) = pci::find(0x10EC, 0x8136) {
+        return probe_8101e(b);
+    }
+    if let Some(b) = pci::find(0x10EC, 0x8139) {
+        return probe_8139cp(b, prefer_mmio);
+    }
+    Err("no 10ec:8136 or 10ec:8139 found (bridges walked)")
+}
+
+fn probe_8139cp(b: Bdf, mmio: bool) -> Result<Rtl, &'static str> {
+    let bus = if mmio {
+        set_pci_cmd(b, 0, PCI_CMD_BM);
+        let m = mmio_window(b)?;
+        set_pci_cmd(b, PCI_CMD_MEM, PCI_CMD_BM);
+        Bus::Mmio(m)
+    } else {
+        set_pci_cmd(b, PCI_CMD_IO, PCI_CMD_BM);
+        let bar0 = pci::read32(b, 0x10);
+        if bar0 & 1 == 0 {
+            return Err("rtl8139 BAR0 is not I/O");
+        }
+        Bus::Pio((bar0 & !0x3) as u16)
+    };
+    let mut mac = [0u8; 6];
+    for (i, m) in mac.iter_mut().enumerate() {
+        *m = unsafe { bus.r8(R::RTL8139CP.mac0 + i as u16) };
+    }
+    Ok(Rtl { bus, regs: &R::RTL8139CP, bdf: b, mac, rx_next: 0, rx_cfg: 0x0000_E70A })
+}
+
+fn probe_8101e(b: Bdf) -> Result<Rtl, &'static str> {
+    set_pci_cmd(b, 0, PCI_CMD_BM | PCI_CMD_IO); // stop any DMA left running by iPXE before anything else
+    let m = mmio_window(b)?;
+    set_pci_cmd(b, PCI_CMD_MEM, PCI_CMD_BM | PCI_CMD_IO);
+    let bus = Bus::Mmio(m);
+    let r = &R::RTL8101E;
+    let txc = unsafe { bus.r32(r.tx_config) };
+    if txc == 0xFFFF_FFFF {
+        return Err("TxConfig reads all-ones (PCI read failed, r8169_main.c:5419)");
+    }
+    let xid = (txc >> 20) & 0xFCF; // r8169_main.c:5422
+    let ver = match xid_version(xid) {
+        Some(v) => v,
+        None => {
+            kprintln!("nic: 10ec:8136 XID {:#05x} is not RTL8101E/8102E/8103E (VER_07..10): refusing", xid);
+            return Err("unsupported 10ec:8136 chip version");
+        }
+    };
+    kprintln!("nic: 10ec:8136 XID {:#05x} -> r8169 RTL_GIGA_MAC_VER_{:02}", xid, ver);
+    // rtl_init_rxcfg (r8169_main.c:2486-2490 and default 2510): VER_10 FIFO_THRESH|DMA_BURST, VER_07..09 default.
+    let rx_cfg = if ver == 10 { R::RX_FIFO_THRESH | R::RX_DMA_BURST } else { R::RX128_INT_EN | R::RX_DMA_BURST };
+    let mut mac = [0u8; 6];
+    for (i, x) in mac.iter_mut().enumerate() {
+        *x = unsafe { bus.r8(r.mac0 + i as u16) };
+    }
+    Ok(Rtl { bus, regs: r, bdf: b, mac, rx_next: 0, rx_cfg: rx_cfg | R::ACCEPT_BROADCAST | R::ACCEPT_MY_PHYS })
+}
+
+impl Rtl {
+    pub fn name(&self) -> &'static str {
+        self.regs.name
+    }
+
+    fn mdio_write(&self, reg: u32, val: u16) -> Result<(), &'static str> {
+        // r8169_mdio_write, r8169_main.c:1154-1164: flag set, wait for it to clear (25 x 20 us), then 20 us.
+        unsafe { self.bus.w32(self.regs.phyar, R::PHYAR_FLAG | (reg & 0x1F) << 16 | val as u32) };
+        for _ in 0..25 {
+            time::delay_us(20);
+            if unsafe { self.bus.r32(self.regs.phyar) } & R::PHYAR_FLAG == 0 {
+                time::delay_us(20);
+                return Ok(());
+            }
+        }
+        Err("PHYAR write timeout")
+    }
+
+    fn mdio_read(&self, reg: u32) -> Result<u16, &'static str> {
+        // r8169_mdio_read, r8169_main.c:1166-1180: flag clear, wait for it to SET, data in 15:0, then 20 us.
+        unsafe { self.bus.w32(self.regs.phyar, (reg & 0x1F) << 16) };
+        for _ in 0..25 {
+            time::delay_us(20);
+            let v = unsafe { self.bus.r32(self.regs.phyar) };
+            if v & R::PHYAR_FLAG != 0 {
+                time::delay_us(20);
+                return Ok(v as u16);
+            }
+        }
+        Err("PHYAR read timeout")
+    }
+
+    fn reset(&self) -> Result<(), &'static str> {
+        let r = self.regs;
+        unsafe {
+            self.bus.w8(r.chip_cmd, r.cmd_reset);
+            for _ in 0..1000 {
+                if self.bus.r8(r.chip_cmd) & r.cmd_reset == 0 {
+                    return Ok(());
+                }
+                time::delay_us(100);
+            }
+        }
+        Err("chip reset did not complete in 100 ms")
+    }
+
+    fn program_rings(&self) {
+        let r = self.regs;
+        unsafe {
+            for i in 0..NRX {
+                let d = addr_of_mut!(RX_DESC.0[i]);
+                let mut o = r.desc_own | BUFSZ as u32;
+                if i == NRX - 1 {
+                    o |= r.ring_end;
+                }
+                write_volatile(d, Desc { opts1: o, opts2: 0, addr: addr_of!(RX_BUF.0[i]) as u64 });
+            }
+            write_volatile(addr_of_mut!(TX_DESC.0[0]), Desc { opts1: r.ring_end, opts2: 0, addr: 0 });
+            fence(Ordering::SeqCst);
+            let tx = addr_of!(TX_DESC) as u64;
+            let rx = addr_of!(RX_DESC) as u64;
+            // high dword first (r8169_main.c:2758-2767 "magic spell")
+            self.bus.w32(r.tx_ring + 4, (tx >> 32) as u32);
+            self.bus.w32(r.tx_ring, tx as u32);
+            self.bus.w32(r.rx_ring + 4, (rx >> 32) as u32);
+            self.bus.w32(r.rx_ring, rx as u32);
+        }
+    }
+
+    /// Reset and bring up the NIC. Every Err path leaves bus mastering OFF.
+    pub fn init(&mut self) -> Result<(), &'static str> {
+        if self.regs.device == 0x8136 {
+            self.init_8101e()
+        } else {
+            self.init_8139cp()
+        }
+    }
+
+    fn init_8139cp(&mut self) -> Result<(), &'static str> {
+        let r = self.regs;
+        self.reset()?;
+        unsafe {
+            self.bus.w16(r.cplus_cmd, 0x0003); // C+ mode: CpTxOn | CpRxOn (8139cp only)
+            self.program_rings();
+            self.bus.w16(r.rx_max_size, BUFSZ as u16);
+            self.bus.w16(r.intr_mask, 0); // polled
+        }
+        set_pci_cmd(self.bdf, PCI_CMD_BM, 0);
+        unsafe {
+            self.bus.w8(r.chip_cmd, r.cmd_rx_enb | r.cmd_tx_enb);
+            self.bus.w32(r.tx_config, 0x0300_0700); // IFG normal, max DMA burst
+            self.bus.w32(r.rx_config, self.rx_cfg); // accept broadcast + my phys, unlimited DMA burst
+        }
+        Ok(())
+    }
+
+    /// rtl_hw_start (r8169_main.c:3930-3961) reduced to the generic part, plus a PHY reset like iPXE's
+    /// realtek_phy_reset. NOT done (documented gap): the per-version hw_config tables (rtl_hw_start_8102e_*,
+    /// r8169_main.c:3562-3603: Config1/Config3/ephy writes) and rtl8102e_hw_phy_config. VER_10 has none.
+    fn init_8101e(&mut self) -> Result<(), &'static str> {
+        let r = self.regs;
+        self.reset()?;
+        unsafe {
+            self.bus.w8(r.cfg9346, R::CFG9346_UNLOCK);
+            let cp = self.bus.r16(r.cplus_cmd) & R::CPCMD_MASK & !(R::CPCMD_RXVLAN | R::CPCMD_RXCHKSUM);
+            self.bus.w16(r.cplus_cmd, cp);
+            self.bus.w8(r.max_tx_packet_size, R::TX_PACKET_MAX); // rtl_hw_start_8168 (r8169_main.c:3903)
+            self.bus.w16(r.intr_mitigate, 0);
+            self.bus.w16(r.rx_max_size, BUFSZ as u16); // Linux uses 16 KiB buffers; ours are 1536 B
+            self.program_rings();
+            self.bus.w8(r.cfg9346, R::CFG9346_LOCK);
+            self.bus.w16(r.intr_mask, 0);
+            self.bus.w16(r.intr_status, 0xFFFF);
+        }
+        // PHY: BMCR reset, wait for self-clear, then autoneg enable + restart (no 1000BASE-T on this PHY).
+        self.mdio_write(0, 0x8000)?;
+        let t = time::now_ms();
+        while self.mdio_read(0)? & 0x8000 != 0 {
+            if time::now_ms() - t > 500 {
+                return Err("PHY reset did not self-clear in 500 ms");
+            }
+        }
+        self.mdio_write(0, 0x1200)?;
+        set_pci_cmd(self.bdf, PCI_CMD_BM, 0);
+        unsafe {
+            self.bus.w8(r.chip_cmd, r.cmd_tx_enb | r.cmd_rx_enb); // r8169_main.c:3957, before Rx/TxConfig
+            self.bus.w32(r.rx_config, self.rx_cfg);
+            self.bus.w32(r.tx_config, R::TX_DMA_BURST << 8 | R::INTER_FRAME_GAP << 24);
+        }
+        let t = time::now_ms();
+        while unsafe { self.bus.r8(r.phystatus) } & R::LINK_STATUS == 0 && time::now_ms() - t < 5000 {}
+        let st = unsafe { self.bus.r8(r.phystatus) };
+        kprintln!("nic: PHYstatus {:#04x} link {}", st, if st & R::LINK_STATUS != 0 { "up" } else { "DOWN after 5 s" });
+        if st & R::LINK_STATUS == 0 {
+            // Review fix (GLM-5.2 C3): no link -> stop the chip and bus mastering instead of running SSH blind.
+            unsafe { self.bus.w8(r.chip_cmd, 0) };
+            set_pci_cmd(self.bdf, 0, PCI_CMD_BM);
+            return Err("no link after 5 s (Rx/Tx and bus mastering turned off again)");
+        }
+        Ok(())
+    }
+
+    /// Non-blocking: if the next RX descriptor is ours, return (index, frame length without FCS).
+    /// The caller must hand the descriptor back with `rx_release(index)`.
+    pub fn rx_poll(&mut self) -> Option<(usize, usize)> {
+        let r = self.regs;
+        let i = self.rx_next;
+        unsafe {
+            let o = read_volatile(addr_of!(RX_DESC.0[i].opts1));
+            if o & r.desc_own != 0 {
+                return None;
+            }
+            fence(Ordering::SeqCst);
+            self.rx_next = (i + 1) % NRX;
+            if o & (r.rx_err | r.first_frag | r.last_frag) != (r.first_frag | r.last_frag) {
+                rx_release(r, i); // errored or multi-descriptor frame: drop it
+                return None;
+            }
+            Some((i, ((o & r.rx_len_mask) as usize).saturating_sub(4).min(BUFSZ)))
+        }
+    }
+}
+
+/// Only valid between `rx_poll` returning (i, len) and `rx_release(i)` (net::Rx enforces this).
+pub(crate) fn rx_buf(i: usize, len: usize) -> &'static [u8] {
+    assert!(i < NRX && len <= BUFSZ);
+    unsafe { core::slice::from_raw_parts(addr_of!(RX_BUF.0[i]) as *const u8, len) }
+}
+
+pub fn rx_release(r: &Regs, i: usize) {
+    let mut no = r.desc_own | BUFSZ as u32;
+    if i == NRX - 1 {
+        no |= r.ring_end;
+    }
+    fence(Ordering::SeqCst);
+    unsafe { write_volatile(addr_of_mut!(RX_DESC.0[i].opts1), no) };
+}
+
+/// Set once a TX descriptor fails to come back (OWN still set after the deadline). From then on the
+/// TX DMA buffer and descriptor are treated as owned by the NIC forever: nothing is written to them.
+static mut TX_WEDGED: bool = false;
+static mut TX_SCRATCH: [u8; BUFSZ] = [0; BUFSZ];
+
+/// Let `fill` build a `len`-byte frame directly in the DMA buffer, then send it.
+/// Never touches the buffer/descriptor unless the NIC has cleared OWN (Codex M2 MUST-FIX).
+pub fn tx_with<R2>(bus: Bus, r: &Regs, len: usize, fill: impl FnOnce(&mut [u8]) -> R2) -> R2 {
+    let len = len.min(BUFSZ);
+    unsafe {
+        let d = addr_of_mut!(TX_DESC.0[0]);
+        if TX_WEDGED || read_volatile(addr_of!((*d).opts1)) & r.desc_own != 0 {
+            TX_WEDGED = true;
+            // Frame is built into scratch and dropped: the NIC may still be DMAing the real buffer.
+            let scratch = &mut *core::ptr::addr_of_mut!(TX_SCRATCH);
+            return fill(&mut scratch[..len]);
+        }
+        let buf = core::slice::from_raw_parts_mut(addr_of_mut!(TX_BUF.0[0]) as *mut u8, BUFSZ);
+        let res = fill(&mut buf[..len]);
+        let wire = len.max(60);
+        for b in &mut buf[len..wire] {
+            *b = 0;
+        }
+        write_volatile(
+            d,
+            Desc {
+                opts1: r.desc_own | r.ring_end | r.first_frag | r.last_frag | wire as u32,
+                opts2: 0,
+                addr: buf.as_ptr() as u64,
+            },
+        );
+        fence(Ordering::SeqCst);
+        bus.w8(r.tx_poll, r.npq);
+        let t0 = rdtsc();
+        while read_volatile(addr_of!((*d).opts1)) & r.desc_own != 0 {
+            if rdtsc() - t0 > 2_000_000_000 {
+                TX_WEDGED = true;
+                kprintln!("nic: TX descriptor not returned by NIC, TX disabled");
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        fence(Ordering::SeqCst);
+        let st = bus.r16(r.intr_status);
+        bus.w16(r.intr_status, st);
+        res
+    }
+}
+//! Hand-built Ethernet/IPv4/UDP/BOOTP DHCPDISCOVER, and a minimal OFFER parser.
+use core::fmt;
+
+pub struct Mac(pub [u8; 6]);
+impl fmt::Display for Mac {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let m = self.0;
+        write!(f, "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5])
+    }
+}
+pub struct Ip(pub [u8; 4]);
+impl fmt::Display for Ip {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}.{}.{}.{}", self.0[0], self.0[1], self.0[2], self.0[3])
+    }
+}
+
+pub(crate) fn csum(b: &[u8]) -> u16 {
+    let mut s: u32 = 0;
+    for c in b.chunks(2) {
+        s += (c[0] as u32) << 8 | *c.get(1).unwrap_or(&0) as u32;
+    }
+    while s >> 16 != 0 {
+        s = (s & 0xFFFF) + (s >> 16);
+    }
+    !(s as u16)
+}
+
+/// Writes a broadcast DHCPDISCOVER into `buf` (>= 342 bytes); returns frame length.
+pub fn build_discover(buf: &mut [u8], mac: [u8; 6], xid: u32) -> usize {
+    buf.fill(0);
+    let bootp_len = 300; // classic minimum BOOTP size
+    let udp_len = 8 + bootp_len;
+    let ip_len = 20 + udp_len;
+    // Ethernet
+    buf[0..6].copy_from_slice(&[0xFF; 6]);
+    buf[6..12].copy_from_slice(&mac);
+    buf[12..14].copy_from_slice(&[0x08, 0x00]);
+    // IPv4
+    let ip = &mut buf[14..34];
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
+    ip[4..6].copy_from_slice(&0x0110u16.to_be_bytes());
+    ip[8] = 64;
+    ip[9] = 17;
+    ip[16..20].copy_from_slice(&[255; 4]);
+    let c = csum(ip);
+    ip[10..12].copy_from_slice(&c.to_be_bytes());
+    // UDP (checksum 0 = none, legal over IPv4)
+    let udp = &mut buf[34..42];
+    udp[0..2].copy_from_slice(&68u16.to_be_bytes());
+    udp[2..4].copy_from_slice(&67u16.to_be_bytes());
+    udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    // BOOTP
+    let b = &mut buf[42..42 + bootp_len];
+    b[0] = 1; // BOOTREQUEST
+    b[1] = 1; // Ethernet
+    b[2] = 6;
+    b[4..8].copy_from_slice(&xid.to_be_bytes());
+    b[10..12].copy_from_slice(&0x8000u16.to_be_bytes()); // broadcast flag
+    b[28..34].copy_from_slice(&mac);
+    b[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
+    let opts: &[u8] = &[
+        53, 1, 1, // DHCPDISCOVER
+        12, 8, b'n', b'c', b'1', b'1', b'0', b'-', b'b', b'm', // hostname
+        55, 3, 1, 3, 6, // want subnet, router, dns
+        255,
+    ];
+    b[240..240 + opts.len()].copy_from_slice(opts);
+    42 + bootp_len
+}
+
+/// If `f` is a DHCPOFFER for `xid`, returns (yiaddr, server id or siaddr).
+pub fn parse_offer(f: &[u8], xid: u32) -> Option<([u8; 4], [u8; 4])> {
+    if f.len() < 42 + 244 || f[12..14] != [0x08, 0x00] || f[23] != 17 {
+        return None;
+    }
+    let ihl = (f[14] & 0xF) as usize * 4;
+    let udp = 14 + ihl;
+    if f[udp + 2..udp + 4] != 68u16.to_be_bytes() {
+        return None;
+    }
+    let b = &f[udp + 8..];
+    if b.len() < 244 || b[0] != 2 || b[4..8] != xid.to_be_bytes() || b[236..240] != [0x63, 0x82, 0x53, 0x63] {
+        return None;
+    }
+    let yiaddr = [b[16], b[17], b[18], b[19]];
+    let mut srv = [b[20], b[21], b[22], b[23]];
+    let (mut i, mut is_offer) = (240, false);
+    while i + 1 < b.len() && b[i] != 255 {
+        if b[i] == 0 {
+            i += 1;
+            continue;
+        }
+        let (t, l) = (b[i], b[i + 1] as usize);
+        let v = b.get(i + 2..i + 2 + l)?;
+        if t == 53 && l == 1 && v[0] == 2 {
+            is_offer = true;
+        }
+        if t == 54 && l == 4 {
+            srv = [v[0], v[1], v[2], v[3]];
+        }
+        i += 2 + l;
+    }
+    is_offer.then_some((yiaddr, srv))
+}
+//! Output to COM1 (0x3F8, 115200 8N1) and the VGA text buffer (0xB8000, 80x25).
+use crate::port::{inb, outb};
+use core::fmt;
+
+const COM1: u16 = 0x3F8;
+const VGA: *mut u16 = 0xB8000 as *mut u16;
+const W: usize = 80;
+const H: usize = 25;
+const ATTR: u16 = 0x1F00; // white on blue
+
+static mut ROW: usize = 0;
+static mut COL: usize = 0;
+/// Cleared when the SSH terminal takes over the screen: log lines then go to COM1 only.
+static mut VGA_LOG: bool = true;
+
+pub fn vga_log_off() {
+    unsafe { VGA_LOG = false };
+}
+
+/// Raw byte to COM1 (used to mirror the remote shell's output into the serial log).
+pub fn serial_raw(b: u8) {
+    serial_putc(b);
+}
+
+pub fn init() {
+    unsafe {
+        outb(COM1 + 1, 0x00); // no interrupts
+        outb(COM1 + 3, 0x80); // DLAB
+        outb(COM1 + 0, 0x01); // divisor 1 = 115200
+        outb(COM1 + 1, 0x00);
+        outb(COM1 + 3, 0x03); // 8N1
+        outb(COM1 + 2, 0xC7); // FIFO
+        outb(COM1 + 4, 0x03);
+        for i in 0..W * H {
+            VGA.add(i).write_volatile(ATTR | b' ' as u16);
+        }
+        ROW = 0;
+        COL = 0;
+    }
+}
+
+fn serial_putc(b: u8) {
+    unsafe {
+        while inb(COM1 + 5) & 0x20 == 0 {}
+        outb(COM1, b);
+    }
+}
+
+fn vga_putc(b: u8) {
+    unsafe {
+        if b == b'\n' {
+            COL = 0;
+            ROW += 1;
+        } else {
+            VGA.add(ROW * W + COL).write_volatile(ATTR | b as u16);
+            COL += 1;
+            if COL == W {
+                COL = 0;
+                ROW += 1;
+            }
+        }
+        if ROW == H {
+            for i in 0..W * (H - 1) {
+                VGA.add(i).write_volatile(VGA.add(i + W).read_volatile());
+            }
+            for i in 0..W {
+                VGA.add((H - 1) * W + i).write_volatile(ATTR | b' ' as u16);
+            }
+            ROW = H - 1;
+        }
+    }
+}
+
+/// RAM copy of everything printed (first 8 KB), so the attended build can ship its log over UDP.
+static mut CAP: [u8; 8192] = [0; 8192];
+static mut CAP_LEN: usize = 0;
+
+pub fn captured() -> &'static [u8] {
+    unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(CAP) as *const u8, CAP_LEN) }
+}
+
+pub struct Console;
+impl fmt::Write for Console {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for &b in s.as_bytes() {
+            if b == b'\n' {
+                serial_putc(b'\r');
+            }
+            serial_putc(b);
+            unsafe {
+                if CAP_LEN < 8192 {
+                    (*core::ptr::addr_of_mut!(CAP))[CAP_LEN] = b;
+                    CAP_LEN += 1;
+                }
+            }
+            if unsafe { VGA_LOG } {
+                vga_putc(b);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[macro_export]
+macro_rules! kprintln {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = writeln!($crate::console::Console, $($arg)*);
+    }};
+}
+
+#[macro_export]
+macro_rules! kprint {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = write!($crate::console::Console, $($arg)*);
+    }};
+}
+#![no_std]
+#![no_main]
+
+use core::arch::{asm, global_asm};
+use core::fmt::Write;
+use core::panic::PanicInfo;
+
+global_asm!(include_str!("boot.s"), options(att_syntax));
+
+mod console;
+#[allow(dead_code)]
+mod dhcp;
+mod kbd;
+mod mb;
+mod net;
+mod nic;
+mod nic_regs;
+mod pci;
+mod port;
+mod rng;
+mod ssh;
+mod term;
+mod time;
+mod udplog;
+mod wdt;
+
+struct SerialLog;
+impl log::Log for SerialLog {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Warn
+    }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            kprintln!("[{}] {}", r.level(), r.args());
+        }
+    }
+    fn flush(&self) {}
+}
+static LOGGER: SerialLog = SerialLog;
+
+#[no_mangle]
+pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
+    console::init();
+    kprintln!("NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)");
+    kprintln!("multiboot magic={:#010x} info={:#x} -> long mode OK", magic, info);
+    wdt::report();
+    if cfg!(feature = "attended") {
+        kprintln!("wdt: ATTENDED build: no watchdog, the operator is the safety net (power cycle -> Slot A)");
+        wdt::halt();
+    } else if !wdt::is_qemu_pc() && !wdt::verify_live() && !wdt::neg_control_on_q35() {
+        kprintln!("wdt: reset path not verified on this machine, refusing to run");
+        wdt::hard_reset();
+    }
+    // Key module right after the watchdog gate: copy the seed out and wipe the module before anything else.
+    let client_seed = mb::take_client_key(info);
+    mb::parse_memory(info);
+    let cmdline = mb::cmdline(info);
+    kprintln!("cmdline: {}", cmdline);
+    wdt::rehearse(cmdline);
+
+    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
+    kprintln!("time: TSC {} ticks/ms (PIT ch2 calibrated)", time::init());
+
+    match nic::probe(cmdline.contains("nic=mmio")) {
+        Ok(mut n) => {
+            kprintln!("nic: {} at {} {} mac={}", n.name(), n.bdf, n.bus, dhcp::Mac(n.mac));
+            match n.init() {
+                Ok(()) if cfg!(feature = "attended") => {
+                    kprintln!("udplog: broadcasting this log to UDP 5514");
+                    udplog::dump(&n, 1);
+                    udplog::dhcp_probe(&mut n);
+                    kprintln!("attended: log round 2, then reset");
+                    udplog::dump(&n, 2);
+                }
+                Ok(()) => ssh::run(n, client_seed, cmdline.contains("rng=dump")),
+                Err(e) => kprintln!("nic: init failed: {} (bus mastering left off)", e),
+            }
+        }
+        Err(e) => kprintln!("nic: {}", e),
+    }
+    kprintln!("DONE");
+    if cfg!(feature = "attended") {
+        kprintln!("attended: hard reset via 0xCF9 in 60 s");
+        wdt::delay_ms(60_000);
+        wdt::hard_reset();
+    }
+    loop {
+        unsafe { asm!("cli; hlt") };
+    }
+}
+
+pub fn ram_overlaps(base: u64, len: u64) -> bool {
+    mb::ram_overlaps(base, len)
+}
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    let _ = writeln!(console::Console, "PANIC: {}", info);
+    loop {
+        unsafe { asm!("cli; hlt") };
+    }
+}
+
+exec
+/bin/zsh -lc "rg -n 'cli|sti|delay_ms|out[bwl]|pub fn parse_offer|pub fn captured' src/boot.s src/wdt.rs src/dhcp.rs src/console.rs; git status --short; tcpdump -nn -vv -r proof/attended-udplog.pcap" in ~/nc110-baremetal
+ succeeded in 0ms:
+src/console.rs:2:use crate::port::{inb, outb};
+src/console.rs:27:        outb(COM1 + 1, 0x00); // no interrupts
+src/console.rs:28:        outb(COM1 + 3, 0x80); // DLAB
+src/console.rs:29:        outb(COM1 + 0, 0x01); // divisor 1 = 115200
+src/console.rs:30:        outb(COM1 + 1, 0x00);
+src/console.rs:31:        outb(COM1 + 3, 0x03); // 8N1
+src/console.rs:32:        outb(COM1 + 2, 0xC7); // FIFO
+src/console.rs:33:        outb(COM1 + 4, 0x03);
+src/console.rs:45:        outb(COM1, b);
+src/console.rs:78:pub fn captured() -> &'static [u8] {
+src/dhcp.rs:74:pub fn parse_offer(f: &[u8], xid: u32) -> Option<([u8; 4], [u8; 4])> {
+src/boot.s:25:    cli
+src/boot.s:37:    outl %eax, %dx
+src/boot.s:54:    outl %eax, %dx
+src/boot.s:62:    outl %eax, %dx
+src/boot.s:89:    outl %eax, %dx
+src/boot.s:92:    outw %ax, %dx
+src/boot.s:95:    outw %ax, %dx
+src/boot.s:97:    outw %ax, %dx
+src/boot.s:102:    outw %ax, %dx
+src/boot.s:105:    outw %ax, %dx
+src/boot.s:109:    outw %ax, %dx
+src/boot.s:180:3:  cli
+src/wdt.rs:3:use crate::port::{inl, inw, outb, outw};
+src/wdt.rs:99:    delay_ms(800);
+src/wdt.rs:127:        outb(0xCF9, 0x02);
+src/wdt.rs:128:        outb(0xCF9, 0x06);
+src/wdt.rs:131:        unsafe { core::arch::asm!("cli; hlt") };
+src/wdt.rs:141:        outw(b, 1); // TCO_RLD: reload first, so the halt cannot race an expiry
+src/wdt.rs:142:        outw(b + 8, pre | 0x0800);
+src/wdt.rs:143:        let (c0, c1) = (inw(b), { delay_ms(1200); inw(b) });
+src/wdt.rs:150:    unsafe { outw(base(), 1) };
+src/wdt.rs:158:pub fn delay_ms(ms: u32) {
+src/wdt.rs:181:            delay_ms(500);
+src/wdt.rs:185:    kprintln!("wdt: HANG now: cli; hlt with the timer running, nobody pets");
+src/wdt.rs:187:        unsafe { core::arch::asm!("cli; hlt") };
+ M grub-test/iso/boot/k.elf
+?? grub-test/nc110-attended-k2-entry.cfg
+?? grub-test/wdt-locked-accept.iso
+?? grub-test/wdt-locked-refuse.iso
+?? proof/codex-review-udplog.txt
+reading from file proof/attended-udplog.pcap, link-type EN10MB (Ethernet)
+12:39:58.257730 IP (tos 0x0, ttl 64, id 0, offset 0, flags [DF], proto UDP (17), length 839)
+    192.168.50.118.5514 > 255.255.255.255.5514: [no cksum] UDP, length 811
+12:39:58.278292 IP (tos 0x0, ttl 64, id 272, offset 0, flags [none], proto UDP (17), length 328)
+    0.0.0.0.68 > 255.255.255.255.67: [no cksum] BOOTP/DHCP, Request from 52:54:00:12:34:56, length 300, xid 0x4e433131, Flags [Broadcast] (0x8000)
+	  Client-Ethernet-Address 52:54:00:12:34:56
+	  Vendor-rfc1048 Extensions
+	    Magic Cookie 0x63825363
+	    DHCP-Message (53), length 1: Discover
+	    Hostname (12), length 8: "nc110-bm"
+	    Parameter-Request (55), length 3: 
+	      Subnet-Mask (1), Default-Gateway (3), Domain-Name-Server (6)
+12:39:58.278302 IP (tos 0x10, ttl 64, id 0, offset 0, flags [none], proto UDP (17), length 576)
+    10.0.2.2.67 > 255.255.255.255.68: [udp sum ok] BOOTP/DHCP, Reply, length 548, xid 0x4e433131, Flags [none] (0x0000)
+	  Your-IP 10.0.2.15
+	  Server-IP 10.0.2.2
+	  Client-Ethernet-Address 52:54:00:12:34:56
+	  Vendor-rfc1048 Extensions
+	    Magic Cookie 0x63825363
+	    DHCP-Message (53), length 1: Offer
+	    Server-ID (54), length 4: 10.0.2.2
+	    Subnet-Mask (1), length 4: 255.255.255.0
+	    Default-Gateway (3), length 4: 10.0.2.2
+	    Domain-Name-Server (6), length 4: 10.0.2.3
+	    Lease-Time (51), length 4: 86400
+12:39:58.278880 IP (tos 0x0, ttl 64, id 0, offset 0, flags [DF], proto UDP (17), length 982)
+    192.168.50.118.5514 > 255.255.255.255.5514: [no cksum] UDP, length 954
+
+codex
+Most is sound for this attended, one-shot boot.
+
+- **MUST-FIX:** None found.
+- **SHOULD-FIX:** Existing [parse_offer](~/nc110-baremetal/src/dhcp.rs:74) accepts malformed IPv4/UDP: no version/minimum-IHL, fragmentation, declared-length, or checksum validation. This can produce a false OFFER report, but I found no out-of-bounds access: the initial 286-byte minimum covers even maximum IHL, and subsequent accesses are bounded. Not a blocker for this diagnostic boot.
+- **NIT:** None within scope.
+
+Safety checks pass: maximum log frame is **1056 bytes**, below `BUFSZ=1536`; chunk staging uses **1014/1024 bytes**. The 8192-byte capture produces at most nine chunks, so header digits fit; rounds are 1 and 2. Capture writes are bounded and append beyond the captured slice. RX parsing finishes before release and returns copied addresses, with no subsequent buffer access.
+
+Outbound IPv4/UDP lengths and checksums are correct; zero UDP checksum is legal for IPv4. The committed PCAP also decodes cleanly. No added disk access or storage-controller writes found; existing console/watchdog/reset I/O remains.
+
+**9/10**
+tokens used
+19,061
+Most is sound for this attended, one-shot boot.
+
+- **MUST-FIX:** None found.
+- **SHOULD-FIX:** Existing [parse_offer](~/nc110-baremetal/src/dhcp.rs:74) accepts malformed IPv4/UDP: no version/minimum-IHL, fragmentation, declared-length, or checksum validation. This can produce a false OFFER report, but I found no out-of-bounds access: the initial 286-byte minimum covers even maximum IHL, and subsequent accesses are bounded. Not a blocker for this diagnostic boot.
+- **NIT:** None within scope.
+
+Safety checks pass: maximum log frame is **1056 bytes**, below `BUFSZ=1536`; chunk staging uses **1014/1024 bytes**. The 8192-byte capture produces at most nine chunks, so header digits fit; rounds are 1 and 2. Capture writes are bounded and append beyond the captured slice. RX parsing finishes before release and returns copied addresses, with no subsequent buffer access.
+
+Outbound IPv4/UDP lengths and checksums are correct; zero UDP checksum is legal for IPv4. The committed PCAP also decodes cleanly. No added disk access or storage-controller writes found; existing console/watchdog/reset I/O remains.
+
+**9/10**

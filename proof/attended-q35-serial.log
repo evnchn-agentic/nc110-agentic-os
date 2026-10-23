@@ -1,0 +1,15 @@
+NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: armed by boot.s (result=0)
+wdt: TCOBASE=0x660 GCS 0x00000000 -> 0x00000000 NO_REBOOT=0 TCO1_CNT=0x0000 HLT=0 LOCK=0
+wdt: before-clear TCO1_STS=0x0000 TCO2_STS=0x0000 SECOND_TO_STS=0 BOOT_STS=0
+wdt: TCO_TMR=5 ticks x 0.6 s, reset expected after 2nd expiry (~6000 ms)
+wdt: ATTENDED build: no watchdog, the operator is the safety net (power cycle -> Slot A)
+wdt: halt: TCO1_CNT 0x0000 -> 0x0800, RLD 5 -> 5 (halted)
+keymod: no multiboot module
+cmdline: target/attended/x86_64-unknown-none/release/nc110-kernel 
+time: TSC 998800 ticks/ms (PIT ch2 calibrated)
+nic: no 10ec:8136 or 10ec:8139 found (bridges walked)
+DONE
+attended: hard reset via 0xCF9 in 60 s
+wdt: hard reset via 0xCF9

@@ -1,0 +1,14 @@
+[  0.000s] host: qemu-system-x86_64 -machine q35 -m 128 -display none -vga std -global ICH9-LPC.noreboot=false -action watchdog=reset -serial file:~/nc110-baremetal/proof/.wdt-neg.serial -qmp unix:~/nc110-baremetal/proof/.qmp.sock,server,wait=off -kernel target/neg/x86_64-unknown-none/release/nc110-kernel -append wdt=hang
+[  0.122s] serial: NC110 bare-metal M0: hello from our own x86_64 kernel (Rust, no_std)
+[  0.122s] host: boot #1
+[  0.122s] serial: multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+[  0.122s] serial: wdt: armed by boot.s (result=0)
+[  0.122s] serial: wdt: TCOBASE=0x660 GCS 0x00000000 -> 0x00000020 NO_REBOOT=1 TCO1_CNT=0x0000 HLT=0 LOCK=0
+[  0.122s] serial: wdt: before-clear TCO1_STS=0x0000 TCO2_STS=0x0000 SECOND_TO_STS=0 BOOT_STS=0
+[  0.122s] serial: wdt: TCO_TMR=5 ticks x 0.6 s, reset expected after 2nd expiry (~6000 ms)
+[  0.934s] serial: wdt: verify NO_REBOOT=1 HLT=0 TMR=5 count 4->3 => NOT VERIFIED
+[  0.934s] serial: wdt: neg-control build on q35: proceeding unverified on purpose
+[  0.934s] serial: cmdline: target/neg/x86_64-unknown-none/release/nc110-kernel wdt=hang
+[  0.934s] serial: wdt: HANG now: cli; hlt with the timer running, nobody pets
+[ 25.021s] host: stop: banners=1 want=2 elapsed=25.0s
+[ 25.034s] host: VERDICT expect=none: PASS (no WATCHDOG/RESET for 24.1s after HANG)

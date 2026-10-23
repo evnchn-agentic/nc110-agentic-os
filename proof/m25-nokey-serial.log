@@ -1,0 +1,9 @@
+NC110 bare-metal M2.5: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: skipped (LPC 00:1f.0 is not ICH9 8086:2918 / NM10 8086:27bc) (result=1)
+keymod: no multiboot module
+cmdline: ~/nc110-baremetal/target/x86_64-unknown-none/release/nc110-kernel 
+time: TSC 999300 ticks/ms (PIT ch2 calibrated)
+nic: rtl8139 C+ (10ec:8139) at 00:03.0 io=0xc000 mac=52:54:00:4e:43:11
+ssh: no client key module (GRUB `module` / QEMU -initrd) -> refusing to run SSH
+DONE

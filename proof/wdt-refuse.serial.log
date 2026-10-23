@@ -1,0 +1,46 @@
+NC110 bare-metal M0: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: left to GRUB (grub-armed build); live registers follow (result=4)
+wdt: live TCOBASE=0x660 GCS=0x00000020 NO_REBOOT=1 TCO1_CNT=0x0000 HLT=0 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=4
+wdt: verify NO_REBOOT=1 HLT=0 TMR=4 count 0->0 => NOT VERIFIED
+wdt: reset path not verified on this machine, refusing to run
+wdt: hard reset via 0xCF9
+NC110 bare-metal M0: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: left to GRUB (grub-armed build); live registers follow (result=4)
+wdt: live TCOBASE=0x660 GCS=0x00000020 NO_REBOOT=1 TCO1_CNT=0x0000 HLT=0 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=4
+wdt: verify NO_REBOOT=1 HLT=0 TMR=4 count 0->0 => NOT VERIFIED
+wdt: reset path not verified on this machine, refusing to run
+wdt: hard reset via 0xCF9
+NC110 bare-metal M0: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: left to GRUB (grub-armed build); live registers follow (result=4)
+wdt: live TCOBASE=0x660 GCS=0x00000020 NO_REBOOT=1 TCO1_CNT=0x0000 HLT=0 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=4
+wdt: verify NO_REBOOT=1 HLT=0 TMR=4 count 0->0 => NOT VERIFIED
+wdt: reset path not verified on this machine, refusing to run
+wdt: hard reset via 0xCF9
+NC110 bare-metal M0: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: left to GRUB (grub-armed build); live registers follow (result=4)
+wdt: live TCOBASE=0x660 GCS=0x00000020 NO_REBOOT=1 TCO1_CNT=0x0000 HLT=0 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=4
+wdt: verify NO_REBOOT=1 HLT=0 TMR=4 count 0->0 => NOT VERIFIED
+wdt: reset path not verified on this machine, refusing to run
+wdt: hard reset via 0xCF9
+NC110 bare-metal M0: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: left to GRUB (grub-armed build); live registers follow (result=4)
+wdt: live TCOBASE=0x660 GCS=0x00000020 NO_REBOOT=1 TCO1_CNT=0x0000 HLT=0 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=4
+wdt: verify NO_REBOOT=1 HLT=0 TMR=4 count 0->0 => NOT VERIFIED
+wdt: reset path not verified on this machine, refusing to run
+wdt: hard reset via 0xCF9
+NC110 bare-metal M0: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: left to GRUB (grub-armed build); live registers follow (result=4)
+wdt: live TCOBASE=0x660 GCS=0x00000020 NO_REBOOT=1 TCO1_CNT=0x0000 HLT=0 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=4
+wdt: verify NO_REBOOT=1 HLT=0 TMR=4 count 0->0 => NOT VERIFIED
+wdt: reset path not verified on this machine, refusing to run
+wdt: hard reset via 0xCF9
+NC110 bare-metal M0: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: left to GRUB (grub-armed build); live registers follow (result=4)
+wdt: live TCOBASE=0x660 GCS=0x00000020 NO_REBOOT=1 TCO1_CNT=0x0000 HLT=0 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=4

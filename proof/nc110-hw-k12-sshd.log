@@ -1,0 +1,293 @@
+debug1: Set /proc/self/oom_score_adj from 0 to -1000
+debug1: Bind to port 22 on 0.0.0.0.
+Server listening on 0.0.0.0 port 22.
+debug1: Bind to port 22 on ::.
+Server listening on :: port 22.
+debug1: Forked child 14.
+debug1: Set /proc/self/oom_score_adj to 0
+debug1: rexec start in 5 out 5 newsock 5 pipe 7 sock 8
+debug1: inetd sockets after dupping: 4, 4
+Connection from 192.168.215.1 port 52446 on 192.168.215.3 port 22 rdomain ""
+debug1: Local version string SSH-2.0-OpenSSH_9.7
+debug1: Remote protocol version 2.0, remote software version Sunset-0.6.0
+debug1: compat_banner: no match: Sunset-0.6.0
+debug1: permanently_set_uid: 22/22 [preauth]
+debug1: list_hostkey_types: ssh-ed25519 [preauth]
+debug1: SSH2_MSG_KEXINIT sent [preauth]
+debug1: SSH2_MSG_KEXINIT received [preauth]
+debug1: kex: algorithm: curve25519-sha256 [preauth]
+debug1: kex: host key algorithm: ssh-ed25519 [preauth]
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none [preauth]
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none [preauth]
+debug1: expecting SSH2_MSG_KEX_ECDH_INIT [preauth]
+debug1: SSH2_MSG_KEX_ECDH_INIT received [preauth]
+debug1: ssh_packet_send2_wrapped: resetting send seqnr 3 [preauth]
+debug1: rekey out after 134217728 blocks [preauth]
+debug1: SSH2_MSG_NEWKEYS sent [preauth]
+debug1: Sending SSH2_MSG_EXT_INFO [preauth]
+debug1: expecting SSH2_MSG_NEWKEYS [preauth]
+debug1: ssh_packet_read_poll2: resetting read seqnr 3 [preauth]
+debug1: SSH2_MSG_NEWKEYS received [preauth]
+debug1: rekey in after 134217728 blocks [preauth]
+debug1: KEX done [preauth]
+debug1: userauth-request for user evnchn service ssh-connection method none [preauth]
+debug1: attempt 0 failures 0 [preauth]
+debug1: authentication methods list 0: publickey
+debug1: authentication methods list 0: publickey [preauth]
+debug1: userauth-request for user evnchn service ssh-connection method publickey [preauth]
+debug1: attempt 1 failures 0 [preauth]
+debug1: userauth_pubkey: publickey test pkalg ssh-ed25519 pkblob ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY [preauth]
+debug1: temporarily_use_uid: 1000/1000 (e=0/0)
+debug1: trying public key file /keys/authorized_keys
+debug1: fd 5 clearing O_NONBLOCK
+debug1: /keys/authorized_keys:1: matching key found: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+debug1: /keys/authorized_keys:1: key options: agent-forwarding port-forwarding pty user-rc x11-forwarding
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at /keys/authorized_keys:1
+debug1: restore_uid: 0/0
+Postponed publickey for evnchn from 192.168.215.1 port 52446 ssh2 [preauth]
+debug1: userauth-request for user evnchn service ssh-connection method publickey [preauth]
+debug1: attempt 2 failures 0 [preauth]
+debug1: temporarily_use_uid: 1000/1000 (e=0/0)
+debug1: trying public key file /keys/authorized_keys
+debug1: fd 5 clearing O_NONBLOCK
+debug1: /keys/authorized_keys:1: matching key found: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+debug1: /keys/authorized_keys:1: key options: agent-forwarding port-forwarding pty user-rc x11-forwarding
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at /keys/authorized_keys:1
+debug1: restore_uid: 0/0
+debug1: auth_activate_options: setting new authentication options
+Accepted publickey for evnchn from 192.168.215.1 port 52446 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+debug1: monitor_child_preauth: user evnchn authenticated by privileged process
+debug1: auth_activate_options: setting new authentication options [preauth]
+debug1: monitor_read_log: child log fd closed
+User child is on pid 16
+debug1: permanently_set_uid: 1000/1000
+debug1: rekey in after 134217728 blocks
+debug1: rekey out after 134217728 blocks
+debug1: ssh_packet_set_postauth: called
+debug1: active: key options: agent-forwarding port-forwarding pty user-rc x11-forwarding
+debug1: Entering interactive session for SSH2.
+debug1: server_init_dispatch
+debug1: server_input_channel_open: ctype session rchan 0 win 1000 max 1000
+debug1: input_session_request
+debug1: channel 0: new session [server-session] (inactive timeout: 0)
+debug1: session_new: session 0
+debug1: session_open: channel 0
+debug1: session_open: session 0: link with channel 0
+debug1: server_input_channel_open: confirm session
+debug1: server_input_channel_req: channel 0 request pty-req reply 0
+debug1: session_by_channel: session 0 channel 0
+debug1: session_input_channel_req: session 0 req pty-req
+debug1: Allocating pty.
+debug1: session_new: session 0
+debug1: session_pty_req: session 0 alloc /dev/pts/0
+debug1: server_input_channel_req: channel 0 request shell reply 0
+debug1: session_by_channel: session 0 channel 0
+debug1: session_input_channel_req: session 0 req shell
+Starting session: forced-command (config) '/bin/sh -c 'seq 1 300000; echo nc110-load-done'' on pts/0 for evnchn from 192.168.215.1 port 52446 id 0
+debug1: server_input_channel_req: channel 0 request window-change reply 0
+debug1: session_by_channel: session 0 channel 0
+debug1: session_input_channel_req: session 0 req window-change
+debug1: Setting controlling tty using TIOCSCTTY.
+Connection closed by 192.168.215.1 port 52446
+debug1: channel 0: free: server-session, nchannels 1
+Close session: user evnchn from 192.168.215.1 port 52446 id 0
+debug1: do_cleanup
+Transferred: sent 2155296, received 42428 bytes
+Closing connection to 192.168.215.1 port 52446
+debug1: session_by_tty: session 0 tty /dev/pts/0
+debug1: session_pty_cleanup2: session 0 release /dev/pts/0
+debug1: Forked child 19.
+debug1: Set /proc/self/oom_score_adj to 0
+debug1: rexec start in 5 out 5 newsock 5 pipe 7 sock 8
+debug1: inetd sockets after dupping: 4, 4
+Connection from 192.168.215.1 port 49934 on 192.168.215.3 port 22 rdomain ""
+debug1: Local version string SSH-2.0-OpenSSH_9.7
+debug1: Remote protocol version 2.0, remote software version Sunset-0.6.0
+debug1: compat_banner: no match: Sunset-0.6.0
+debug1: permanently_set_uid: 22/22 [preauth]
+debug1: list_hostkey_types: ssh-ed25519 [preauth]
+debug1: SSH2_MSG_KEXINIT sent [preauth]
+debug1: SSH2_MSG_KEXINIT received [preauth]
+debug1: kex: algorithm: curve25519-sha256 [preauth]
+debug1: kex: host key algorithm: ssh-ed25519 [preauth]
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none [preauth]
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none [preauth]
+debug1: expecting SSH2_MSG_KEX_ECDH_INIT [preauth]
+debug1: SSH2_MSG_KEX_ECDH_INIT received [preauth]
+debug1: ssh_packet_send2_wrapped: resetting send seqnr 3 [preauth]
+debug1: rekey out after 134217728 blocks [preauth]
+debug1: SSH2_MSG_NEWKEYS sent [preauth]
+debug1: Sending SSH2_MSG_EXT_INFO [preauth]
+debug1: expecting SSH2_MSG_NEWKEYS [preauth]
+debug1: ssh_packet_read_poll2: resetting read seqnr 3 [preauth]
+debug1: SSH2_MSG_NEWKEYS received [preauth]
+debug1: rekey in after 134217728 blocks [preauth]
+debug1: KEX done [preauth]
+debug1: userauth-request for user evnchn service ssh-connection method none [preauth]
+debug1: attempt 0 failures 0 [preauth]
+debug1: authentication methods list 0: publickey
+debug1: authentication methods list 0: publickey [preauth]
+debug1: userauth-request for user evnchn service ssh-connection method publickey [preauth]
+debug1: attempt 1 failures 0 [preauth]
+debug1: userauth_pubkey: publickey test pkalg ssh-ed25519 pkblob ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY [preauth]
+debug1: temporarily_use_uid: 1000/1000 (e=0/0)
+debug1: trying public key file /keys/authorized_keys
+debug1: fd 5 clearing O_NONBLOCK
+debug1: /keys/authorized_keys:1: matching key found: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+debug1: /keys/authorized_keys:1: key options: agent-forwarding port-forwarding pty user-rc x11-forwarding
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at /keys/authorized_keys:1
+debug1: restore_uid: 0/0
+Postponed publickey for evnchn from 192.168.215.1 port 49934 ssh2 [preauth]
+debug1: userauth-request for user evnchn service ssh-connection method publickey [preauth]
+debug1: attempt 2 failures 0 [preauth]
+debug1: temporarily_use_uid: 1000/1000 (e=0/0)
+debug1: trying public key file /keys/authorized_keys
+debug1: fd 5 clearing O_NONBLOCK
+debug1: /keys/authorized_keys:1: matching key found: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+debug1: /keys/authorized_keys:1: key options: agent-forwarding port-forwarding pty user-rc x11-forwarding
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at /keys/authorized_keys:1
+debug1: restore_uid: 0/0
+debug1: auth_activate_options: setting new authentication options
+Accepted publickey for evnchn from 192.168.215.1 port 49934 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+debug1: monitor_child_preauth: user evnchn authenticated by privileged process
+debug1: auth_activate_options: setting new authentication options [preauth]
+debug1: monitor_read_log: child log fd closed
+User child is on pid 21
+debug1: permanently_set_uid: 1000/1000
+debug1: rekey in after 134217728 blocks
+debug1: rekey out after 134217728 blocks
+debug1: ssh_packet_set_postauth: called
+debug1: active: key options: agent-forwarding port-forwarding pty user-rc x11-forwarding
+debug1: Entering interactive session for SSH2.
+debug1: server_init_dispatch
+debug1: server_input_channel_open: ctype session rchan 0 win 1000 max 1000
+debug1: input_session_request
+debug1: channel 0: new session [server-session] (inactive timeout: 0)
+debug1: session_new: session 0
+debug1: session_open: channel 0
+debug1: session_open: session 0: link with channel 0
+debug1: server_input_channel_open: confirm session
+debug1: server_input_channel_req: channel 0 request pty-req reply 0
+debug1: session_by_channel: session 0 channel 0
+debug1: session_input_channel_req: session 0 req pty-req
+debug1: Allocating pty.
+debug1: session_new: session 0
+debug1: session_pty_req: session 0 alloc /dev/pts/0
+debug1: server_input_channel_req: channel 0 request shell reply 0
+debug1: session_by_channel: session 0 channel 0
+debug1: session_input_channel_req: session 0 req shell
+Starting session: forced-command (config) '/bin/sh -c 'seq 1 300000; echo nc110-load-done'' on pts/0 for evnchn from 192.168.215.1 port 49934 id 0
+debug1: server_input_channel_req: channel 0 request window-change reply 0
+debug1: session_by_channel: session 0 channel 0
+debug1: session_input_channel_req: session 0 req window-change
+debug1: Setting controlling tty using TIOCSCTTY.
+debug1: Received SIGCHLD.
+debug1: session_by_pid: pid 22
+debug1: session_exit_message: session 0 channel 0 pid 22 exit 0
+debug1: session_exit_message: release channel 0
+debug1: session_by_tty: session 0 tty /dev/pts/0
+debug1: session_pty_cleanup2: session 0 release /dev/pts/0
+Connection closed by 192.168.215.1 port 49934
+debug1: channel 0: free: server-session, nchannels 1
+Close session: user evnchn from 192.168.215.1 port 49934 id 0
+debug1: do_cleanup
+Transferred: sent 2372876, received 46568 bytes
+Closing connection to 192.168.215.1 port 49934
+debug1: Forked child 24.
+debug1: Set /proc/self/oom_score_adj to 0
+debug1: rexec start in 5 out 5 newsock 5 pipe 7 sock 8
+debug1: inetd sockets after dupping: 4, 4
+Connection from 192.168.215.1 port 48710 on 192.168.215.3 port 22 rdomain ""
+debug1: Local version string SSH-2.0-OpenSSH_9.7
+debug1: Remote protocol version 2.0, remote software version Sunset-0.6.0
+debug1: compat_banner: no match: Sunset-0.6.0
+debug1: permanently_set_uid: 22/22 [preauth]
+debug1: list_hostkey_types: ssh-ed25519 [preauth]
+debug1: SSH2_MSG_KEXINIT sent [preauth]
+debug1: SSH2_MSG_KEXINIT received [preauth]
+debug1: kex: algorithm: curve25519-sha256 [preauth]
+debug1: kex: host key algorithm: ssh-ed25519 [preauth]
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none [preauth]
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none [preauth]
+debug1: expecting SSH2_MSG_KEX_ECDH_INIT [preauth]
+debug1: SSH2_MSG_KEX_ECDH_INIT received [preauth]
+debug1: ssh_packet_send2_wrapped: resetting send seqnr 3 [preauth]
+debug1: rekey out after 134217728 blocks [preauth]
+debug1: SSH2_MSG_NEWKEYS sent [preauth]
+debug1: Sending SSH2_MSG_EXT_INFO [preauth]
+debug1: expecting SSH2_MSG_NEWKEYS [preauth]
+debug1: ssh_packet_read_poll2: resetting read seqnr 3 [preauth]
+debug1: SSH2_MSG_NEWKEYS received [preauth]
+debug1: rekey in after 134217728 blocks [preauth]
+debug1: KEX done [preauth]
+debug1: userauth-request for user evnchn service ssh-connection method none [preauth]
+debug1: attempt 0 failures 0 [preauth]
+debug1: authentication methods list 0: publickey
+debug1: authentication methods list 0: publickey [preauth]
+debug1: userauth-request for user evnchn service ssh-connection method publickey [preauth]
+debug1: attempt 1 failures 0 [preauth]
+debug1: userauth_pubkey: publickey test pkalg ssh-ed25519 pkblob ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY [preauth]
+debug1: temporarily_use_uid: 1000/1000 (e=0/0)
+debug1: trying public key file /keys/authorized_keys
+debug1: fd 5 clearing O_NONBLOCK
+debug1: /keys/authorized_keys:1: matching key found: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+debug1: /keys/authorized_keys:1: key options: agent-forwarding port-forwarding pty user-rc x11-forwarding
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at /keys/authorized_keys:1
+debug1: restore_uid: 0/0
+Postponed publickey for evnchn from 192.168.215.1 port 48710 ssh2 [preauth]
+debug1: userauth-request for user evnchn service ssh-connection method publickey [preauth]
+debug1: attempt 2 failures 0 [preauth]
+debug1: temporarily_use_uid: 1000/1000 (e=0/0)
+debug1: trying public key file /keys/authorized_keys
+debug1: fd 5 clearing O_NONBLOCK
+debug1: /keys/authorized_keys:1: matching key found: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+debug1: /keys/authorized_keys:1: key options: agent-forwarding port-forwarding pty user-rc x11-forwarding
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at /keys/authorized_keys:1
+debug1: restore_uid: 0/0
+debug1: auth_activate_options: setting new authentication options
+Accepted publickey for evnchn from 192.168.215.1 port 48710 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+debug1: monitor_child_preauth: user evnchn authenticated by privileged process
+debug1: auth_activate_options: setting new authentication options [preauth]
+debug1: monitor_read_log: child log fd closed
+User child is on pid 26
+debug1: permanently_set_uid: 1000/1000
+debug1: rekey in after 134217728 blocks
+debug1: rekey out after 134217728 blocks
+debug1: ssh_packet_set_postauth: called
+debug1: active: key options: agent-forwarding port-forwarding pty user-rc x11-forwarding
+debug1: Entering interactive session for SSH2.
+debug1: server_init_dispatch
+debug1: server_input_channel_open: ctype session rchan 0 win 1000 max 1000
+debug1: input_session_request
+debug1: channel 0: new session [server-session] (inactive timeout: 0)
+debug1: session_new: session 0
+debug1: session_open: channel 0
+debug1: session_open: session 0: link with channel 0
+debug1: server_input_channel_open: confirm session
+debug1: server_input_channel_req: channel 0 request pty-req reply 0
+debug1: session_by_channel: session 0 channel 0
+debug1: session_input_channel_req: session 0 req pty-req
+debug1: Allocating pty.
+debug1: session_new: session 0
+debug1: session_pty_req: session 0 alloc /dev/pts/0
+debug1: server_input_channel_req: channel 0 request shell reply 0
+debug1: session_by_channel: session 0 channel 0
+debug1: session_input_channel_req: session 0 req shell
+Starting session: forced-command (config) '/bin/sh -c 'seq 1 300000; echo nc110-load-done'' on pts/0 for evnchn from 192.168.215.1 port 48710 id 0
+debug1: server_input_channel_req: channel 0 request window-change reply 0
+debug1: Setting controlling tty using TIOCSCTTY.
+debug1: session_by_channel: session 0 channel 0
+debug1: session_input_channel_req: session 0 req window-change
+debug1: Received SIGCHLD.
+debug1: session_by_pid: pid 27
+debug1: session_exit_message: session 0 channel 0 pid 27 exit 0
+debug1: session_exit_message: release channel 0
+debug1: session_by_tty: session 0 tty /dev/pts/0
+debug1: session_pty_cleanup2: session 0 release /dev/pts/0
+channel 0: chan_read_failed for istate 1
+Connection closed by 192.168.215.1 port 48710
+debug1: channel 0: free: server-session, nchannels 1
+Close session: user evnchn from 192.168.215.1 port 48710 id 0
+debug1: do_cleanup
+Transferred: sent 2370720, received 46188 bytes
+Closing connection to 192.168.215.1 port 48710

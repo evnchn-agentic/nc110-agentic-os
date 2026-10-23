@@ -1,0 +1,3838 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a14643-fd68-7d53-a5f4-c722ab81f6c1
+--------
+user
+Follow-up review, calibrated (MUST-FIX/SHOULD-FIX/NIT, signal over volume). Repo ~/nc110-baremetal. Your previous review is proof/codex-review-m3.txt (on commit 7cbb8e3). The fixes are in b136578: git diff 7cbb8e3 b136578 -- src run-m3.py. Check whether each of your 4 findings is actually resolved and whether the fixes introduced new defects (e.g. kbd::init i8042 command-byte read stealing keystrokes or hanging, Ctrl-Alt-Del detection, the may_recv close path, keepalive/timeout). Proof logs: proof/m3-peerkill-serial.log (fixed) vs proof/m3-peerkill-nofix-serial.log (fix reverted, hangs), proof/m3-cad-serial.log. Do not edit files. End with a 0-10 score.
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll check the four original findings against the fixes, then review the changed paths and proof logs for regressions. I won’t edit files.
+exec
+/bin/zsh -lc 'cat proof/codex-review-m3.txt; git diff 7cbb8e3 b136578 -- src run-m3.py' in ~/nc110-baremetal
+ succeeded in 0ms:
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a1463d-3f63-7700-a099-0961f1e9a28e
+--------
+user
+You are a skeptical second-lineage reviewer. Repo: ~/nc110-baremetal, commit 7cbb8e3 (diff vs 27afaf8: git diff 27afaf8 7cbb8e3 -- src run-m3.py tools). A bare-metal Rust no_std x86_64 kernel now runs an interactive SSH shell: src/kbd.rs (polled i8042 PS/2, scancode set 1 -> ASCII), src/term.rs (VGA 80x25 VT100 subset), src/ssh.rs (Sunset 0.6.0 pty-req + shell, keyboard->channel, channel->terminal). QEMU proof passes (proof/m3-serial.log). Assume it is broken and try to refute it, calibrated: tier findings MUST-FIX / SHOULD-FIX / NIT, signal over volume, 'most is sound' is a valid verdict. Focus: (1) memory safety / out-of-bounds in term.rs (cursor/row/col arithmetic, CSI params, P/@/X/L/M), (2) kbd.rs buffer handling and lost bytes, (3) ssh.rs loop: write_channel partial writes, termination, infinite loop with shell_open and no deadline, watchdog petting semantics (it pets the TCO in the main loop when armed), (4) anything that would break on real NC110 hardware (EC-emulated i8042, translation). Do not edit files. End with a 0-10 score.
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll inspect the diff and surrounding code, then check the terminal bounds, keyboard handling, and SSH loop against the proof’s coverage. I won’t edit files.
+exec
+/bin/zsh -lc 'git diff 27afaf8 7cbb8e3 -- src run-m3.py tools' in ~/nc110-baremetal
+ succeeded in 0ms:
+diff --git a/run-m3.py b/run-m3.py
+new file mode 100644
+index 0000000..ef177ce
+--- /dev/null
++++ b/run-m3.py
+@@ -0,0 +1,120 @@
++#!/usr/bin/env python3
++"""M3 proof: boot the kernel in QEMU, let it SSH into a throwaway sshd (127.0.0.1:2223, interactive /bin/sh via
++ForceCommand, tools/sshd_config.m3), then TYPE into the guest's PS/2 keyboard with the monitor's `sendkey`.
++
++Typed: `echo nc110-m3-okxy` + 2 Backspace, `echo $((6*7))` (shifted keys), `sleep 30` + Ctrl-C, printf with CSI D/K,
++`seq 1 30` (scroll), `uname -a`, `exit`.
++Writes proof/m3-serial.log, m3-sshd.log, m3-screen.png (after uname output), m3-screen-exit.png, m3-net.pcap.
++One QEMU (-m 256) and one sshd at a time; both are always killed on exit.
++"""
++import os, socket, subprocess, sys, time
++
++ROOT = os.path.dirname(os.path.abspath(__file__))
++PROOF = os.path.join(ROOT, "proof")
++KERNEL = os.path.join(ROOT, "target/x86_64-unknown-none/release/nc110-kernel")
++SERIAL, SSHD_LOG, PNG0, PNG, PNG2, PCAP = (os.path.join(PROOF, "m3-" + n) for n in
++    ("serial.log", "sshd.log", "screen-early.png", "screen.png", "screen-exit.png", "net.pcap"))
++MON = os.path.join(PROOF, ".monitor.sock")
++SSHD_CFG = os.path.join(ROOT, "tools/sshd_config.m3")
++PIDFILE = os.path.join(ROOT, "test-keys/sshd-m3.pid")
++
++KEYS = {" ": "spc", "-": "minus", "\n": "ret", "\b": "backspace", "$": "shift-4", "(": "shift-9", ")": "shift-0", "*": "shift-8",
++        "'": "apostrophe", "\\": "backslash", "[": "bracket_left"}
++
++
++def serial():
++    try:
++        return open(SERIAL, "rb").read().decode(errors="replace")
++    except FileNotFoundError:
++        return ""
++
++
++def wait_for(pred, what, timeout):
++    t0 = time.time()
++    while time.time() - t0 < timeout:
++        if pred(serial()):
++            print(f"  ok: {what} ({time.time() - t0:.1f}s)")
++            return True
++        time.sleep(0.2)
++    print(f"  TIMEOUT waiting for {what}")
++    return False
++
++
++for p in (SERIAL, SSHD_LOG, PNG0, PNG, PNG2, PCAP, MON):
++    if os.path.exists(p):
++        os.unlink(p)
++
++sshd = subprocess.Popen(["/usr/sbin/sshd", "-D", "-e", "-f", SSHD_CFG], stderr=open(SSHD_LOG, "wb"))
++time.sleep(1)
++cmd = ["qemu-system-x86_64", "-machine", "pc", "-cpu", "max", "-m", "256", "-no-reboot",
++       "-display", "none", "-vga", "std", "-serial", f"file:{SERIAL}", "-monitor", f"unix:{MON},server,nowait",
++       "-netdev", "user,id=n0", "-device", "rtl8139,netdev=n0,mac=52:54:00:4e:43:11",
++       "-object", f"filter-dump,id=f0,netdev=n0,file={PCAP}",
++       "-kernel", KERNEL, "-initrd", os.path.join(ROOT, "test-keys/client.key")]
++print("+", " ".join(cmd))
++q = subprocess.Popen(cmd)
++ok = False
++try:
++    time.sleep(1)
++    mon = socket.socket(socket.AF_UNIX)
++    mon.connect(MON)
++    mon.setblocking(False)
++
++    def hmp(line):
++        mon.sendall((line + "\n").encode())
++        time.sleep(0.08)
++        try:
++            mon.recv(65536)
++        except BlockingIOError:
++            pass
++
++    def typ(s):
++        print(f"  typing {s!r}")
++        for ch in s:
++            hmp("sendkey " + KEYS.get(ch, "shift-" + ch.lower() if ch.isupper() else ch))
++
++    prompts = lambda s: s.count("nc110$ ")
++    steps = [
++        wait_for(lambda s: prompts(s) >= 1, "shell prompt", 60),
++    ]
++    if all(steps):
++        typ("echo nc110-m3-okxy\b\b\n")  # two Backspaces: the pty must erase "xy"
++        steps.append(wait_for(lambda s: s.count("nc110-m3-ok") >= 2 and prompts(s) >= 2, "echo output", 20))
++        typ("echo $((6*7))\n")
++        steps.append(wait_for(lambda s: "\r\n42\r\n" in s and prompts(s) >= 3, "shifted keys -> 42", 20))
++        typ("sleep 30\n")
++        time.sleep(2)
++        t_c = time.time()
++        hmp("sendkey ctrl-c")
++        print("  typing Ctrl-C")
++        steps.append(wait_for(lambda s: prompts(s) >= 4, "prompt back after Ctrl-C (sleep 30 interrupted)", 10))
++        print(f"  Ctrl-C to prompt: {time.time() - t_c:.1f}s")
++        # Terminal escapes: CSI 1 D (cursor left) then CSI K (erase to EOL): screen must read "AXZ", not "ABXZ".
++        typ("printf 'AB\\033[1DX\\033[KZ\\n'\n")
++        steps.append(wait_for(lambda s: "\x1b[1DX\x1b[KZ" in s.replace("^[", "\x1b") and prompts(s) >= 5, "CSI D/K test", 20))
++        time.sleep(0.3)
++        hmp(f"screendump {PNG0} -f png")  # before scrolling: echo / 42 / ^C / CSI lines
++        typ("seq 1 30\n")  # forces the 80x25 screen to scroll
++        steps.append(wait_for(lambda s: "\r\n30\r\n" in s and prompts(s) >= 6, "scroll test", 20))
++        typ("uname -a\n")
++        steps.append(wait_for(lambda s: "Darwin" in s and prompts(s) >= 7, "uname -a output", 20))
++        time.sleep(0.5)
++        hmp(f"screendump {PNG} -f png")
++        typ("exit\n")
++        steps.append(wait_for(lambda s: "DONE" in s, "session closed, DONE", 20))
++        time.sleep(0.3)
++        hmp(f"screendump {PNG2} -f png")
++        time.sleep(0.5)
++    ok = all(steps)
++    hmp("quit")
++    q.wait(timeout=10)
++finally:
++    if q.poll() is None:
++        q.kill()
++    sshd.terminate()
++    sshd.wait(timeout=5)
++    for p in (MON, PIDFILE):
++        if os.path.exists(p):
++            os.unlink(p)
++print("RESULT:", "PASS" if ok else "FAIL")
++sys.exit(0 if ok else 1)
+diff --git a/src/console.rs b/src/console.rs
+index c026a65..7ee4fb0 100644
+--- a/src/console.rs
++++ b/src/console.rs
+@@ -10,6 +10,17 @@ const ATTR: u16 = 0x1F00; // white on blue
+ 
+ static mut ROW: usize = 0;
+ static mut COL: usize = 0;
++/// Cleared when the SSH terminal takes over the screen: log lines then go to COM1 only.
++static mut VGA_LOG: bool = true;
++
++pub fn vga_log_off() {
++    unsafe { VGA_LOG = false };
++}
++
++/// Raw byte to COM1 (used to mirror the remote shell's output into the serial log).
++pub fn serial_raw(b: u8) {
++    serial_putc(b);
++}
+ 
+ pub fn init() {
+     unsafe {
+@@ -68,7 +79,9 @@ impl fmt::Write for Console {
+                 serial_putc(b'\r');
+             }
+             serial_putc(b);
+-            vga_putc(b);
++            if unsafe { VGA_LOG } {
++                vga_putc(b);
++            }
+         }
+         Ok(())
+     }
+diff --git a/src/kbd.rs b/src/kbd.rs
+new file mode 100644
+index 0000000..f3a9296
+--- /dev/null
++++ b/src/kbd.rs
+@@ -0,0 +1,156 @@
++//! PS/2 keyboard, polled through the i8042 (data 0x60, status 0x64), scancode set 1.
++//!
++//! Set 1 because the firmware leaves the i8042's set-2 -> set-1 translation on (SeaBIOS in QEMU does;
++//! on the NC110 the internal keyboard sits behind the EC's i8042 emulation, which is the same 0x60/0x64
++//! interface; its translation state is unverified until M1-on-hardware). We never reprogram the controller.
++//! Output is what an xterm would send: Enter = CR, Backspace = DEL (0x7F), Ctrl+letter = letter & 0x1F,
++//! arrows/Home/End/Delete as CSI sequences. US layout only.
++use crate::port::inb;
++
++const DATA: u16 = 0x60;
++const STATUS: u16 = 0x64;
++
++static mut SHIFT_L: bool = false;
++static mut SHIFT_R: bool = false;
++static mut CTRL: bool = false;
++static mut CAPS: bool = false;
++static mut E0: bool = false;
++
++// Set 1 make codes 0x00..0x3A, US layout: (unshifted, shifted); 0 = not a character key.
++const MAP: [(u8, u8); 0x3A] = {
++    let mut m = [(0u8, 0u8); 0x3A];
++    m[0x01] = (0x1B, 0x1B);
++    let row1 = b"1234567890-=";
++    let row1s = b"!@#$%^&*()_+";
++    let mut i = 0;
++    while i < 12 {
++        m[0x02 + i] = (row1[i], row1s[i]);
++        i += 1;
++    }
++    m[0x0E] = (0x7F, 0x7F);
++    m[0x0F] = (b'\t', b'\t');
++    let row2 = b"qwertyuiop[]";
++    let row2s = b"QWERTYUIOP{}";
++    i = 0;
++    while i < 12 {
++        m[0x10 + i] = (row2[i], row2s[i]);
++        i += 1;
++    }
++    m[0x1C] = (b'\r', b'\r');
++    let row3 = b"asdfghjkl;'`";
++    let row3s = b"ASDFGHJKL:\"~";
++    i = 0;
++    while i < 12 {
++        m[0x1E + i] = (row3[i], row3s[i]);
++        i += 1;
++    }
++    m[0x2B] = (b'\\', b'|');
++    let row4 = b"zxcvbnm,./";
++    let row4s = b"ZXCVBNM<>?";
++    i = 0;
++    while i < 10 {
++        m[0x2C + i] = (row4[i], row4s[i]);
++        i += 1;
++    }
++    m[0x37] = (b'*', b'*');
++    m[0x39] = (b' ', b' ');
++    m
++};
++
++/// Drain whatever the controller has buffered (firmware leftovers) so the first key is a real one.
++pub fn init() -> usize {
++    let mut n = 0;
++    unsafe {
++        while inb(STATUS) & 1 != 0 && n < 64 {
++            let _ = inb(DATA);
++            n += 1;
++        }
++    }
++    n
++}
++
++/// Translate one scancode; appends 0..4 bytes to `out` and returns how many.
++fn translate(sc: u8, out: &mut [u8; 4]) -> usize {
++    unsafe {
++        if sc == 0xE0 {
++            E0 = true;
++            return 0;
++        }
++        let ext = E0;
++        E0 = false;
++        let brk = sc & 0x80 != 0;
++        let code = sc & 0x7F;
++        match (ext, code) {
++            (false, 0x2A) => SHIFT_L = !brk,
++            (false, 0x36) => SHIFT_R = !brk,
++            (_, 0x1D) => CTRL = !brk, // left ctrl, or E0 1D right ctrl
++            (false, 0x3A) if !brk => CAPS = !CAPS,
++            _ => {}
++        }
++        if brk {
++            return 0;
++        }
++        if ext {
++            let seq: &[u8] = match code {
++                0x48 => b"\x1b[A",
++                0x50 => b"\x1b[B",
++                0x4D => b"\x1b[C",
++                0x4B => b"\x1b[D",
++                0x47 => b"\x1b[H",
++                0x4F => b"\x1b[F",
++                0x53 => b"\x1b[3~",
++                0x1C => b"\r", // keypad Enter
++                0x35 => b"/",  // keypad /
++                _ => b"",
++            };
++            out[..seq.len()].copy_from_slice(seq);
++            return seq.len();
++        }
++        if (code as usize) >= MAP.len() {
++            return 0;
++        }
++        let (lo, hi) = MAP[code as usize];
++        if lo == 0 {
++            return 0;
++        }
++        let shift = SHIFT_L || SHIFT_R;
++        let mut c = if shift { hi } else { lo };
++        if CAPS && lo.is_ascii_lowercase() {
++            c = if shift { lo } else { hi };
++        }
++        if CTRL {
++            c = match c {
++                b'a'..=b'z' | b'A'..=b'Z' => c & 0x1F,
++                b'@' | b' ' | b'2' => 0x00,
++                b'[' => 0x1B,
++                b'\\' => 0x1C,
++                b']' => 0x1D,
++                b'_' | b'-' => 0x1F,
++                _ => c,
++            };
++        }
++        out[0] = c;
++        1
++    }
++}
++
++/// Poll the controller and append the bytes typed so far to `buf[*len..]`. Mouse (AUX) bytes are dropped.
++/// Stops reading scancodes once fewer than 4 bytes of room remain, so nothing typed is lost (the i8042 holds it).
++pub fn poll(buf: &mut [u8], len: &mut usize) {
++    unsafe {
++        while buf.len() - *len >= 4 {
++            let st = inb(STATUS);
++            if st & 1 == 0 {
++                break;
++            }
++            let sc = inb(DATA);
++            if st & 0x20 != 0 {
++                continue; // AUX (touchpad) byte
++            }
++            let mut tmp = [0u8; 4];
++            let n = translate(sc, &mut tmp);
++            buf[*len..*len + n].copy_from_slice(&tmp[..n]);
++            *len += n;
++        }
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 3b88bce..bde9a03 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -10,6 +10,7 @@ global_asm!(include_str!("boot.s"), options(att_syntax));
+ mod console;
+ #[allow(dead_code)]
+ mod dhcp;
++mod kbd;
+ mod mb;
+ mod net;
+ mod nic;
+@@ -18,6 +19,7 @@ mod pci;
+ mod port;
+ mod rng;
+ mod ssh;
++mod term;
+ mod time;
+ mod wdt;
+ 
+@@ -38,7 +40,7 @@ static LOGGER: SerialLog = SerialLog;
+ #[no_mangle]
+ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
+     console::init();
+-    kprintln!("NC110 bare-metal M2.5: hello from our own x86_64 kernel (Rust, no_std)");
++    kprintln!("NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)");
+     kprintln!("multiboot magic={:#010x} info={:#x} -> long mode OK", magic, info);
+     wdt::report();
+     if !wdt::is_qemu_pc() && !wdt::verify_live() && !wdt::neg_control_on_q35() {
+diff --git a/src/ssh.rs b/src/ssh.rs
+index 321586e..5ab3db6 100644
+--- a/src/ssh.rs
++++ b/src/ssh.rs
+@@ -1,21 +1,22 @@
+-//! M2: DHCP + TCP (smoltcp) + SSH client (Sunset) against a throwaway sshd on the host.
++//! M2/M3: DHCP + TCP (smoltcp) + SSH client (Sunset) against a throwaway sshd on the host.
+ //!
+ //! Milestones are printed one per line so the furthest one reached is unambiguous:
+ //!   (a) TCP connect + server banner   (b) key exchange done, host key matched the pin
+-//!   (c) publickey auth OK             (d) exec channel output
++//!   (c) publickey auth OK             (d) channel output
++//! M3: the session asks for a pty (xterm 80x25) and a shell; PS/2 keystrokes go to the channel and the
++//! channel's output is drawn by the VGA terminal (`term`), and mirrored to COM1 with ESC shown as `^[`.
+ use crate::net::Nic;
+ use crate::nic::Rtl;
+-use crate::{kprintln, rng, time};
++use crate::{console, kbd, kprintln, rng, term, time, wdt};
+ use sha2::{Digest, Sha256};
+ use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+ use smoltcp::socket::{dhcpv4, tcp};
+ use smoltcp::time::Instant;
+ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+-use sunset::{ChanData, ChanHandle, CliEvent, Event, PubKey, Runner, SignKey};
++use sunset::{ChanData, ChanHandle, CliEvent, Event, Pty, PubKey, Runner, SignKey};
+ 
+ const SERVER: (Ipv4Address, u16) = (Ipv4Address::new(10, 0, 2, 2), 2223);
+ const USER: &str = "evnchn";
+-const CMD: &str = "nc110-m2"; // ignored by the server: its ForceCommand decides what runs
+ 
+ /// The ONE host key we accept: raw ed25519 public key of the throwaway sshd's host key.
+ #[cfg(not(feature = "badpin"))]
+@@ -151,13 +152,20 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+     let mut pubkey_tries = 0;
+     let mut chan: Option<ChanHandle> = None;
+     let mut kex_done = false;
+-    let mut out_line = [0u8; 256];
+-    let mut out_len = 0usize;
+     let mut got_output = false;
+     let mut finished = false;
++    let mut shell_open = false;
++    let mut keys = [0u8; 64];
++    let mut nkeys = 0usize;
++    let mut last_pet = time::now_ms();
++    // 60 s to get as far as an open shell; after that the session lasts until the remote side closes it.
+     let deadline = time::now_ms() + 60_000;
+ 
+-    'outer: while time::now_ms() < deadline {
++    'outer: while shell_open || time::now_ms() < deadline {
++        if wdt::armed() && time::now_ms() - last_pet >= 1000 {
++            wdt::pet(); // the main loop is the liveness signal: a hang anywhere in it stops the petting
++            last_pet = time::now_ms();
++        }
+         iface.poll(now(), &mut dev, &mut sockets);
+         let sock = sockets.get_mut::<tcp::Socket>(tcp_h);
+         if !connected {
+@@ -282,8 +290,21 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+                     open_session = true;
+                 }
+                 Event::Cli(CliEvent::SessionOpened(mut o)) => {
+-                    kprintln!("ssh: session channel open, exec request");
+-                    let _ = o.exec(CMD);
++                    let mut tn = heapless::String::new();
++                    let _ = tn.push_str("xterm");
++                    let pty = Pty { term: tn, cols: 80, rows: 25, width: 0, height: 0, modes: heapless::Vec::new() };
++                    let rp = o.pty(pty);
++                    let rs = o.shell();
++                    kprintln!("ssh: session channel open, pty-req xterm 80x25 ({:?}), shell ({:?})", rp.is_ok(), rs.is_ok());
++                    if rp.is_err() || rs.is_err() {
++                        stop_all = true;
++                    } else {
++                        shell_open = true;
++                        kbd::init();
++                        console::vga_log_off();
++                        term::init();
++                        kprintln!("term: VGA now belongs to the remote shell; keyboard is live");
++                    }
+                 }
+                 Event::Cli(CliEvent::SessionExit(x)) => {
+                     kprintln!("ssh: remote exit {:?}", x);
+@@ -315,39 +336,54 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+             }
+         }
+ 
+-        // channel data -> console
++        // channel data -> VGA terminal (+ serial mirror)
+         if let Some(c) = &chan {
++            let mut drew = false;
+             while let Some((_num, dt, _len)) = runner.read_channel_ready() {
+                 let mut buf = [0u8; 512];
+                 match runner.read_channel(c, dt, &mut buf) {
+                     Ok(0) => break,
+                     Ok(n) => {
++                        if !got_output {
++                            kprintln!("ssh(d): first shell output ({} bytes)", n);
++                            got_output = true;
++                        }
+                         for &b in &buf[..n] {
+-                            if b == b'\n' {
+-                                kprintln!(
+-                                    "ssh(d): {} {}",
+-                                    if dt == ChanData::Stderr { "stderr:" } else { "stdout:" },
+-                                    core::str::from_utf8(&out_line[..out_len]).unwrap_or("?")
+-                                );
+-                                got_output = true;
+-                                out_len = 0;
+-                            } else if out_len < out_line.len() {
+-                                out_line[out_len] = b;
+-                                out_len += 1;
++                            term::feed(b);
++                            if b == 0x1B {
++                                console::serial_raw(b'^');
++                                console::serial_raw(b'[');
++                            } else {
++                                console::serial_raw(b);
+                             }
+                         }
++                        drew = true;
+                     }
+                     Err(_) => break,
+                 }
+             }
+-            if runner.is_channel_eof(c) || runner.is_channel_closed(c) {
+-                if out_len > 0 {
+-                    kprintln!("ssh(d): stdout: {}", core::str::from_utf8(&out_line[..out_len]).unwrap_or("?"));
+-                    out_len = 0;
++            if drew {
++                term::sync_cursor();
++            }
++
++            // keyboard -> channel (whatever does not fit now stays queued; the i8042 holds the rest)
++            if shell_open && !finished {
++                kbd::poll(&mut keys, &mut nkeys);
++                if nkeys > 0 {
++                    match runner.write_channel(c, ChanData::Normal, &keys[..nkeys]) {
++                        Ok(n) => {
++                            keys.copy_within(n..nkeys, 0);
++                            nkeys -= n;
++                        }
++                        Err(_) => nkeys = 0, // channel gone; the close check below ends the session
++                    }
+                 }
+-                if got_output && !finished {
++            }
++
++            if runner.is_channel_eof(c) || runner.is_channel_closed(c) {
++                if !finished {
+                     finished = true;
+-                    kprintln!("ssh: channel closed, disconnecting");
++                    kprintln!("\r\nssh: shell channel closed, disconnecting");
+                     runner.close_output();
+                 }
+             }
+@@ -376,7 +412,7 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+     let (calls, reseeds, samples, failed) = rng::stats();
+     kprintln!("rng: {} requests served, {} reseeds, {} raw samples health-tested, failure latched: {}", calls, reseeds, samples, failed);
+     if got_output {
+-        kprintln!("ssh: M2 (d) reached: our kernel ran a command over SSH");
++        kprintln!("ssh: M3 reached: interactive shell over SSH, drawn on VGA, typed on PS/2");
+     } else {
+         kprintln!("ssh: stopped before (d)");
+     }
+diff --git a/src/term.rs b/src/term.rs
+new file mode 100644
+index 0000000..12a6c09
+--- /dev/null
++++ b/src/term.rs
+@@ -0,0 +1,268 @@
++//! VGA text terminal (80x25 at 0xB8000) with the VT100/xterm subset a /bin/sh session needs:
++//! CR LF BS TAB BEL, deferred autowrap, scrolling, CSI A B C D G d H f J K P @ X L M, ESC 7/8/M/c.
++//! SGR (colours) and modes (?h/?l, bracketed paste) are parsed and ignored; OSC titles are swallowed;
++//! UTF-8 multibyte characters show as one '?'. The hardware cursor follows the text cursor.
++use crate::port::outb;
++
++const VGA: *mut u16 = 0xB8000 as *mut u16;
++const W: usize = 80;
++const H: usize = 25;
++const ATTR: u16 = 0x0700; // light grey on black (the log console before the shell is white on blue)
++const BLANK: u16 = ATTR | b' ' as u16;
++
++#[derive(Clone, Copy, PartialEq)]
++enum St {
++    Ground,
++    Esc,
++    EscSkip, // ESC ( B and friends: one charset byte follows
++    Csi,
++    Osc,
++    OscEsc,
++}
++
++struct T {
++    row: usize,
++    col: usize,
++    wrap: bool, // deferred wrap: last column written, next printable goes to the next line
++    st: St,
++    p: [u16; 8],
++    np: usize,
++    private: bool,
++    saved: (usize, usize),
++}
++
++static mut T: T = T { row: 0, col: 0, wrap: false, st: St::Ground, p: [0; 8], np: 0, private: false, saved: (0, 0) };
++
++fn put(r: usize, c: usize, v: u16) {
++    unsafe { VGA.add(r * W + c).write_volatile(v) }
++}
++fn get(r: usize, c: usize) -> u16 {
++    unsafe { VGA.add(r * W + c).read_volatile() }
++}
++fn clear_range(from: usize, to: usize) {
++    for i in from..to {
++        unsafe { VGA.add(i).write_volatile(BLANK) }
++    }
++}
++fn scroll_up(top: usize) {
++    for r in top..H - 1 {
++        for c in 0..W {
++            put(r, c, get(r + 1, c));
++        }
++    }
++    clear_range((H - 1) * W, H * W);
++}
++fn scroll_down(top: usize) {
++    for r in (top + 1..H).rev() {
++        for c in 0..W {
++            put(r, c, get(r - 1, c));
++        }
++    }
++    clear_range(top * W, top * W + W);
++}
++
++fn hw_cursor(t: &T) {
++    let pos = (t.row * W + t.col.min(W - 1)) as u16;
++    unsafe {
++        outb(0x3D4, 0x0A);
++        outb(0x3D5, 13); // cursor scanlines 13..14, enabled
++        outb(0x3D4, 0x0B);
++        outb(0x3D5, 14);
++        outb(0x3D4, 0x0F);
++        outb(0x3D5, pos as u8);
++        outb(0x3D4, 0x0E);
++        outb(0x3D5, (pos >> 8) as u8);
++    }
++}
++
++/// Take over the screen: clear it and home the cursor.
++pub fn init() {
++    clear_range(0, W * H);
++    unsafe {
++        let t = &mut *core::ptr::addr_of_mut!(T);
++        *t = T { row: 0, col: 0, wrap: false, st: St::Ground, p: [0; 8], np: 0, private: false, saved: (0, 0) };
++        hw_cursor(t);
++    }
++}
++
++fn lf(t: &mut T) {
++    if t.row == H - 1 {
++        scroll_up(0);
++    } else {
++        t.row += 1;
++    }
++}
++
++fn arg(t: &T, i: usize, def: u16) -> usize {
++    let v = if i < t.np { t.p[i] } else { 0 };
++    (if v == 0 { def } else { v }) as usize
++}
++
++fn csi(t: &mut T, f: u8) {
++    if t.private {
++        return; // ?25h/l, ?2004h/l, ?1h ... : modes we do not model
++    }
++    let n = arg(t, 0, 1);
++    match f {
++        b'A' => t.row = t.row.saturating_sub(n),
++        b'B' | b'e' => t.row = (t.row + n).min(H - 1),
++        b'C' | b'a' => t.col = (t.col + n).min(W - 1),
++        b'D' => t.col = t.col.saturating_sub(n),
++        b'G' | b'`' => t.col = (n - 1).min(W - 1),
++        b'd' => t.row = (n - 1).min(H - 1),
++        b'H' | b'f' => {
++            t.row = (arg(t, 0, 1) - 1).min(H - 1);
++            t.col = (arg(t, 1, 1) - 1).min(W - 1);
++        }
++        b'J' => {
++            let cur = t.row * W + t.col;
++            match arg(t, 0, 0) {
++                0 => clear_range(cur, W * H),
++                1 => clear_range(0, cur + 1),
++                _ => clear_range(0, W * H),
++            }
++        }
++        b'K' => {
++            let s = t.row * W;
++            match arg(t, 0, 0) {
++                0 => clear_range(s + t.col, s + W),
++                1 => clear_range(s, s + t.col + 1),
++                _ => clear_range(s, s + W),
++            }
++        }
++        b'P' => {
++            // delete n chars, shift the rest of the line left
++            let n = n.min(W - t.col);
++            for c in t.col..W {
++                put(t.row, c, if c + n < W { get(t.row, c + n) } else { BLANK });
++            }
++        }
++        b'@' => {
++            let n = n.min(W - t.col);
++            for c in (t.col..W).rev() {
++                put(t.row, c, if c >= t.col + n { get(t.row, c - n) } else { BLANK });
++            }
++        }
++        b'X' => {
++            let s = t.row * W + t.col;
++            clear_range(s, s + n.min(W - t.col));
++        }
++        b'L' => {
++            for _ in 0..n.min(H - t.row) {
++                scroll_down(t.row);
++            }
++        }
++        b'M' => {
++            for _ in 0..n.min(H - t.row) {
++                scroll_up(t.row);
++            }
++        }
++        _ => {} // 'm' (SGR), 'r' (scroll region), 'h'/'l', 'n' (DSR: no reply), ...: ignored
++    }
++    t.wrap = false;
++}
++
++/// Feed one byte of the remote's output.
++pub fn feed(b: u8) {
++    let t = unsafe { &mut *core::ptr::addr_of_mut!(T) };
++    match t.st {
++        St::Ground => match b {
++            0x1B => t.st = St::Esc,
++            b'\r' => {
++                t.col = 0;
++                t.wrap = false;
++            }
++            b'\n' | 0x0B | 0x0C => {
++                lf(t);
++                t.wrap = false;
++            }
++            0x08 => {
++                t.col = t.col.saturating_sub(1);
++                t.wrap = false;
++            }
++            b'\t' => t.col = ((t.col + 8) & !7).min(W - 1),
++            0x80..=0xBF => {} // UTF-8 continuation byte
++            _ if b < 0x20 || b == 0x7F => {} // BEL and other controls
++            _ => {
++                if t.wrap {
++                    t.col = 0;
++                    lf(t);
++                    t.wrap = false;
++                }
++                let ch = if b >= 0x80 { b'?' } else { b };
++                put(t.row, t.col, ATTR | ch as u16);
++                if t.col == W - 1 {
++                    t.wrap = true;
++                } else {
++                    t.col += 1;
++                }
++            }
++        },
++        St::Esc => {
++            t.st = St::Ground;
++            match b {
++                b'[' => {
++                    t.st = St::Csi;
++                    t.p = [0; 8];
++                    t.np = 0;
++                    t.private = false;
++                }
++                b']' => t.st = St::Osc,
++                b'(' | b')' | b'*' | b'+' | b'#' | b'%' => t.st = St::EscSkip,
++                b'7' => t.saved = (t.row, t.col),
++                b'8' => (t.row, t.col) = t.saved,
++                b'D' => lf(t),
++                b'E' => {
++                    t.col = 0;
++                    lf(t);
++                }
++                b'M' => {
++                    if t.row == 0 {
++                        scroll_down(0);
++                    } else {
++                        t.row -= 1;
++                    }
++                }
++                b'c' => init(),
++                _ => {} // '=', '>', ...
++            }
++        }
++        St::EscSkip => t.st = St::Ground,
++        St::Csi => match b {
++            b'0'..=b'9' => {
++                if t.np == 0 {
++                    t.np = 1;
++                }
++                let i = t.np - 1;
++                if i < t.p.len() {
++                    t.p[i] = t.p[i].saturating_mul(10).saturating_add((b - b'0') as u16);
++                }
++            }
++            b';' => {
++                if t.np == 0 {
++                    t.np = 1;
++                }
++                t.np += 1;
++            }
++            b'?' | b'>' | b'<' | b'=' => t.private = true,
++            0x20..=0x2F => {} // intermediates
++            0x40..=0x7E => {
++                t.st = St::Ground;
++                csi(t, b);
++            }
++            0x1B => t.st = St::Esc,
++            _ => {} // controls inside CSI: ignored
++        },
++        St::Osc => match b {
++            0x07 => t.st = St::Ground,
++            0x1B => t.st = St::OscEsc,
++            _ => {}
++        },
++        St::OscEsc => t.st = if b == b'\\' { St::Ground } else { St::Osc },
++    }
++}
++
++/// Move the hardware cursor to the text cursor (once per batch of output, not per byte).
++pub fn sync_cursor() {
++    hw_cursor(unsafe { &*core::ptr::addr_of!(T) });
++}
+diff --git a/tools/sshd_config.m3 b/tools/sshd_config.m3
+new file mode 100644
+index 0000000..86bd7c1
+--- /dev/null
++++ b/tools/sshd_config.m3
+@@ -0,0 +1,18 @@
++ListenAddress 127.0.0.1:2223
++HostKey ~/nc110-baremetal/test-keys/host_ed25519
++HostKeyAlgorithms ssh-ed25519
++KexAlgorithms curve25519-sha256
++Ciphers chacha20-poly1305@openssh.com
++PubkeyAcceptedAlgorithms ssh-ed25519
++AuthorizedKeysFile ~/nc110-baremetal/test-keys/authorized_keys
++AuthenticationMethods publickey
++PubkeyAuthentication yes
++PasswordAuthentication no
++KbdInteractiveAuthentication no
++UsePAM no
++StrictModes no
++PermitRootLogin no
++AllowUsers evnchn
++ForceCommand /usr/bin/env -i PS1='nc110$ ' /bin/sh -i
++PidFile ~/nc110-baremetal/test-keys/sshd-m3.pid
++LogLevel VERBOSE
+
+exec
+/bin/zsh -lc "pwd; git status --short; rg --files -g AGENTS.md -g '*sunset*' -g Cargo.lock; nl -ba src/ssh.rs | sed -n '120,440p'; cat src/wdt.rs; cat proof/m3-serial.log" in ~/nc110-baremetal
+ succeeded in 0ms:
+~/nc110-baremetal
+?? proof/codex-review-m3.txt
+Cargo.lock
+   120	            have_ip = true;
+   121	            break;
+   122	        }
+   123	    }
+   124	    if !have_ip {
+   125	        kprintln!("dhcp: no lease in 10 s -> static slirp fallback 10.0.2.15/24 gw 10.0.2.2");
+   126	        iface.update_ip_addrs(|a| {
+   127	            let _ = a.push(IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24)));
+   128	        });
+   129	        let _ = iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2));
+   130	    }
+   131	
+   132	    // ---- TCP connect ----
+   133	    let lport = 49152 + (u16::from_le_bytes([seed[0], seed[1]]) % 16000);
+   134	    sockets
+   135	        .get_mut::<tcp::Socket>(tcp_h)
+   136	        .connect(iface.context(), (IpAddress::Ipv4(SERVER.0), SERVER.1), lport)
+   137	        .expect("tcp connect");
+   138	    kprintln!("tcp: connecting {}:{} from :{}", SERVER.0, SERVER.1, lport);
+   139	
+   140	    let signkey = SignKey::Ed25519(sunset::ed25519_dalek::SigningKey::from_bytes(&client_seed));
+   141	    for b in client_seed.iter_mut() {
+   142	        unsafe { core::ptr::write_volatile(b, 0) }; // our copy; the SigningKey keeps its own
+   143	    }
+   144	    let mut runner = Runner::new_client(unsafe { &mut *core::ptr::addr_of_mut!(SSH_IN) }, unsafe {
+   145	        &mut *core::ptr::addr_of_mut!(SSH_OUT)
+   146	    });
+   147	
+   148	    let mut connected = false;
+   149	    let mut banner_shown = false;
+   150	    let mut banner = [0u8; 128];
+   151	    let mut banner_len = 0usize;
+   152	    let mut pubkey_tries = 0;
+   153	    let mut chan: Option<ChanHandle> = None;
+   154	    let mut kex_done = false;
+   155	    let mut got_output = false;
+   156	    let mut finished = false;
+   157	    let mut shell_open = false;
+   158	    let mut keys = [0u8; 64];
+   159	    let mut nkeys = 0usize;
+   160	    let mut last_pet = time::now_ms();
+   161	    // 60 s to get as far as an open shell; after that the session lasts until the remote side closes it.
+   162	    let deadline = time::now_ms() + 60_000;
+   163	
+   164	    'outer: while shell_open || time::now_ms() < deadline {
+   165	        if wdt::armed() && time::now_ms() - last_pet >= 1000 {
+   166	            wdt::pet(); // the main loop is the liveness signal: a hang anywhere in it stops the petting
+   167	            last_pet = time::now_ms();
+   168	        }
+   169	        iface.poll(now(), &mut dev, &mut sockets);
+   170	        let sock = sockets.get_mut::<tcp::Socket>(tcp_h);
+   171	        if !connected {
+   172	            if sock.may_send() {
+   173	                connected = true;
+   174	                kprintln!("tcp: connected to {}:{}", SERVER.0, SERVER.1);
+   175	            } else if !sock.is_open() {
+   176	                kprintln!("tcp: connection failed");
+   177	                break;
+   178	            }
+   179	        }
+   180	
+   181	        // network -> runner
+   182	        if sock.can_recv() && runner.is_input_ready() {
+   183	            let r = sock.recv(|buf| {
+   184	                if !banner_shown {
+   185	                    for &b in buf.iter() {
+   186	                        if b == b'\n' {
+   187	                            banner_shown = true;
+   188	                            break;
+   189	                        }
+   190	                        if b != b'\r' && banner_len < banner.len() {
+   191	                            banner[banner_len] = b;
+   192	                            banner_len += 1;
+   193	                        }
+   194	                    }
+   195	                }
+   196	                match runner.input(buf) {
+   197	                    Ok(n) => (n, Ok(())),
+   198	                    Err(e) => (0, Err(e)),
+   199	                }
+   200	            });
+   201	            if banner_shown && banner_len > 0 {
+   202	                kprintln!("ssh(a): server banner: {}", core::str::from_utf8(&banner[..banner_len]).unwrap_or("?"));
+   203	                banner_len = 0;
+   204	            }
+   205	            if let Ok(Err(e)) = r {
+   206	                kprintln!("ssh: input error {:?}", e);
+   207	                break;
+   208	            }
+   209	        }
+   210	        if !sock.is_active() && connected && !sock.can_recv() {
+   211	            runner.close_input();
+   212	        }
+   213	
+   214	        // runner events
+   215	        loop {
+   216	            let mut open_session = false;
+   217	            let mut stop_all = false;
+   218	            let mut idle = false;
+   219	            {
+   220	            let ev = match runner.progress() {
+   221	                Ok(ev) => ev,
+   222	                Err(e) => {
+   223	                    kprintln!("ssh: error {:?}", e);
+   224	                    break 'outer;
+   225	                }
+   226	            };
+   227	            match ev {
+   228	                Event::Cli(CliEvent::Hostkey(h)) => {
+   229	                    let pk = match h.hostkey() {
+   230	                        Ok(PubKey::Ed25519(k)) => Some(k.key.0),
+   231	                        _ => None,
+   232	                    };
+   233	                    match pk {
+   234	                        Some(k) if ct_eq(&k, &HOST_PIN) => {
+   235	                            let f = fp_str(&k);
+   236	                            kprintln!(
+   237	                                "ssh: host key ssh-ed25519 SHA256:{} matches pin",
+   238	                                core::str::from_utf8(&f).unwrap_or("?")
+   239	                            );
+   240	                            if let Err(e) = h.accept() {
+   241	                                kprintln!("ssh: host key accept failed (exchange signature?) {:?}", e);
+   242	                                stop_all = true;
+   243	                            }
+   244	                        }
+   245	                        Some(k) => {
+   246	                            let f = fp_str(&k);
+   247	                            let p = fp_str(&HOST_PIN);
+   248	                            kprintln!(
+   249	                                "ssh: hostkey MISMATCH: got SHA256:{} pinned SHA256:{} -> rejecting",
+   250	                                core::str::from_utf8(&f).unwrap_or("?"),
+   251	                                core::str::from_utf8(&p).unwrap_or("?")
+   252	                            );
+   253	                            let _ = h.reject();
+   254	                            stop_all = true;
+   255	                        }
+   256	                        None => {
+   257	                            kprintln!("ssh: hostkey MISMATCH: not ssh-ed25519 -> rejecting");
+   258	                            let _ = h.reject();
+   259	                            stop_all = true;
+   260	                        }
+   261	                    }
+   262	                }
+   263	                Event::Cli(CliEvent::Banner(b)) => {
+   264	                    kprintln!("ssh: userauth banner: {}", b.banner().unwrap_or("?"));
+   265	                }
+   266	                Event::Cli(CliEvent::Username(u)) => {
+   267	                    if !kex_done {
+   268	                        kex_done = true;
+   269	                        kprintln!("ssh(b): key exchange done (curve25519-sha256, host sig verified, chacha20-poly1305)");
+   270	                    }
+   271	                    let _ = u.username(USER);
+   272	                }
+   273	                Event::Cli(CliEvent::Password(p)) => {
+   274	                    let _ = p.skip();
+   275	                }
+   276	                Event::Cli(CliEvent::Pubkey(p)) => {
+   277	                    if pubkey_tries == 0 {
+   278	                        pubkey_tries += 1;
+   279	                        kprintln!("ssh: offering publickey ssh-ed25519 (throwaway test key)");
+   280	                        let _ = p.pubkey(signkey.clone());
+   281	                    } else {
+   282	                        let _ = p.skip();
+   283	                    }
+   284	                }
+   285	                Event::Cli(CliEvent::AgentSign(s)) => {
+   286	                    let _ = s.skip();
+   287	                }
+   288	                Event::Cli(CliEvent::Authenticated) => {
+   289	                    kprintln!("ssh(c): publickey auth OK as {}", USER);
+   290	                    open_session = true;
+   291	                }
+   292	                Event::Cli(CliEvent::SessionOpened(mut o)) => {
+   293	                    let mut tn = heapless::String::new();
+   294	                    let _ = tn.push_str("xterm");
+   295	                    let pty = Pty { term: tn, cols: 80, rows: 25, width: 0, height: 0, modes: heapless::Vec::new() };
+   296	                    let rp = o.pty(pty);
+   297	                    let rs = o.shell();
+   298	                    kprintln!("ssh: session channel open, pty-req xterm 80x25 ({:?}), shell ({:?})", rp.is_ok(), rs.is_ok());
+   299	                    if rp.is_err() || rs.is_err() {
+   300	                        stop_all = true;
+   301	                    } else {
+   302	                        shell_open = true;
+   303	                        kbd::init();
+   304	                        console::vga_log_off();
+   305	                        term::init();
+   306	                        kprintln!("term: VGA now belongs to the remote shell; keyboard is live");
+   307	                    }
+   308	                }
+   309	                Event::Cli(CliEvent::SessionExit(x)) => {
+   310	                    kprintln!("ssh: remote exit {:?}", x);
+   311	                }
+   312	                Event::Cli(CliEvent::Defunct) => {
+   313	                    kprintln!("ssh: connection closed");
+   314	                    finished = true;
+   315	                    idle = true;
+   316	                }
+   317	                Event::Cli(CliEvent::PollAgain) | Event::Progressed => {}
+   318	                Event::None => idle = true,
+   319	                _ => {}
+   320	            }
+   321	            }
+   322	            if stop_all {
+   323	                break 'outer;
+   324	            }
+   325	            if idle && !open_session {
+   326	                break;
+   327	            }
+   328	            if open_session {
+   329	                match runner.open_client_session() {
+   330	                    Ok(c) => chan = Some(c),
+   331	                    Err(e) => {
+   332	                        kprintln!("ssh: open session failed {:?}", e);
+   333	                        break 'outer;
+   334	                    }
+   335	                }
+   336	            }
+   337	        }
+   338	
+   339	        // channel data -> VGA terminal (+ serial mirror)
+   340	        if let Some(c) = &chan {
+   341	            let mut drew = false;
+   342	            while let Some((_num, dt, _len)) = runner.read_channel_ready() {
+   343	                let mut buf = [0u8; 512];
+   344	                match runner.read_channel(c, dt, &mut buf) {
+   345	                    Ok(0) => break,
+   346	                    Ok(n) => {
+   347	                        if !got_output {
+   348	                            kprintln!("ssh(d): first shell output ({} bytes)", n);
+   349	                            got_output = true;
+   350	                        }
+   351	                        for &b in &buf[..n] {
+   352	                            term::feed(b);
+   353	                            if b == 0x1B {
+   354	                                console::serial_raw(b'^');
+   355	                                console::serial_raw(b'[');
+   356	                            } else {
+   357	                                console::serial_raw(b);
+   358	                            }
+   359	                        }
+   360	                        drew = true;
+   361	                    }
+   362	                    Err(_) => break,
+   363	                }
+   364	            }
+   365	            if drew {
+   366	                term::sync_cursor();
+   367	            }
+   368	
+   369	            // keyboard -> channel (whatever does not fit now stays queued; the i8042 holds the rest)
+   370	            if shell_open && !finished {
+   371	                kbd::poll(&mut keys, &mut nkeys);
+   372	                if nkeys > 0 {
+   373	                    match runner.write_channel(c, ChanData::Normal, &keys[..nkeys]) {
+   374	                        Ok(n) => {
+   375	                            keys.copy_within(n..nkeys, 0);
+   376	                            nkeys -= n;
+   377	                        }
+   378	                        Err(_) => nkeys = 0, // channel gone; the close check below ends the session
+   379	                    }
+   380	                }
+   381	            }
+   382	
+   383	            if runner.is_channel_eof(c) || runner.is_channel_closed(c) {
+   384	                if !finished {
+   385	                    finished = true;
+   386	                    kprintln!("\r\nssh: shell channel closed, disconnecting");
+   387	                    runner.close_output();
+   388	                }
+   389	            }
+   390	        }
+   391	
+   392	        // runner -> network
+   393	        let sock = sockets.get_mut::<tcp::Socket>(tcp_h);
+   394	        while sock.can_send() {
+   395	            let out = runner.output_buf();
+   396	            if out.is_empty() {
+   397	                break;
+   398	            }
+   399	            match sock.send_slice(out) {
+   400	                Ok(0) | Err(_) => break,
+   401	                Ok(n) => runner.consume_output(n),
+   402	            }
+   403	        }
+   404	        if finished {
+   405	            sock.close();
+   406	            for _ in 0..50 {
+   407	                iface.poll(now(), &mut dev, &mut sockets);
+   408	            }
+   409	            break;
+   410	        }
+   411	    }
+   412	    let (calls, reseeds, samples, failed) = rng::stats();
+   413	    kprintln!("rng: {} requests served, {} reseeds, {} raw samples health-tested, failure latched: {}", calls, reseeds, samples, failed);
+   414	    if got_output {
+   415	        kprintln!("ssh: M3 reached: interactive shell over SSH, drawn on VGA, typed on PS/2");
+   416	    } else {
+   417	        kprintln!("ssh: stopped before (d)");
+   418	    }
+   419	}
+//! TCO watchdog (ICH9 in QEMU q35, NM10 on the NC110; both iTCO v2). boot.s arms it before any
+//! Rust runs; this module reports what boot.s did, pets it, and runs the M0.5 rehearsal modes.
+use crate::port::{inl, inw, outb, outw};
+use crate::{kprintln, pci};
+use core::ptr::{addr_of, read_volatile};
+
+#[cfg(all(feature = "neg-control", feature = "grub-armed"))]
+compile_error!("neg-control is QEMU-only and must never be combined with grub-armed (the hardware artifact)");
+
+/// Negative control (`--features neg-control`, QEMU q35 only; boot.s never self-arms on NM10): boot.s SETS GCS.NO_REBOOT instead of clearing it
+/// (QEMU's GCS powers up 0 with noreboot=false, so merely skipping the clear would prove nothing).
+#[no_mangle]
+static TCO_NEG_CONTROL: u8 = cfg!(feature = "neg-control") as u8;
+
+/// `--features grub-armed`: boot.s does NOT arm; used to test the GRUB iorw/memrw arming sequence.
+#[no_mangle]
+static TCO_GRUB_ARMED: u8 = cfg!(feature = "grub-armed") as u8;
+
+extern "C" {
+    static tco_result: u32;
+    static tco_gcs_pre: u32;
+    static tco_gcs: u32;
+    static tco_base: u32;
+    static tco_sts1_pre: u16;
+    static tco_sts2_pre: u16;
+    static tco_cnt: u16;
+}
+
+fn rd<T: Copy>(p: *const T) -> T {
+    unsafe { read_volatile(p) }
+}
+
+pub fn armed() -> bool {
+    matches!(rd(addr_of!(tco_result)), 0 | 4 | 5)
+}
+
+fn pmbase() -> u16 {
+    (pci::read32(pci::b0(31, 0), 0x40) & 0xFF80) as u16
+}
+
+pub fn base() -> u16 {
+    pmbase() + 0x60
+}
+
+pub fn report() {
+    let r = rd(addr_of!(tco_result));
+    let what = match r {
+        0 => "armed by boot.s",
+        1 => "skipped (LPC 00:1f.0 is not ICH9 8086:2918 / NM10 8086:27bc)",
+        2 => "NOT armed: PMBASE unset",
+        3 => "NOT armed: RCBA disabled",
+        4 => "left to GRUB (grub-armed build); live registers follow",
+        5 => "NM10: GRUB owns the watchdog, kernel hands off; live registers follow",
+        _ => "NOT armed: unknown",
+    };
+    kprintln!("wdt: {} (result={})", what, r);
+    if r == 4 || r == 5 {
+        let b = base();
+        let gcs = unsafe { read_volatile(((pci::read32(pci::b0(31, 0), 0xF0) & 0xFFFF_C000) + 0x3410) as *const u32) };
+        let (s1, s2, cnt, tmr) = unsafe { (inw(b + 4), inw(b + 6), inw(b + 8), inw(b + 0x12)) };
+        kprintln!(
+            "wdt: live TCOBASE={:#x} GCS={:#010x} NO_REBOOT={} TCO1_CNT={:#06x} HLT={} TCO1_STS={:#06x} TCO2_STS={:#06x} TCO_TMR={}",
+            b, gcs, (gcs >> 5) & 1, cnt, (cnt >> 11) & 1, s1, s2, tmr & 0x3FF
+        );
+        return;
+    }
+    if r != 0 {
+        return;
+    }
+    let (b, gcs, s1, s2, cnt) = {
+        (rd(addr_of!(tco_base)) as u16, rd(addr_of!(tco_gcs)), rd(addr_of!(tco_sts1_pre)), rd(addr_of!(tco_sts2_pre)), rd(addr_of!(tco_cnt)))
+    };
+    kprintln!(
+        "wdt: TCOBASE={:#x} GCS {:#010x} -> {:#010x} NO_REBOOT={} TCO1_CNT={:#06x} HLT={} LOCK={}",
+        b, rd(addr_of!(tco_gcs_pre)), gcs, (gcs >> 5) & 1, cnt, (cnt >> 11) & 1, (cnt >> 12) & 1
+    );
+    kprintln!(
+        "wdt: before-clear TCO1_STS={:#06x} TCO2_STS={:#06x} SECOND_TO_STS={} BOOT_STS={}",
+        s1, s2, (s2 >> 1) & 1, (s2 >> 2) & 1
+    );
+    let tmr = unsafe { inw(b + 0x12) } & 0x3FF;
+    kprintln!("wdt: TCO_TMR={} ticks x 0.6 s, reset expected after 2nd expiry (~{} ms)", tmr, tmr as u32 * 1200);
+}
+
+/// Live check of the reset path, whoever armed it: NO_REBOOT=0, HLT=0, TMR>=4, and the counter
+/// (TCO_RLD reads back the current value on v2) decrements across ~1.3 ticks.
+pub fn verify_live() -> bool {
+    if !armed() {
+        return false;
+    }
+    let b = base();
+    let rcba = pci::read32(pci::b0(31, 0), 0xF0);
+    if rcba & 1 == 0 {
+        return false;
+    }
+    let gcs = unsafe { read_volatile(((rcba & 0xFFFF_C000) + 0x3410) as *const u32) };
+    let (cnt, tmr) = unsafe { (inw(b + 8), inw(b + 0x12) & 0x3FF) };
+    let c0 = unsafe { inw(b) } & 0x3FF;
+    delay_ms(800);
+    let c1 = unsafe { inw(b) } & 0x3FF;
+    let ok = gcs & 0x20 == 0 && cnt & 0x0800 == 0 && tmr >= 4 && c1 != c0;
+    kprintln!(
+        "wdt: verify NO_REBOOT={} HLT={} TMR={} count {}->{} => {}",
+        (gcs >> 5) & 1, (cnt >> 11) & 1, tmr, c0, c1, if ok { "VERIFIED" } else { "NOT VERIFIED" }
+    );
+    ok
+}
+
+/// QEMU `-machine pc` (PIIX3 8086:7000 at 00:01.0) has no TCO; the M0 NIC demo may run unprotected there.
+pub fn is_qemu_pc() -> bool {
+    pci::read32(pci::b0(1, 0), 0) == 0x7000_8086 && rd(addr_of!(tco_result)) == 1
+}
+
+/// The negative control must reach its hang unverified (that is the point); only on q35, never NM10.
+pub fn neg_control_on_q35() -> bool {
+    let on = cfg!(feature = "neg-control") && rd(addr_of!(tco_result)) == 0;
+    if on {
+        kprintln!("wdt: neg-control build on q35: proceeding unverified on purpose");
+    }
+    on
+}
+
+/// Hard reset via the reset control register (spec M2 `reboot`): back to the firmware / Slot A.
+pub fn hard_reset() -> ! {
+    kprintln!("wdt: hard reset via 0xCF9");
+    unsafe {
+        outb(0xCF9, 0x02);
+        outb(0xCF9, 0x06);
+    }
+    loop {
+        unsafe { core::arch::asm!("cli; hlt") };
+    }
+}
+
+pub fn pet() {
+    unsafe { outw(base(), 1) };
+}
+
+/// ACPI PM timer (PMBASE+0x08, 3.579545 MHz, 24-bit) based delay; same block on ICH9 and NM10.
+fn pm_timer() -> u32 {
+    unsafe { inl(pmbase() + 8) & 0x00FF_FFFF }
+}
+
+pub fn delay_ms(ms: u32) {
+    let need = ms as u64 * 3_579_545 / 1000;
+    let mut last = pm_timer();
+    let mut acc = 0u64;
+    while acc < need {
+        let now = pm_timer();
+        acc += (now.wrapping_sub(last) & 0x00FF_FFFF) as u64;
+        last = now;
+    }
+}
+
+/// `wdt=pet:N` pets every 500 ms for N s, then stops and hangs. `wdt=hang` hangs at once.
+pub fn rehearse(cmdline: &str) -> bool {
+    let Some(i) = cmdline.find("wdt=") else { return false };
+    let arg = cmdline[i + 4..].split(' ').next().unwrap_or("");
+    if !armed() {
+        kprintln!("wdt: mode {} requested but watchdog not armed", arg);
+        return false;
+    }
+    let secs: u32 = arg.strip_prefix("pet:").and_then(|n| n.parse().ok()).unwrap_or(0);
+    for s in 0..secs {
+        for _ in 0..2 {
+            pet();
+            delay_ms(500);
+        }
+        kprintln!("wdt: alive t={}s (petting every 500 ms)", s + 1);
+    }
+    kprintln!("wdt: HANG now: cli; hlt with the timer running, nobody pets");
+    loop {
+        unsafe { core::arch::asm!("cli; hlt") };
+    }
+}
+NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: skipped (LPC 00:1f.0 is not ICH9 8086:2918 / NM10 8086:27bc) (result=1)
+keymod: client key from module 0 at 0x59b000 (72 B), public key verified, module wiped
+cmdline: ~/nc110-baremetal/target/x86_64-unknown-none/release/nc110-kernel 
+time: TSC 999200 ticks/ms (PIT ch2 calibrated)
+nic: rtl8139 C+ (10ec:8139) at 00:03.0 io=0xc000 mac=52:54:00:4e:43:11
+rng: TSC granularity 1000 ticks, sample window 64000 ticks
+rng: jitter startup 4096 samples passed RCT(cut 301) + APT(W 512, cut 507); 65639 TSC ticks/sample
+rng: min-entropy per 8-bit sample: MCV 2.819 (max 525/4096, 147 distinct), lag-1 1.056; claimed 0.100
+rng: RDRAND present, mixed in (jitter alone already passed)
+dhcp: smoltcp lease 10.0.2.15/24 router Some(10.0.2.2)
+tcp: connecting 10.0.2.2:2223 from :52826
+tcp: connected to 10.0.2.2:2223
+ssh(a): server banner: SSH-2.0-OpenSSH_10.2
+ssh: host key ssh-ed25519 SHA256:CuNB3VjtmuYL5Eb0958nDAjO80F6deBx8lHK2kTbRJ0 matches pin
+ssh(b): key exchange done (curve25519-sha256, host sig verified, chacha20-poly1305)
+ssh: offering publickey ssh-ed25519 (throwaway test key)
+ssh(c): publickey auth OK as evnchn
+ssh: session channel open, pty-req xterm 80x25 (true), shell (true)
+term: VGA now belongs to the remote shell; keyboard is live
+ssh(d): first shell output (7 bytes)
+nc110$ echo nc110-m3-okxy  
+nc110-m3-ok
+nc110$ echo $((6*7))
+42
+nc110$ sleep 30
+^C
+nc110$ printf 'AB\033[1DX\033[KZ\n'
+AB^[[1DX^[[KZ
+nc110$ seq 1 30
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+nc110$ uname -a
+Darwin Mac 25.5.0 Darwin Kernel Version 25.5.0: Tue Jun  9 22:26:22 PDT 2026; root:xnu-12377.121.10~1/RELEASE_ARM64_T8132 arm64
+nc110$ exit
+exit
+
+
+ssh: shell channel closed, disconnecting
+rng: 98 requests served, 12 reseeds, 133120 raw samples health-tested, failure latched: false
+ssh: M3 reached: interactive shell over SSH, drawn on VGA, typed on PS/2
+DONE
+
+exec
+/bin/zsh -lc "rg --files ~/.cargo/registry/src | rg 'sunset-0.6.0/.*/?(runner|channel|client|session).*rs"'$'"'" in ~/nc110-baremetal
+ succeeded in 0ms:
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/client.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/channel.rs
+
+exec
+/bin/zsh -lc "rg -n 'write_channel|fn shell|fn pty|RequestFailure|ChannelFailure|want_reply|Session.*Fail|fn close_input' ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src; sed -n '1,120p' src/ssh.rs; cat src/console.rs; rg -n 'timeout|keep_alive|is_active|CloseWait' ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smoltcp-*/src/socket/tcp.rs | head -65; git rev-parse HEAD; rg --files -g '*md'" in ~/nc110-baremetal
+ exited 1 in 0ms:
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/traffic.rs:750:    ChannelFailure(packets::ChannelFailure),
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/traffic.rs:756:    RequestFailure(packets::RequestFailure),
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/traffic.rs:766:            DeferredPacket::ChannelFailure(p) => (p.clone()).into(),
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/traffic.rs:772:            DeferredPacket::RequestFailure(p) => (p.clone()).into(),
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/traffic.rs:783:            Packet::ChannelFailure(p) => Self::ChannelFailure(p),
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/traffic.rs:788:            Packet::RequestFailure(p) => Self::RequestFailure(p),
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/conn.rs:538:            | Packet::ChannelFailure(_) => {
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/conn.rs:543:                if p.want_reply {
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/conn.rs:544:                    s.send(packets::RequestFailure {})?;
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/conn.rs:550:            Packet::RequestFailure(_) => {
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/packets.rs:657:    pub want_reply: bool,
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/packets.rs:711:pub struct RequestFailure {}
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/packets.rs:811:pub struct ChannelFailure {
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/packets.rs:822:    pub want_reply: bool,
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/packets.rs:1149:(82, RequestFailure, RequestFailure, SSH_MSG_REQUEST_FAILURE, Sess),
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/packets.rs:1161:(100, ChannelFailure, ChannelFailure, SSH_MSG_CHANNEL_FAILURE, Sess),
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs:451:    pub fn close_input(&mut self) {
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs:510:    pub fn write_channel(
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs:525:        let len = self.write_channel_ready(chan, dt)?;
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs:627:    pub fn write_channel_ready(
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs:638:        // When write_channel_ready() returns Some(0), a subsequent
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs:655:        // write_channel_ready() will happen after the deferred packets are
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs:679:    pub fn is_write_channel_valid(&self, chan: &ChanHandle, dt: ChanData) -> bool {
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/channel.rs:500:            Packet::ChannelFailure(_p) => {
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/channel.rs:538:            if r.want_reply {
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/channel.rs:543:                    s.send(packets::ChannelFailure { num })
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/channel.rs:686:            want_reply: false,
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/channel.rs:902:                if p.want_reply {
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/channel.rs:906:                        let _ = s.send(packets::ChannelFailure { num });
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/channel.rs:955:    /// Returns Ok(want_reply: bool) on success
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/channel.rs:1178:    pub fn pty(&mut self, pty: channel::Pty) -> Result<()> {
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/channel.rs:1187:    pub fn shell(&mut self) -> Result<()> {
+//! M2/M3: DHCP + TCP (smoltcp) + SSH client (Sunset) against a throwaway sshd on the host.
+//!
+//! Milestones are printed one per line so the furthest one reached is unambiguous:
+//!   (a) TCP connect + server banner   (b) key exchange done, host key matched the pin
+//!   (c) publickey auth OK             (d) channel output
+//! M3: the session asks for a pty (xterm 80x25) and a shell; PS/2 keystrokes go to the channel and the
+//! channel's output is drawn by the VGA terminal (`term`), and mirrored to COM1 with ESC shown as `^[`.
+use crate::net::Nic;
+use crate::nic::Rtl;
+use crate::{console, kbd, kprintln, rng, term, time, wdt};
+use sha2::{Digest, Sha256};
+use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+use smoltcp::socket::{dhcpv4, tcp};
+use smoltcp::time::Instant;
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+use sunset::{ChanData, ChanHandle, CliEvent, Event, Pty, PubKey, Runner, SignKey};
+
+const SERVER: (Ipv4Address, u16) = (Ipv4Address::new(10, 0, 2, 2), 2223);
+const USER: &str = "evnchn";
+
+/// The ONE host key we accept: raw ed25519 public key of the throwaway sshd's host key.
+#[cfg(not(feature = "badpin"))]
+const HOST_PIN: [u8; 32] = *include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/test-keys/host_pub.bin"));
+/// Negative control: same pin with one bit flipped, must be rejected.
+#[cfg(feature = "badpin")]
+const HOST_PIN: [u8; 32] = {
+    let mut k = *include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/test-keys/host_pub.bin"));
+    k[0] ^= 0x01;
+    k
+};
+
+static mut SOCK_STORE: [SocketStorage<'static>; 3] = [SocketStorage::EMPTY; 3];
+static mut TCP_RX: [u8; 16384] = [0; 16384];
+static mut TCP_TX: [u8; 16384] = [0; 16384];
+static mut SSH_IN: [u8; 36000] = [0; 36000];
+static mut SSH_OUT: [u8; 36000] = [0; 36000];
+
+fn now() -> Instant {
+    Instant::from_millis(time::now_ms())
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// OpenSSH-style "SHA256:<base64, no padding>" of the ssh-ed25519 public key blob.
+fn fingerprint(key: &[u8; 32], out: &mut [u8; 43]) {
+    let mut h = Sha256::new();
+    h.update(11u32.to_be_bytes());
+    h.update(b"ssh-ed25519");
+    h.update(32u32.to_be_bytes());
+    h.update(key);
+    let d = h.finalize();
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bits: u32 = 0;
+    let mut n = 0;
+    let mut o = 0;
+    for &b in d.iter() {
+        bits = (bits << 8) | b as u32;
+        n += 8;
+        while n >= 6 {
+            n -= 6;
+            out[o] = A[((bits >> n) & 63) as usize];
+            o += 1;
+        }
+    }
+    if n > 0 {
+        out[o] = A[((bits << (6 - n)) & 63) as usize];
+    }
+}
+
+fn fp_str(key: &[u8; 32]) -> [u8; 43] {
+    let mut f = [0u8; 43];
+    fingerprint(key, &mut f);
+    f
+}
+
+/// `client_seed`: the ed25519 seed loaded from the multiboot key module (never compiled in, M2.5).
+pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+    let Some(mut client_seed) = client_seed else {
+        kprintln!("ssh: no client key module (GRUB `module` / QEMU -initrd) -> refusing to run SSH");
+        return;
+    };
+    if rng::init(rng_dump).is_err() {
+        return; // rng::init already printed why
+    }
+
+    let mac = nic.mac;
+    let mut dev = Nic(nic);
+    let mut cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    let mut seed = [0u8; 8];
+    if rng::fill(&mut seed).is_err() {
+        kprintln!("rng: entropy pool failed for the network seed -> refusing to run SSH");
+        return;
+    }
+    cfg.random_seed = u64::from_le_bytes(seed);
+    let mut iface = Interface::new(cfg, &mut dev, now());
+
+    let mut sockets = SocketSet::new(unsafe { &mut *core::ptr::addr_of_mut!(SOCK_STORE) }[..].as_mut());
+    let dhcp_h = sockets.add(dhcpv4::Socket::new());
+    let tcp_h = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(TCP_RX) }[..].as_mut()),
+        tcp::SocketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(TCP_TX) }[..].as_mut()),
+    ));
+
+    // ---- DHCP (smoltcp) ----
+    let t0 = time::now_ms();
+    let mut have_ip = false;
+    while time::now_ms() - t0 < 10_000 {
+        iface.poll(now(), &mut dev, &mut sockets);
+        if let Some(dhcpv4::Event::Configured(c)) = sockets.get_mut::<dhcpv4::Socket>(dhcp_h).poll() {
+            iface.update_ip_addrs(|a| {
+                a.clear();
+                let _ = a.push(IpCidr::Ipv4(c.address));
+            });
+            if let Some(gw) = c.router {
+                let _ = iface.routes_mut().add_default_ipv4_route(gw);
+            }
+            kprintln!("dhcp: smoltcp lease {} router {:?}", c.address, c.router);
+            have_ip = true;
+//! Output to COM1 (0x3F8, 115200 8N1) and the VGA text buffer (0xB8000, 80x25).
+use crate::port::{inb, outb};
+use core::fmt;
+
+const COM1: u16 = 0x3F8;
+const VGA: *mut u16 = 0xB8000 as *mut u16;
+const W: usize = 80;
+const H: usize = 25;
+const ATTR: u16 = 0x1F00; // white on blue
+
+static mut ROW: usize = 0;
+static mut COL: usize = 0;
+/// Cleared when the SSH terminal takes over the screen: log lines then go to COM1 only.
+static mut VGA_LOG: bool = true;
+
+pub fn vga_log_off() {
+    unsafe { VGA_LOG = false };
+}
+
+/// Raw byte to COM1 (used to mirror the remote shell's output into the serial log).
+pub fn serial_raw(b: u8) {
+    serial_putc(b);
+}
+
+pub fn init() {
+    unsafe {
+        outb(COM1 + 1, 0x00); // no interrupts
+        outb(COM1 + 3, 0x80); // DLAB
+        outb(COM1 + 0, 0x01); // divisor 1 = 115200
+        outb(COM1 + 1, 0x00);
+        outb(COM1 + 3, 0x03); // 8N1
+        outb(COM1 + 2, 0xC7); // FIFO
+        outb(COM1 + 4, 0x03);
+        for i in 0..W * H {
+            VGA.add(i).write_volatile(ATTR | b' ' as u16);
+        }
+        ROW = 0;
+        COL = 0;
+    }
+}
+
+fn serial_putc(b: u8) {
+    unsafe {
+        while inb(COM1 + 5) & 0x20 == 0 {}
+        outb(COM1, b);
+    }
+}
+
+fn vga_putc(b: u8) {
+    unsafe {
+        if b == b'\n' {
+            COL = 0;
+            ROW += 1;
+        } else {
+            VGA.add(ROW * W + COL).write_volatile(ATTR | b as u16);
+            COL += 1;
+            if COL == W {
+                COL = 0;
+                ROW += 1;
+            }
+        }
+        if ROW == H {
+            for i in 0..W * (H - 1) {
+                VGA.add(i).write_volatile(VGA.add(i + W).read_volatile());
+            }
+            for i in 0..W {
+                VGA.add((H - 1) * W + i).write_volatile(ATTR | b' ' as u16);
+            }
+            ROW = H - 1;
+        }
+    }
+}
+
+pub struct Console;
+impl fmt::Write for Console {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for &b in s.as_bytes() {
+            if b == b'\n' {
+                serial_putc(b'\r');
+            }
+            serial_putc(b);
+            if unsafe { VGA_LOG } {
+                vga_putc(b);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[macro_export]
+macro_rules! kprintln {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = writeln!($crate::console::Console, $($arg)*);
+    }};
+}
+
+#[macro_export]
+macro_rules! kprint {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = write!($crate::console::Console, $($arg)*);
+    }};
+}
+117:    CloseWait,
+133:            State::CloseWait => write!(f, "CLOSE-WAIT"),
+193:    fn retransmission_timeout(&self) -> Duration {
+285:        keep_alive_at: Option<Instant>,
+306:            keep_alive_at: None,
+310:    fn should_keep_alive(&self, timestamp: Instant) -> bool {
+313:                keep_alive_at: Some(keep_alive_at),
+314:            } if timestamp >= keep_alive_at => true,
+344:                keep_alive_at: Some(keep_alive_at),
+345:            } => PollAt::Time(keep_alive_at),
+347:                keep_alive_at: None,
+358:            keep_alive_at: interval.map(|interval| timestamp + interval),
+362:    fn set_keep_alive(&mut self) {
+363:        if let Timer::Idle { keep_alive_at } = self
+364:            && keep_alive_at.is_none()
+366:            *keep_alive_at = Some(Instant::from_millis(0))
+370:    fn rewind_keep_alive(&mut self, timestamp: Instant, interval: Option<Duration>) {
+371:        if let Timer::Idle { keep_alive_at } = self {
+372:            *keep_alive_at = interval.map(|interval| timestamp + interval)
+479:    timeout: Option<Duration>,
+481:    keep_alive: Option<Duration>,
+597:            timeout: None,
+598:            keep_alive: None,
+729:    /// Return the timeout duration.
+731:    /// See also the [set_timeout](#method.set_timeout) method.
+732:    pub fn timeout(&self) -> Option<Duration> {
+733:        self.timeout
+787:    /// Set the timeout duration.
+789:    /// A socket with a timeout duration set will abort the connection if either of the following
+796:    ///   * After enabling [keep-alive](#method.set_keep_alive), the remote endpoint exceeds
+798:    pub fn set_timeout(&mut self, duration: Option<Duration>) {
+799:        self.timeout = duration
+827:    /// See also the [set_keep_alive](#method.set_keep_alive) method.
+828:    pub fn keep_alive(&self) -> Option<Duration> {
+829:        self.keep_alive
+842:    /// The keep-alive functionality together with the timeout functionality allows to react
+844:    pub fn set_keep_alive(&mut self, interval: Option<Duration>) {
+845:        self.keep_alive = interval;
+846:        if self.keep_alive.is_some() {
+849:            self.timer.set_keep_alive();
+1094:            State::CloseWait => self.set_state(State::LastAck),
+1159:    pub fn is_active(&self) -> bool {
+1183:            State::CloseWait => true,
+1259:                let delay = self.rtte.retransmission_timeout();
+1795:                    // If we're in the TIME-WAIT state, restart the TIME-WAIT timeout, since
+1933:                self.timer.set_for_idle(cx.now(), self.keep_alive);
+1947:                self.set_state(State::CloseWait);
+1995:                self.set_state(State::CloseWait);
+2037:            (State::CloseWait, TcpControl::None) => {}
+2178:                    self.timer.set_for_idle(cx.now(), self.keep_alive);
+2181:                    let rto = self.rtte.retransmission_timeout();
+2187:                self.timer.set_for_idle(cx.now(), self.keep_alive);
+2197:            let delay = self.rtte.retransmission_timeout();
+2203:            self.timer.set_for_idle(cx.now(), self.keep_alive);
+2293:        match (self.remote_last_ts, self.timeout) {
+2294:            (Some(remote_last_ts), Some(timeout)) => timestamp >= remote_last_ts + timeout,
+2460:            // So, we start counting the timeout not from the last received packet
+2471:            // If a timeout expires, we should abort the connection.
+2472:            net_debug!("timeout exceeded");
+2509:            self.timer.set_for_idle(cx.now(), self.keep_alive);
+2533:        } else if self.timer.should_keep_alive(cx.now()) {
+2620:            | State::CloseWait
+2729:                        State::Established | State::CloseWait if !repr.payload.is_empty() => {
+2745:        let is_keep_alive;
+2746:        if self.timer.should_keep_alive(cx.now()) && repr.is_empty() {
+7cbb8e370ec83bba3a7a6df468a18736985d9300
+
+codex
+The terminal’s row and column bounds appear sound, including P/@/X/L/M. The SSH loop retains partially written input correctly. I’m checking two remaining risks: whether a dead connection can keep the watchdog fed indefinitely, and whether the keyboard’s “nothing typed is lost” claim holds under backpressure.
+exec
+/bin/zsh -lc "sed -n '440,465p' ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs; sed -n '496,545p' ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs; sed -n '620,678p' ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs; sed -n '670,695p' ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/channel.rs; sed -n '1150,1205p' ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/channel.rs; sed -n '1140,1215p' ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smoltcp-*/src/socket/tcp.rs; cat src/main.rs; cat Cargo.toml" in ~/nc110-baremetal
+ succeeded in 0ms:
+        }
+
+        self.conn.initial_sent() && self.traf_in.is_input_ready()
+    }
+
+    /// Set a waker to be notified when [`input()`](Self::input) is ready to be called.
+    pub fn set_input_waker(&mut self, waker: &Waker) {
+        set_waker(&mut self.input_waker, waker)
+    }
+
+    /// Indicate that the input SSH tcp socket has closed
+    pub fn close_input(&mut self) {
+        trace!("close_input");
+        self.closed_input = true;
+    }
+
+    /// Write any pending output to the wire, returning the size written
+    pub fn output(&mut self, buf: &mut [u8]) -> usize {
+        let out = self.output_buf();
+        let l = out.len().min(buf.len());
+        buf.copy_from_slice(&out[..l]);
+        self.consume_output(l);
+        l
+    }
+
+    /// Returns a buffer of output to send over the wire.
+        set_waker(&mut self.output_waker, waker);
+    }
+
+    /// Indicate that the output SSH tcp socket has closed
+    pub fn close_output(&mut self) {
+        trace!("close_input");
+        self.traf_out.close();
+        self.wake();
+    }
+
+    /// Send data from this application out the wire.
+    ///
+    /// Returns `Ok(len)` consumed, `Err(Error::ChannelEof)` on EOF,
+    /// or other errors.
+    pub fn write_channel(
+        &mut self,
+        chan: &ChanHandle,
+        dt: ChanData,
+        buf: &[u8],
+    ) -> Result<usize> {
+        if self.traf_out.closed() {
+            // TODO: unsure if we need this
+            return error::ChannelEOF.fail();
+        }
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let len = self.write_channel_ready(chan, dt)?;
+        let len = match len {
+            Some(0) => return Ok(0),
+            Some(l) => l,
+            None => return Err(Error::ChannelEOF),
+        };
+
+        let len = len.min(buf.len());
+
+        let p = self.conn.channels.send_data(chan.0, dt, &buf[..len])?;
+        trace!("send_packet ch {:?} dt {:?} {}", chan.0, dt, len);
+        self.traf_out.send_packet(p, &mut self.keys)?;
+        self.wake();
+        Ok(len)
+    }
+
+    /// Receive data coming from the wire into this application.
+    ///
+    /// Returns `Ok(len)` received, `Err(Error::ChannelEof)` on EOF,
+    /// or other errors. Ok(0) indicates no data available, ie pending.
+    /// TODO: EOF is unimplemented
+    }
+
+    /// Returns the maximum data that may be sent to a channel
+    ///
+    /// Returns `Ok(None)` on channel closed.
+    ///
+    /// May fail with `BadChannelData` if dt is invalid for this session.
+    pub fn write_channel_ready(
+        &self,
+        chan: &ChanHandle,
+        dt: ChanData,
+    ) -> Result<Option<usize>> {
+        if self.traf_out.closed() {
+            return Ok(None);
+        }
+        // Avoid apps polling forever on a packet type that won't come
+        dt.validate_send(CS::is_client())?;
+
+        // When write_channel_ready() returns Some(0), a subsequent
+        // channel_wake_write() needs to occur.
+
+        // channel_wake_write() after KexDone.
+        if self.conn.is_kex_sending() {
+            // Only KEX messages are allowed during key exchange,
+            // not data.
+            return Ok(Some(0));
+        }
+
+        // Drain only happens prior to KEX, so can be woken after KexDone.
+        if self.traf_out.is_draining() {
+            // Continual channel data could prevent drain from completing,
+            // so disallow channel writes when draining.
+            return Ok(Some(0));
+        }
+
+        // write_channel_ready() will happen after the deferred packets are
+        // moved to main queued then written.
+        if self.traf_out.have_deferred_packets() {
+            // Let deferred packets get moved to the output queue
+            // before sending more channel data.
+            return Ok(Some(0));
+        }
+
+        // minimum of buffer space and channel window available
+        let payload_space = self.traf_out.send_allowed(&self.keys);
+        // subtract space for packet headers prior to data
+        let payload_space = payload_space.saturating_sub(dt.packet_offset());
+        let r = Ok(self
+            .conn
+            .channels
+            .send_allowed(chan.0)
+            .map(|s| s.min(payload_space)));
+        trace!("ready_channel_send {chan:?} -> {r:?}");
+        r
+    }
+
+    /// Returns `true` if the channel and `dt` are currently valid for writing.
+    ///
+    /// Note that they may not be ready to send output.
+                    modes: BinString(&[]),
+                })
+            }
+            Req::Exec(cmd) => {
+                ChannelReqType::Exec(packets::Exec { command: cmd.into() })
+            }
+            Req::Subsystem(cmd) => ChannelReqType::Subsystem(packets::Subsystem {
+                subsystem: cmd.into(),
+            }),
+            Req::WinChange(rt) => ChannelReqType::WinChange(rt),
+            Req::Break(rt) => ChannelReqType::Break(rt),
+        };
+
+        let p = ChannelRequest {
+            num: ch.send_num()?,
+            // we aren't handling responses for anything
+            want_reply: false,
+            req,
+        };
+        let p: Packet = p.into();
+        s.send(p)
+    }
+}
+
+/// Convenience for the types of session channels that can be opened
+pub enum SessionCommand<S: AsRef<str>> {
+    }
+}
+
+impl From<ChanFail> for DispatchOpenError {
+    fn from(f: ChanFail) -> Self {
+        Self::Failure(f)
+    }
+}
+
+// constructed from runner::cli_session_opener()
+/// Sends shell, command, or other requests to a newly opened session channel
+pub struct CliSessionOpener<'g, 'a> {
+    pub(crate) ch: &'g Channel,
+    pub(crate) s: TrafSend<'g, 'a>,
+}
+
+impl<'g, 'a> CliSessionOpener<'g, 'a> {
+    /// Returns the channel number associated with this session.
+    pub fn channel(&self) -> ChanNum {
+        self.ch.num()
+    }
+
+    /// Requests a Pseudo-TTY for the channel.
+    ///
+    /// This must be sent prior to requesting a shell or command.
+    /// Shells using a PTY will only receive data on the stdin FD, not stderr.
+    // TODO: set a flag in the channel so that it drops data on stderr, to
+    // avoid waiting forever for a consumer?
+    pub fn pty(&mut self, pty: channel::Pty) -> Result<()> {
+        self.send(Req::Pty(pty))
+    }
+
+    /// Requests a particular command or shell for a channel
+    pub fn cmd<S: AsRef<str>>(&mut self, cmd: &SessionCommand<S>) -> Result<()> {
+        self.send(cmd.into())
+    }
+
+    pub fn shell(&mut self) -> Result<()> {
+        self.send(Req::Shell)
+    }
+
+    pub fn exec(&mut self, cmd: impl AsRef<str>) -> Result<()> {
+        self.send(Req::Exec(cmd.as_ref()))
+    }
+
+    pub fn subsystem(&mut self, cmd: impl AsRef<str>) -> Result<()> {
+        self.send(Req::Subsystem(cmd.as_ref()))
+    }
+
+    fn send(&mut self, req: Req) -> Result<()> {
+        req.send(self.ch, &mut self.s)
+    }
+}
+
+impl core::fmt::Debug for CliSessionOpener<'_, '_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            State::Closed => false,
+            State::TimeWait => false,
+            _ => true,
+        }
+    }
+
+    /// Return whether a connection is active.
+    ///
+    /// This function returns true if the socket is actively exchanging packets with
+    /// a remote endpoint. Note that this does not mean that it is possible to send or receive
+    /// data through the socket; for that, use [can_send](#method.can_send) or
+    /// [can_recv](#method.can_recv).
+    ///
+    /// If a connection is established, [abort](#method.close) will send a reset to
+    /// the remote endpoint.
+    ///
+    /// In terms of the TCP state machine, the socket must not be in the `CLOSED`, `TIME-WAIT`,
+    /// or `LISTEN` state.
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        match self.state {
+            State::Closed => false,
+            State::TimeWait => false,
+            State::Listen => false,
+            _ => true,
+        }
+    }
+
+    /// Return whether the transmit half of the full-duplex connection is open.
+    ///
+    /// This function returns true if it's possible to send data and have it arrive
+    /// to the remote endpoint. However, it does not make any guarantees about the state
+    /// of the transmit buffer, and even if it returns true, [send](#method.send) may
+    /// not be able to enqueue any octets.
+    ///
+    /// In terms of the TCP state machine, the socket must be in the `ESTABLISHED` or
+    /// `CLOSE-WAIT` state.
+    #[inline]
+    pub fn may_send(&self) -> bool {
+        match self.state {
+            State::Established => true,
+            // In CLOSE-WAIT, the remote endpoint has closed our receive half of the connection
+            // but we still can transmit indefinitely.
+            State::CloseWait => true,
+            _ => false,
+        }
+    }
+
+    /// Return whether the receive half of the full-duplex connection is open.
+    ///
+    /// This function returns true if it's possible to receive data from the remote endpoint.
+    /// It will return true while there is data in the receive buffer, and if there isn't,
+    /// as long as the remote endpoint has not closed the connection.
+    ///
+    /// In terms of the TCP state machine, the socket must be in the `ESTABLISHED`,
+    /// `FIN-WAIT-1`, or `FIN-WAIT-2` state, or have data in the receive buffer instead.
+    #[inline]
+    pub fn may_recv(&self) -> bool {
+        match self.state {
+            State::Established => true,
+            // In FIN-WAIT-1/2, we have closed our transmit half of the connection but
+            // we still can receive indefinitely.
+            State::FinWait1 | State::FinWait2 => true,
+            // If we have something in the receive buffer, we can receive that.
+            _ if self.can_recv() => true,
+            _ => false,
+        }
+    }
+
+    /// Check whether the transmit half of the full-duplex connection is open
+    /// (see [may_send](#method.may_send)), and the transmit buffer is not full.
+    #[inline]
+    pub fn can_send(&self) -> bool {
+        if !self.may_send() {
+            return false;
+        }
+#![no_std]
+#![no_main]
+
+use core::arch::{asm, global_asm};
+use core::fmt::Write;
+use core::panic::PanicInfo;
+
+global_asm!(include_str!("boot.s"), options(att_syntax));
+
+mod console;
+#[allow(dead_code)]
+mod dhcp;
+mod kbd;
+mod mb;
+mod net;
+mod nic;
+mod nic_regs;
+mod pci;
+mod port;
+mod rng;
+mod ssh;
+mod term;
+mod time;
+mod wdt;
+
+struct SerialLog;
+impl log::Log for SerialLog {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Warn
+    }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            kprintln!("[{}] {}", r.level(), r.args());
+        }
+    }
+    fn flush(&self) {}
+}
+static LOGGER: SerialLog = SerialLog;
+
+#[no_mangle]
+pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
+    console::init();
+    kprintln!("NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)");
+    kprintln!("multiboot magic={:#010x} info={:#x} -> long mode OK", magic, info);
+    wdt::report();
+    if !wdt::is_qemu_pc() && !wdt::verify_live() && !wdt::neg_control_on_q35() {
+        kprintln!("wdt: reset path not verified on this machine, refusing to run");
+        wdt::hard_reset();
+    }
+    // Key module right after the watchdog gate: copy the seed out and wipe the module before anything else.
+    let client_seed = mb::take_client_key(info);
+    mb::parse_memory(info);
+    let cmdline = mb::cmdline(info);
+    kprintln!("cmdline: {}", cmdline);
+    wdt::rehearse(cmdline);
+
+    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
+    kprintln!("time: TSC {} ticks/ms (PIT ch2 calibrated)", time::init());
+
+    match nic::probe(cmdline.contains("nic=mmio")) {
+        Ok(mut n) => {
+            kprintln!("nic: {} at {} {} mac={}", n.name(), n.bdf, n.bus, dhcp::Mac(n.mac));
+            match n.init() {
+                Ok(()) => ssh::run(n, client_seed, cmdline.contains("rng=dump")),
+                Err(e) => kprintln!("nic: init failed: {} (bus mastering left off)", e),
+            }
+        }
+        Err(e) => kprintln!("nic: {}", e),
+    }
+    kprintln!("DONE");
+    loop {
+        unsafe { asm!("cli; hlt") };
+    }
+}
+
+pub fn ram_overlaps(base: u64, len: u64) -> bool {
+    mb::ram_overlaps(base, len)
+}
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    let _ = writeln!(console::Console, "PANIC: {}", info);
+    loop {
+        unsafe { asm!("cli; hlt") };
+    }
+}
+[package]
+name = "nc110-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+neg-control = []
+grub-armed = []
+badpin = []  # negative control: flip one bit of the pinned host key
+badjitter = []  # negative control: constant TSC in the jitter source, startup health test must refuse SSH
+
+[dependencies]
+# M2: pinned exact versions (Cargo.lock is committed too).
+sunset = { version = "=0.6.0", default-features = false }
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-tcp", "socket-dhcpv4"] }
+getrandom = { version = "0.4", default-features = false }
+log = "0.4"
+heapless = { version = "=0.9.3", default-features = false }  # M3: sunset::Pty.term is a heapless::String
+sha2 = { version = "=0.11.1", default-features = false }
+
+[[bin]]
+name = "nc110-kernel"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+web search: 
+web search: site.kernel.org i8042 translation atkbd translated keyboard buffer overflow ...
+web search: 
+web search: https://raw.githubusercontent.com/qemu/qemu/master/hw/input/ps2.c
+exec
+/bin/zsh -lc "nl -ba src/term.rs | sed -n '94,175p'; nl -ba src/kbd.rs | sed -n '60,160p'; rg -n 'closed_input|Defunct' ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs; rg -n 'cli|sti|0xb8000|0xB8000' src/boot.s" in ~/nc110-baremetal
+ succeeded in 0ms:
+    94	}
+    95	
+    96	fn arg(t: &T, i: usize, def: u16) -> usize {
+    97	    let v = if i < t.np { t.p[i] } else { 0 };
+    98	    (if v == 0 { def } else { v }) as usize
+    99	}
+   100	
+   101	fn csi(t: &mut T, f: u8) {
+   102	    if t.private {
+   103	        return; // ?25h/l, ?2004h/l, ?1h ... : modes we do not model
+   104	    }
+   105	    let n = arg(t, 0, 1);
+   106	    match f {
+   107	        b'A' => t.row = t.row.saturating_sub(n),
+   108	        b'B' | b'e' => t.row = (t.row + n).min(H - 1),
+   109	        b'C' | b'a' => t.col = (t.col + n).min(W - 1),
+   110	        b'D' => t.col = t.col.saturating_sub(n),
+   111	        b'G' | b'`' => t.col = (n - 1).min(W - 1),
+   112	        b'd' => t.row = (n - 1).min(H - 1),
+   113	        b'H' | b'f' => {
+   114	            t.row = (arg(t, 0, 1) - 1).min(H - 1);
+   115	            t.col = (arg(t, 1, 1) - 1).min(W - 1);
+   116	        }
+   117	        b'J' => {
+   118	            let cur = t.row * W + t.col;
+   119	            match arg(t, 0, 0) {
+   120	                0 => clear_range(cur, W * H),
+   121	                1 => clear_range(0, cur + 1),
+   122	                _ => clear_range(0, W * H),
+   123	            }
+   124	        }
+   125	        b'K' => {
+   126	            let s = t.row * W;
+   127	            match arg(t, 0, 0) {
+   128	                0 => clear_range(s + t.col, s + W),
+   129	                1 => clear_range(s, s + t.col + 1),
+   130	                _ => clear_range(s, s + W),
+   131	            }
+   132	        }
+   133	        b'P' => {
+   134	            // delete n chars, shift the rest of the line left
+   135	            let n = n.min(W - t.col);
+   136	            for c in t.col..W {
+   137	                put(t.row, c, if c + n < W { get(t.row, c + n) } else { BLANK });
+   138	            }
+   139	        }
+   140	        b'@' => {
+   141	            let n = n.min(W - t.col);
+   142	            for c in (t.col..W).rev() {
+   143	                put(t.row, c, if c >= t.col + n { get(t.row, c - n) } else { BLANK });
+   144	            }
+   145	        }
+   146	        b'X' => {
+   147	            let s = t.row * W + t.col;
+   148	            clear_range(s, s + n.min(W - t.col));
+   149	        }
+   150	        b'L' => {
+   151	            for _ in 0..n.min(H - t.row) {
+   152	                scroll_down(t.row);
+   153	            }
+   154	        }
+   155	        b'M' => {
+   156	            for _ in 0..n.min(H - t.row) {
+   157	                scroll_up(t.row);
+   158	            }
+   159	        }
+   160	        _ => {} // 'm' (SGR), 'r' (scroll region), 'h'/'l', 'n' (DSR: no reply), ...: ignored
+   161	    }
+   162	    t.wrap = false;
+   163	}
+   164	
+   165	/// Feed one byte of the remote's output.
+   166	pub fn feed(b: u8) {
+   167	    let t = unsafe { &mut *core::ptr::addr_of_mut!(T) };
+   168	    match t.st {
+   169	        St::Ground => match b {
+   170	            0x1B => t.st = St::Esc,
+   171	            b'\r' => {
+   172	                t.col = 0;
+   173	                t.wrap = false;
+   174	            }
+   175	            b'\n' | 0x0B | 0x0C => {
+    60	/// Drain whatever the controller has buffered (firmware leftovers) so the first key is a real one.
+    61	pub fn init() -> usize {
+    62	    let mut n = 0;
+    63	    unsafe {
+    64	        while inb(STATUS) & 1 != 0 && n < 64 {
+    65	            let _ = inb(DATA);
+    66	            n += 1;
+    67	        }
+    68	    }
+    69	    n
+    70	}
+    71	
+    72	/// Translate one scancode; appends 0..4 bytes to `out` and returns how many.
+    73	fn translate(sc: u8, out: &mut [u8; 4]) -> usize {
+    74	    unsafe {
+    75	        if sc == 0xE0 {
+    76	            E0 = true;
+    77	            return 0;
+    78	        }
+    79	        let ext = E0;
+    80	        E0 = false;
+    81	        let brk = sc & 0x80 != 0;
+    82	        let code = sc & 0x7F;
+    83	        match (ext, code) {
+    84	            (false, 0x2A) => SHIFT_L = !brk,
+    85	            (false, 0x36) => SHIFT_R = !brk,
+    86	            (_, 0x1D) => CTRL = !brk, // left ctrl, or E0 1D right ctrl
+    87	            (false, 0x3A) if !brk => CAPS = !CAPS,
+    88	            _ => {}
+    89	        }
+    90	        if brk {
+    91	            return 0;
+    92	        }
+    93	        if ext {
+    94	            let seq: &[u8] = match code {
+    95	                0x48 => b"\x1b[A",
+    96	                0x50 => b"\x1b[B",
+    97	                0x4D => b"\x1b[C",
+    98	                0x4B => b"\x1b[D",
+    99	                0x47 => b"\x1b[H",
+   100	                0x4F => b"\x1b[F",
+   101	                0x53 => b"\x1b[3~",
+   102	                0x1C => b"\r", // keypad Enter
+   103	                0x35 => b"/",  // keypad /
+   104	                _ => b"",
+   105	            };
+   106	            out[..seq.len()].copy_from_slice(seq);
+   107	            return seq.len();
+   108	        }
+   109	        if (code as usize) >= MAP.len() {
+   110	            return 0;
+   111	        }
+   112	        let (lo, hi) = MAP[code as usize];
+   113	        if lo == 0 {
+   114	            return 0;
+   115	        }
+   116	        let shift = SHIFT_L || SHIFT_R;
+   117	        let mut c = if shift { hi } else { lo };
+   118	        if CAPS && lo.is_ascii_lowercase() {
+   119	            c = if shift { lo } else { hi };
+   120	        }
+   121	        if CTRL {
+   122	            c = match c {
+   123	                b'a'..=b'z' | b'A'..=b'Z' => c & 0x1F,
+   124	                b'@' | b' ' | b'2' => 0x00,
+   125	                b'[' => 0x1B,
+   126	                b'\\' => 0x1C,
+   127	                b']' => 0x1D,
+   128	                b'_' | b'-' => 0x1F,
+   129	                _ => c,
+   130	            };
+   131	        }
+   132	        out[0] = c;
+   133	        1
+   134	    }
+   135	}
+   136	
+   137	/// Poll the controller and append the bytes typed so far to `buf[*len..]`. Mouse (AUX) bytes are dropped.
+   138	/// Stops reading scancodes once fewer than 4 bytes of room remain, so nothing typed is lost (the i8042 holds it).
+   139	pub fn poll(buf: &mut [u8], len: &mut usize) {
+   140	    unsafe {
+   141	        while buf.len() - *len >= 4 {
+   142	            let st = inb(STATUS);
+   143	            if st & 1 == 0 {
+   144	                break;
+   145	            }
+   146	            let sc = inb(DATA);
+   147	            if st & 0x20 != 0 {
+   148	                continue; // AUX (touchpad) byte
+   149	            }
+   150	            let mut tmp = [0u8; 4];
+   151	            let n = translate(sc, &mut tmp);
+   152	            buf[*len..*len + n].copy_from_slice(&tmp[..n]);
+   153	            *len += n;
+   154	        }
+   155	    }
+   156	}
+46:    closed_input: bool,
+294:            closed_input: false,
+371:        } else if self.closed_input {
+374:                return Ok(Event::Cli(CliEvent::Defunct));
+376:                return Ok(Event::Serv(ServEvent::Defunct));
+418:        if self.closed_input {
+429:        if self.closed_input {
+453:        self.closed_input = true;
+552:        if self.closed_input {
+615:        self.conn.channels.have_recv_eof(chan.0) || self.closed_input
+619:        self.conn.channels.is_closed(chan.0) || self.closed_input
+25:    cli
+180:3:  cli
+
+codex
+Most of the bounds and data movement code is sound. I found one significant termination defect and three smaller issues. Reviewed commit `7cbb8e3`, its installed dependencies, and the existing proof log; no files changed and no new QEMU run.
+
+1. **MUST-FIX — Dead sessions can spin forever while petting the watchdog.** [ssh.rs:210](~/nc110-baremetal/src/ssh.rs:210), [ssh.rs:164](~/nc110-baremetal/src/ssh.rs:164)
+
+   A TCP FIN without an SSH channel-close/disconnect leaves smoltcp in `CloseWait`. Its `is_active()` remains **true**, so this code never calls `runner.close_input()`. With `shell_open == true`, the deadline no longer applies. The loop continues petting TCO indefinitely.
+
+   A blackholed connection has the same recovery problem: neither TCP timeout nor keepalive is configured. Also, Sunset 0.6.0 sends PTY/shell requests with `want_reply: false`; their `Ok` results mean locally queued, not remotely accepted. Thus `shell_open` disables the startup deadline before shell startup is established.
+
+   **Fix:** detect drained receive-side closure using `may_recv()`, retain a startup deadline, and provide bounded peer-liveness detection plus a local escape/reset path. A healthy idle shell should remain open; merely iterating the loop must not be mistaken for a usable connection. Normal channel EOF/close termination does work.
+
+2. **SHOULD-FIX — Keyboard backpressure can lose scancodes and leave modifiers stuck.** [kbd.rs:137](~/nc110-baremetal/src/kbd.rs:137)
+
+   Once the 64-byte input queue has fewer than four free bytes, polling stops entirely—including processing Shift/Ctrl releases. If SSH stays blocked and typing continues, upstream buffering eventually fills. Losing a modifier release leaves subsequent input incorrectly modified.
+
+   The comment claiming “nothing typed is lost” is false even for QEMU: its PS/2 implementation has a finite queue and drops input when full. [QEMU source](https://raw.githubusercontent.com/qemu/qemu/master/hw/input/ps2.c)
+
+   **Fix:** continue draining and tracking keyboard state independently of channel capacity, with a bounded queue and explicit overflow/recovery policy. Increasing the queue alone cannot guarantee losslessness under indefinite backpressure.
+
+3. **SHOULD-FIX — Ignored SGR sequences cancel deferred autowrap and overwrite text.** [term.rs:160](~/nc110-baremetal/src/term.rs:160)
+
+   Deterministic example from a cleared screen: feed 80 `A` bytes, then `ESC[0mB`. The 80th `A` sets pending wrap; the ignored SGR clears it; `B` overwrites column 80 instead of appearing at the start of the next row. Ordinary coloured output can trigger this even when displaying colours is deliberately unsupported.
+
+   **Fix:** preserve pending wrap for SGR and other operations that should not change cursor/wrap state.
+
+4. **SHOULD-FIX before hardware acceptance — Set-1 decoding depends on unverified firmware state.** [kbd.rs:61](~/nc110-baremetal/src/kbd.rs:61)
+
+   Initialization only drains data. It neither checks translation nor establishes the keyboard’s scan mode. If the NC110 delivers untranslated set 2, decoding becomes incorrect immediately—for example, set-2 `A` make code `0x1C` becomes Enter here. Linux explicitly distinguishes translated and untranslated controller configurations. [Linux i8042 source](https://raw.githubusercontent.com/torvalds/linux/master/drivers/input/serio/i8042.c)
+
+   This is a **conditional hardware risk**, not evidence that this NC110 actually boots in the wrong mode. Validate the actual GRUB-to-kernel handoff with raw make/break captures and controller state; then enforce or explicitly gate the supported configuration.
+
+The suspected memory-corruption paths did **not** hold up: row/column invariants stay within 25×80; numeric CSI parameters saturate; P/@/X clamp to remaining columns; L/M clamp to remaining rows; copy directions are correct. Excess CSI parameters do not cause array indexing beyond the eight slots with the current callers.
+
+Likewise, `write_channel` partial writes—including `Ok(0)` during backpressure/rekey—retain the unsent suffix correctly. Keyboard appends respect available capacity at the current call site.
+
+**NIT:** None worth adding. The existing proof demonstrates the happy path, but its machine has no armed TCO and it does not exercise these failure cases.
+
+**Score: 7/10.**
+tokens used
+46,293
+Most of the bounds and data movement code is sound. I found one significant termination defect and three smaller issues. Reviewed commit `7cbb8e3`, its installed dependencies, and the existing proof log; no files changed and no new QEMU run.
+
+1. **MUST-FIX — Dead sessions can spin forever while petting the watchdog.** [ssh.rs:210](~/nc110-baremetal/src/ssh.rs:210), [ssh.rs:164](~/nc110-baremetal/src/ssh.rs:164)
+
+   A TCP FIN without an SSH channel-close/disconnect leaves smoltcp in `CloseWait`. Its `is_active()` remains **true**, so this code never calls `runner.close_input()`. With `shell_open == true`, the deadline no longer applies. The loop continues petting TCO indefinitely.
+
+   A blackholed connection has the same recovery problem: neither TCP timeout nor keepalive is configured. Also, Sunset 0.6.0 sends PTY/shell requests with `want_reply: false`; their `Ok` results mean locally queued, not remotely accepted. Thus `shell_open` disables the startup deadline before shell startup is established.
+
+   **Fix:** detect drained receive-side closure using `may_recv()`, retain a startup deadline, and provide bounded peer-liveness detection plus a local escape/reset path. A healthy idle shell should remain open; merely iterating the loop must not be mistaken for a usable connection. Normal channel EOF/close termination does work.
+
+2. **SHOULD-FIX — Keyboard backpressure can lose scancodes and leave modifiers stuck.** [kbd.rs:137](~/nc110-baremetal/src/kbd.rs:137)
+
+   Once the 64-byte input queue has fewer than four free bytes, polling stops entirely—including processing Shift/Ctrl releases. If SSH stays blocked and typing continues, upstream buffering eventually fills. Losing a modifier release leaves subsequent input incorrectly modified.
+
+   The comment claiming “nothing typed is lost” is false even for QEMU: its PS/2 implementation has a finite queue and drops input when full. [QEMU source](https://raw.githubusercontent.com/qemu/qemu/master/hw/input/ps2.c)
+
+   **Fix:** continue draining and tracking keyboard state independently of channel capacity, with a bounded queue and explicit overflow/recovery policy. Increasing the queue alone cannot guarantee losslessness under indefinite backpressure.
+
+3. **SHOULD-FIX — Ignored SGR sequences cancel deferred autowrap and overwrite text.** [term.rs:160](~/nc110-baremetal/src/term.rs:160)
+
+   Deterministic example from a cleared screen: feed 80 `A` bytes, then `ESC[0mB`. The 80th `A` sets pending wrap; the ignored SGR clears it; `B` overwrites column 80 instead of appearing at the start of the next row. Ordinary coloured output can trigger this even when displaying colours is deliberately unsupported.
+
+   **Fix:** preserve pending wrap for SGR and other operations that should not change cursor/wrap state.
+
+4. **SHOULD-FIX before hardware acceptance — Set-1 decoding depends on unverified firmware state.** [kbd.rs:61](~/nc110-baremetal/src/kbd.rs:61)
+
+   Initialization only drains data. It neither checks translation nor establishes the keyboard’s scan mode. If the NC110 delivers untranslated set 2, decoding becomes incorrect immediately—for example, set-2 `A` make code `0x1C` becomes Enter here. Linux explicitly distinguishes translated and untranslated controller configurations. [Linux i8042 source](https://raw.githubusercontent.com/torvalds/linux/master/drivers/input/serio/i8042.c)
+
+   This is a **conditional hardware risk**, not evidence that this NC110 actually boots in the wrong mode. Validate the actual GRUB-to-kernel handoff with raw make/break captures and controller state; then enforce or explicitly gate the supported configuration.
+
+The suspected memory-corruption paths did **not** hold up: row/column invariants stay within 25×80; numeric CSI parameters saturate; P/@/X clamp to remaining columns; L/M clamp to remaining rows; copy directions are correct. Excess CSI parameters do not cause array indexing beyond the eight slots with the current callers.
+
+Likewise, `write_channel` partial writes—including `Ok(0)` during backpressure/rekey—retain the unsent suffix correctly. Keyboard appends respect available capacity at the current call site.
+
+**NIT:** None worth adding. The existing proof demonstrates the happy path, but its machine has no armed TCO and it does not exercise these failure cases.
+
+**Score: 7/10.**
+diff --git a/run-m3.py b/run-m3.py
+index ef177ce..f5b6b7d 100644
+--- a/run-m3.py
++++ b/run-m3.py
+@@ -2,23 +2,27 @@
+ """M3 proof: boot the kernel in QEMU, let it SSH into a throwaway sshd (127.0.0.1:2223, interactive /bin/sh via
+ ForceCommand, tools/sshd_config.m3), then TYPE into the guest's PS/2 keyboard with the monitor's `sendkey`.
+ 
+-Typed: `echo nc110-m3-okxy` + 2 Backspace, `echo $((6*7))` (shifted keys), `sleep 30` + Ctrl-C, printf with CSI D/K,
++Typed: `echo nc110-m3-okxy` + 2 Backspace, `echo $((6*7))` (shifted keys), `sleep 30` + Ctrl-C, printf with CSI D/K, 80 cols + SGR wrap,
+ `seq 1 30` (scroll), `uname -a`, `exit`.
+ Writes proof/m3-serial.log, m3-sshd.log, m3-screen.png (after uname output), m3-screen-exit.png, m3-net.pcap.
+ One QEMU (-m 256) and one sshd at a time; both are always killed on exit.
++MODE=peerkill: after the prompt, SIGKILL sshd's per-connection child (peer vanishes without an SSH close);
++               the kernel must notice the TCP close and end the session (proof/m3-peerkill-*).
++MODE=cad:      after the prompt, press Ctrl-Alt-Del; the kernel must hard-reset (QEMU exits: -no-reboot).
+ """
+ import os, socket, subprocess, sys, time
+ 
+ ROOT = os.path.dirname(os.path.abspath(__file__))
+ PROOF = os.path.join(ROOT, "proof")
+ KERNEL = os.path.join(ROOT, "target/x86_64-unknown-none/release/nc110-kernel")
+-SERIAL, SSHD_LOG, PNG0, PNG, PNG2, PCAP = (os.path.join(PROOF, "m3-" + n) for n in
++MODE = os.environ.get("MODE", "")
++SERIAL, SSHD_LOG, PNG0, PNG, PNG2, PCAP = (os.path.join(PROOF, "m3-" + (MODE + "-" if MODE else "") + n) for n in
+     ("serial.log", "sshd.log", "screen-early.png", "screen.png", "screen-exit.png", "net.pcap"))
+ MON = os.path.join(PROOF, ".monitor.sock")
+ SSHD_CFG = os.path.join(ROOT, "tools/sshd_config.m3")
+ PIDFILE = os.path.join(ROOT, "test-keys/sshd-m3.pid")
+ 
+-KEYS = {" ": "spc", "-": "minus", "\n": "ret", "\b": "backspace", "$": "shift-4", "(": "shift-9", ")": "shift-0", "*": "shift-8",
++KEYS = {" ": "spc", "-": "minus", "\n": "ret", "\b": "backspace", "$": "shift-4", "(": "shift-9", ")": "shift-0", "*": "shift-8", "%": "shift-5",
+         "'": "apostrophe", "\\": "backslash", "[": "bracket_left"}
+ 
+ 
+@@ -77,7 +81,29 @@ try:
+     steps = [
+         wait_for(lambda s: prompts(s) >= 1, "shell prompt", 60),
+     ]
+-    if all(steps):
++    if all(steps) and MODE == "peerkill":
++        time.sleep(0.5)
++        def descendants(pid):
++            out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout.split()
++            return [d for c in out for d in [int(c), *descendants(int(c))]]
++        victims = descendants(sshd.pid)  # sshd-session, its user child and the shell: all hold or feed the socket
++        subprocess.run(["ps", "-o", "pid,ppid,comm", "-p", ",".join(map(str, victims))])
++        for v in victims:
++            os.kill(v, 9)
++        print(f"  SIGKILLed {len(victims)} sshd descendants")
++        steps.append(wait_for(lambda s: ("TCP connection gone" in s or "ssh: connection closed" in s) and "DONE" in s, "kernel notices the dead peer", 30))
++        hmp(f"screendump {PNG} -f png")
++        time.sleep(0.5)
++    elif all(steps) and MODE == "cad":
++        hmp("sendkey ctrl-alt-delete")
++        steps.append(wait_for(lambda s: "Ctrl-Alt-Del -> hard reset" in s, "Ctrl-Alt-Del message", 10))
++        try:
++            q.wait(timeout=10)
++            print("  ok: QEMU exited after the reset (-no-reboot), rc", q.returncode)
++        except subprocess.TimeoutExpired:
++            steps.append(False)
++            print("  FAIL: QEMU still running after Ctrl-Alt-Del")
++    elif all(steps):
+         typ("echo nc110-m3-okxy\b\b\n")  # two Backspaces: the pty must erase "xy"
+         steps.append(wait_for(lambda s: s.count("nc110-m3-ok") >= 2 and prompts(s) >= 2, "echo output", 20))
+         typ("echo $((6*7))\n")
+@@ -92,12 +118,15 @@ try:
+         # Terminal escapes: CSI 1 D (cursor left) then CSI K (erase to EOL): screen must read "AXZ", not "ABXZ".
+         typ("printf 'AB\\033[1DX\\033[KZ\\n'\n")
+         steps.append(wait_for(lambda s: "\x1b[1DX\x1b[KZ" in s.replace("^[", "\x1b") and prompts(s) >= 5, "CSI D/K test", 20))
++        # Deferred wrap must survive an ignored SGR: 80 zeros fill the row, then ESC[0m, then B starts the next row.
++        typ("printf '%080d\\033[0mB\\n' 0\n")
++        steps.append(wait_for(lambda s: "0\x1b[0mB" in s.replace("^[", "\x1b") and prompts(s) >= 6, "SGR keeps pending wrap", 20))
+         time.sleep(0.3)
+         hmp(f"screendump {PNG0} -f png")  # before scrolling: echo / 42 / ^C / CSI lines
+         typ("seq 1 30\n")  # forces the 80x25 screen to scroll
+-        steps.append(wait_for(lambda s: "\r\n30\r\n" in s and prompts(s) >= 6, "scroll test", 20))
++        steps.append(wait_for(lambda s: "\r\n30\r\n" in s and prompts(s) >= 7, "scroll test", 20))
+         typ("uname -a\n")
+-        steps.append(wait_for(lambda s: "Darwin" in s and prompts(s) >= 7, "uname -a output", 20))
++        steps.append(wait_for(lambda s: "Darwin" in s and prompts(s) >= 8, "uname -a output", 20))
+         time.sleep(0.5)
+         hmp(f"screendump {PNG} -f png")
+         typ("exit\n")
+@@ -106,8 +135,9 @@ try:
+         hmp(f"screendump {PNG2} -f png")
+         time.sleep(0.5)
+     ok = all(steps)
+-    hmp("quit")
+-    q.wait(timeout=10)
++    if q.poll() is None:
++        hmp("quit")
++        q.wait(timeout=10)
+ finally:
+     if q.poll() is None:
+         q.kill()
+diff --git a/src/kbd.rs b/src/kbd.rs
+index f3a9296..04103ad 100644
+--- a/src/kbd.rs
++++ b/src/kbd.rs
+@@ -4,7 +4,9 @@
+ //! on the NC110 the internal keyboard sits behind the EC's i8042 emulation, which is the same 0x60/0x64
+ //! interface; its translation state is unverified until M1-on-hardware). We never reprogram the controller.
+ //! Output is what an xterm would send: Enter = CR, Backspace = DEL (0x7F), Ctrl+letter = letter & 0x1F,
+-//! arrows/Home/End/Delete as CSI sequences. US layout only.
++//! arrows/Home/End/Delete as CSI sequences. US layout only. Ctrl-Alt-Del is the local escape (poll returns true).
++//! `init` reads the controller command byte: with translation off (raw set 2) the keyboard is left disabled
++//! rather than decoded wrongly.
+ use crate::port::inb;
+ 
+ const DATA: u16 = 0x60;
+@@ -14,7 +16,10 @@ static mut SHIFT_L: bool = false;
+ static mut SHIFT_R: bool = false;
+ static mut CTRL: bool = false;
+ static mut CAPS: bool = false;
++static mut ALT: bool = false;
+ static mut E0: bool = false;
++static mut ENABLED: bool = false;
++static mut DROPPED: u32 = 0;
+ 
+ // Set 1 make codes 0x00..0x3A, US layout: (unshifted, shifted); 0 = not a character key.
+ const MAP: [(u8, u8); 0x3A] = {
+@@ -57,8 +62,7 @@ const MAP: [(u8, u8); 0x3A] = {
+     m
+ };
+ 
+-/// Drain whatever the controller has buffered (firmware leftovers) so the first key is a real one.
+-pub fn init() -> usize {
++fn drain() -> usize {
+     let mut n = 0;
+     unsafe {
+         while inb(STATUS) & 1 != 0 && n < 64 {
+@@ -69,6 +73,48 @@ pub fn init() -> usize {
+     n
+ }
+ 
++/// Drain firmware leftovers, then read the i8042 command byte (cmd 0x20) and require translation (bit 6):
++/// that is what makes the keyboard's set 2 arrive here as set 1. Returns the command byte if it was readable.
++pub fn init() -> Option<u8> {
++    drain();
++    let cfg = unsafe {
++        let mut ok = false;
++        for _ in 0..1_000_000 {
++            if inb(STATUS) & 2 == 0 {
++                ok = true;
++                break;
++            }
++        }
++        if ok {
++            crate::port::outb(STATUS, 0x20);
++            let mut v = None;
++            for _ in 0..1_000_000 {
++                let st = inb(STATUS);
++                if st & 1 != 0 {
++                    let b = inb(DATA);
++                    if st & 0x20 == 0 {
++                        v = Some(b);
++                        break;
++                    }
++                }
++            }
++            v
++        } else {
++            None
++        }
++    };
++    unsafe {
++        ENABLED = matches!(cfg, Some(c) if c & 0x40 != 0);
++        crate::kprintln!(
++            "kbd: i8042 command byte {:?} -> translation {}",
++            cfg,
++            if ENABLED { "on, decoding scancode set 1" } else { "OFF or unreadable: keyboard disabled (set 2 not supported)" }
++        );
++    }
++    drain();
++    cfg
++}
++
+ /// Translate one scancode; appends 0..4 bytes to `out` and returns how many.
+ fn translate(sc: u8, out: &mut [u8; 4]) -> usize {
+     unsafe {
+@@ -84,6 +130,7 @@ fn translate(sc: u8, out: &mut [u8; 4]) -> usize {
+             (false, 0x2A) => SHIFT_L = !brk,
+             (false, 0x36) => SHIFT_R = !brk,
+             (_, 0x1D) => CTRL = !brk, // left ctrl, or E0 1D right ctrl
++            (_, 0x38) => ALT = !brk,  // left alt, or E0 38 right alt
+             (false, 0x3A) if !brk => CAPS = !CAPS,
+             _ => {}
+         }
+@@ -135,10 +182,16 @@ fn translate(sc: u8, out: &mut [u8; 4]) -> usize {
+ }
+ 
+ /// Poll the controller and append the bytes typed so far to `buf[*len..]`. Mouse (AUX) bytes are dropped.
+-/// Stops reading scancodes once fewer than 4 bytes of room remain, so nothing typed is lost (the i8042 holds it).
+-pub fn poll(buf: &mut [u8], len: &mut usize) {
++/// Always drains the controller so modifier releases are never missed; if `buf` is full (the SSH channel is not
++/// taking input), the key's bytes are dropped and counted rather than left to overflow the controller.
++/// Returns true on Ctrl-Alt-Del.
++pub fn poll(buf: &mut [u8], len: &mut usize) -> bool {
+     unsafe {
+-        while buf.len() - *len >= 4 {
++        if !ENABLED {
++            drain();
++            return false;
++        }
++        for _ in 0..64 {
+             let st = inb(STATUS);
+             if st & 1 == 0 {
+                 break;
+@@ -147,10 +200,23 @@ pub fn poll(buf: &mut [u8], len: &mut usize) {
+             if st & 0x20 != 0 {
+                 continue; // AUX (touchpad) byte
+             }
++            if E0 && sc == 0x53 && CTRL && ALT {
++                return true;
++            }
+             let mut tmp = [0u8; 4];
+             let n = translate(sc, &mut tmp);
+-            buf[*len..*len + n].copy_from_slice(&tmp[..n]);
+-            *len += n;
++            if buf.len() - *len >= n {
++                buf[*len..*len + n].copy_from_slice(&tmp[..n]);
++                *len += n;
++            } else {
++                DROPPED = DROPPED.wrapping_add(1);
++            }
+         }
++        false
+     }
+ }
++
++/// Keys dropped because the channel was not taking input.
++pub fn dropped() -> u32 {
++    unsafe { DROPPED }
++}
+diff --git a/src/ssh.rs b/src/ssh.rs
+index 5ab3db6..cbc95b0 100644
+--- a/src/ssh.rs
++++ b/src/ssh.rs
+@@ -135,6 +135,9 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+         .get_mut::<tcp::Socket>(tcp_h)
+         .connect(iface.context(), (IpAddress::Ipv4(SERVER.0), SERVER.1), lport)
+         .expect("tcp connect");
++    // Peer liveness: keepalive every 15 s; unacknowledged data or keepalives abort the socket after 60 s.
++    sockets.get_mut::<tcp::Socket>(tcp_h).set_keep_alive(Some(smoltcp::time::Duration::from_secs(15)));
++    sockets.get_mut::<tcp::Socket>(tcp_h).set_timeout(Some(smoltcp::time::Duration::from_secs(60)));
+     kprintln!("tcp: connecting {}:{} from :{}", SERVER.0, SERVER.1, lport);
+ 
+     let signkey = SignKey::Ed25519(sunset::ed25519_dalek::SigningKey::from_bytes(&client_seed));
+@@ -158,10 +161,11 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+     let mut keys = [0u8; 64];
+     let mut nkeys = 0usize;
+     let mut last_pet = time::now_ms();
+-    // 60 s to get as far as an open shell; after that the session lasts until the remote side closes it.
++    // 60 s to get as far as the shell's first output (pty/shell requests are sent want_reply=false, so output is
++    // the first sign the shell really started); after that the session lasts until it closes or the peer dies.
+     let deadline = time::now_ms() + 60_000;
+ 
+-    'outer: while shell_open || time::now_ms() < deadline {
++    'outer: while got_output || time::now_ms() < deadline {
+         if wdt::armed() && time::now_ms() - last_pet >= 1000 {
+             wdt::pet(); // the main loop is the liveness signal: a hang anywhere in it stops the petting
+             last_pet = time::now_ms();
+@@ -207,8 +211,13 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+                 break;
+             }
+         }
+-        if !sock.is_active() && connected && !sock.can_recv() {
++        // Peer sent FIN (CloseWait) or the socket died (reset/timeout): no more input once the buffer is drained.
++        if connected && !sock.may_recv() && !sock.can_recv() {
+             runner.close_input();
++            if !sock.is_open() {
++                kprintln!("\r\nssh: TCP connection gone ({:?}), ending session", sock.state());
++                break 'outer;
++            }
+         }
+ 
+         // runner events
+@@ -368,7 +377,10 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+ 
+             // keyboard -> channel (whatever does not fit now stays queued; the i8042 holds the rest)
+             if shell_open && !finished {
+-                kbd::poll(&mut keys, &mut nkeys);
++                if kbd::poll(&mut keys, &mut nkeys) {
++                    kprintln!("\r\nkbd: Ctrl-Alt-Del -> hard reset");
++                    wdt::hard_reset();
++                }
+                 if nkeys > 0 {
+                     match runner.write_channel(c, ChanData::Normal, &keys[..nkeys]) {
+                         Ok(n) => {
+@@ -410,6 +422,7 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+         }
+     }
+     let (calls, reseeds, samples, failed) = rng::stats();
++    kprintln!("kbd: {} keys dropped while the channel was not taking input", kbd::dropped());
+     kprintln!("rng: {} requests served, {} reseeds, {} raw samples health-tested, failure latched: {}", calls, reseeds, samples, failed);
+     if got_output {
+         kprintln!("ssh: M3 reached: interactive shell over SSH, drawn on VGA, typed on PS/2");
+diff --git a/src/term.rs b/src/term.rs
+index 12a6c09..6e700a4 100644
+--- a/src/term.rs
++++ b/src/term.rs
+@@ -102,6 +102,9 @@ fn csi(t: &mut T, f: u8) {
+     if t.private {
+         return; // ?25h/l, ?2004h/l, ?1h ... : modes we do not model
+     }
++    if !matches!(f, b'A' | b'B' | b'e' | b'C' | b'a' | b'D' | b'G' | b'`' | b'd' | b'H' | b'f' | b'J' | b'K' | b'P' | b'@' | b'X' | b'L' | b'M') {
++        return; // 'm' (SGR), 'r', 'h'/'l', 'n' (DSR: no reply), ...: ignored, and they keep a pending wrap
++    }
+     let n = arg(t, 0, 1);
+     match f {
+         b'A' => t.row = t.row.saturating_sub(n),
+@@ -157,7 +160,7 @@ fn csi(t: &mut T, f: u8) {
+                 scroll_up(t.row);
+             }
+         }
+-        _ => {} // 'm' (SGR), 'r' (scroll region), 'h'/'l', 'n' (DSR: no reply), ...: ignored
++        _ => {}
+     }
+     t.wrap = false;
+ }
+
+exec
+/bin/zsh -lc "git status --short; rg --files -g AGENTS.md -g Cargo.lock -g Cargo.toml; nl -ba src/ssh.rs | sed -n '165,445p'; cat proof/m3-peerkill-serial.log proof/m3-peerkill-nofix-serial.log proof/m3-cad-serial.log" in ~/nc110-baremetal
+ succeeded in 0ms:
+?? proof/codex-review-m3-followup.txt
+Cargo.lock
+Cargo.toml
+   165	    // the first sign the shell really started); after that the session lasts until it closes or the peer dies.
+   166	    let deadline = time::now_ms() + 60_000;
+   167	
+   168	    'outer: while got_output || time::now_ms() < deadline {
+   169	        if wdt::armed() && time::now_ms() - last_pet >= 1000 {
+   170	            wdt::pet(); // the main loop is the liveness signal: a hang anywhere in it stops the petting
+   171	            last_pet = time::now_ms();
+   172	        }
+   173	        iface.poll(now(), &mut dev, &mut sockets);
+   174	        let sock = sockets.get_mut::<tcp::Socket>(tcp_h);
+   175	        if !connected {
+   176	            if sock.may_send() {
+   177	                connected = true;
+   178	                kprintln!("tcp: connected to {}:{}", SERVER.0, SERVER.1);
+   179	            } else if !sock.is_open() {
+   180	                kprintln!("tcp: connection failed");
+   181	                break;
+   182	            }
+   183	        }
+   184	
+   185	        // network -> runner
+   186	        if sock.can_recv() && runner.is_input_ready() {
+   187	            let r = sock.recv(|buf| {
+   188	                if !banner_shown {
+   189	                    for &b in buf.iter() {
+   190	                        if b == b'\n' {
+   191	                            banner_shown = true;
+   192	                            break;
+   193	                        }
+   194	                        if b != b'\r' && banner_len < banner.len() {
+   195	                            banner[banner_len] = b;
+   196	                            banner_len += 1;
+   197	                        }
+   198	                    }
+   199	                }
+   200	                match runner.input(buf) {
+   201	                    Ok(n) => (n, Ok(())),
+   202	                    Err(e) => (0, Err(e)),
+   203	                }
+   204	            });
+   205	            if banner_shown && banner_len > 0 {
+   206	                kprintln!("ssh(a): server banner: {}", core::str::from_utf8(&banner[..banner_len]).unwrap_or("?"));
+   207	                banner_len = 0;
+   208	            }
+   209	            if let Ok(Err(e)) = r {
+   210	                kprintln!("ssh: input error {:?}", e);
+   211	                break;
+   212	            }
+   213	        }
+   214	        // Peer sent FIN (CloseWait) or the socket died (reset/timeout): no more input once the buffer is drained.
+   215	        if connected && !sock.may_recv() && !sock.can_recv() {
+   216	            runner.close_input();
+   217	            if !sock.is_open() {
+   218	                kprintln!("\r\nssh: TCP connection gone ({:?}), ending session", sock.state());
+   219	                break 'outer;
+   220	            }
+   221	        }
+   222	
+   223	        // runner events
+   224	        loop {
+   225	            let mut open_session = false;
+   226	            let mut stop_all = false;
+   227	            let mut idle = false;
+   228	            {
+   229	            let ev = match runner.progress() {
+   230	                Ok(ev) => ev,
+   231	                Err(e) => {
+   232	                    kprintln!("ssh: error {:?}", e);
+   233	                    break 'outer;
+   234	                }
+   235	            };
+   236	            match ev {
+   237	                Event::Cli(CliEvent::Hostkey(h)) => {
+   238	                    let pk = match h.hostkey() {
+   239	                        Ok(PubKey::Ed25519(k)) => Some(k.key.0),
+   240	                        _ => None,
+   241	                    };
+   242	                    match pk {
+   243	                        Some(k) if ct_eq(&k, &HOST_PIN) => {
+   244	                            let f = fp_str(&k);
+   245	                            kprintln!(
+   246	                                "ssh: host key ssh-ed25519 SHA256:{} matches pin",
+   247	                                core::str::from_utf8(&f).unwrap_or("?")
+   248	                            );
+   249	                            if let Err(e) = h.accept() {
+   250	                                kprintln!("ssh: host key accept failed (exchange signature?) {:?}", e);
+   251	                                stop_all = true;
+   252	                            }
+   253	                        }
+   254	                        Some(k) => {
+   255	                            let f = fp_str(&k);
+   256	                            let p = fp_str(&HOST_PIN);
+   257	                            kprintln!(
+   258	                                "ssh: hostkey MISMATCH: got SHA256:{} pinned SHA256:{} -> rejecting",
+   259	                                core::str::from_utf8(&f).unwrap_or("?"),
+   260	                                core::str::from_utf8(&p).unwrap_or("?")
+   261	                            );
+   262	                            let _ = h.reject();
+   263	                            stop_all = true;
+   264	                        }
+   265	                        None => {
+   266	                            kprintln!("ssh: hostkey MISMATCH: not ssh-ed25519 -> rejecting");
+   267	                            let _ = h.reject();
+   268	                            stop_all = true;
+   269	                        }
+   270	                    }
+   271	                }
+   272	                Event::Cli(CliEvent::Banner(b)) => {
+   273	                    kprintln!("ssh: userauth banner: {}", b.banner().unwrap_or("?"));
+   274	                }
+   275	                Event::Cli(CliEvent::Username(u)) => {
+   276	                    if !kex_done {
+   277	                        kex_done = true;
+   278	                        kprintln!("ssh(b): key exchange done (curve25519-sha256, host sig verified, chacha20-poly1305)");
+   279	                    }
+   280	                    let _ = u.username(USER);
+   281	                }
+   282	                Event::Cli(CliEvent::Password(p)) => {
+   283	                    let _ = p.skip();
+   284	                }
+   285	                Event::Cli(CliEvent::Pubkey(p)) => {
+   286	                    if pubkey_tries == 0 {
+   287	                        pubkey_tries += 1;
+   288	                        kprintln!("ssh: offering publickey ssh-ed25519 (throwaway test key)");
+   289	                        let _ = p.pubkey(signkey.clone());
+   290	                    } else {
+   291	                        let _ = p.skip();
+   292	                    }
+   293	                }
+   294	                Event::Cli(CliEvent::AgentSign(s)) => {
+   295	                    let _ = s.skip();
+   296	                }
+   297	                Event::Cli(CliEvent::Authenticated) => {
+   298	                    kprintln!("ssh(c): publickey auth OK as {}", USER);
+   299	                    open_session = true;
+   300	                }
+   301	                Event::Cli(CliEvent::SessionOpened(mut o)) => {
+   302	                    let mut tn = heapless::String::new();
+   303	                    let _ = tn.push_str("xterm");
+   304	                    let pty = Pty { term: tn, cols: 80, rows: 25, width: 0, height: 0, modes: heapless::Vec::new() };
+   305	                    let rp = o.pty(pty);
+   306	                    let rs = o.shell();
+   307	                    kprintln!("ssh: session channel open, pty-req xterm 80x25 ({:?}), shell ({:?})", rp.is_ok(), rs.is_ok());
+   308	                    if rp.is_err() || rs.is_err() {
+   309	                        stop_all = true;
+   310	                    } else {
+   311	                        shell_open = true;
+   312	                        kbd::init();
+   313	                        console::vga_log_off();
+   314	                        term::init();
+   315	                        kprintln!("term: VGA now belongs to the remote shell; keyboard is live");
+   316	                    }
+   317	                }
+   318	                Event::Cli(CliEvent::SessionExit(x)) => {
+   319	                    kprintln!("ssh: remote exit {:?}", x);
+   320	                }
+   321	                Event::Cli(CliEvent::Defunct) => {
+   322	                    kprintln!("ssh: connection closed");
+   323	                    finished = true;
+   324	                    idle = true;
+   325	                }
+   326	                Event::Cli(CliEvent::PollAgain) | Event::Progressed => {}
+   327	                Event::None => idle = true,
+   328	                _ => {}
+   329	            }
+   330	            }
+   331	            if stop_all {
+   332	                break 'outer;
+   333	            }
+   334	            if idle && !open_session {
+   335	                break;
+   336	            }
+   337	            if open_session {
+   338	                match runner.open_client_session() {
+   339	                    Ok(c) => chan = Some(c),
+   340	                    Err(e) => {
+   341	                        kprintln!("ssh: open session failed {:?}", e);
+   342	                        break 'outer;
+   343	                    }
+   344	                }
+   345	            }
+   346	        }
+   347	
+   348	        // channel data -> VGA terminal (+ serial mirror)
+   349	        if let Some(c) = &chan {
+   350	            let mut drew = false;
+   351	            while let Some((_num, dt, _len)) = runner.read_channel_ready() {
+   352	                let mut buf = [0u8; 512];
+   353	                match runner.read_channel(c, dt, &mut buf) {
+   354	                    Ok(0) => break,
+   355	                    Ok(n) => {
+   356	                        if !got_output {
+   357	                            kprintln!("ssh(d): first shell output ({} bytes)", n);
+   358	                            got_output = true;
+   359	                        }
+   360	                        for &b in &buf[..n] {
+   361	                            term::feed(b);
+   362	                            if b == 0x1B {
+   363	                                console::serial_raw(b'^');
+   364	                                console::serial_raw(b'[');
+   365	                            } else {
+   366	                                console::serial_raw(b);
+   367	                            }
+   368	                        }
+   369	                        drew = true;
+   370	                    }
+   371	                    Err(_) => break,
+   372	                }
+   373	            }
+   374	            if drew {
+   375	                term::sync_cursor();
+   376	            }
+   377	
+   378	            // keyboard -> channel (whatever does not fit now stays queued; the i8042 holds the rest)
+   379	            if shell_open && !finished {
+   380	                if kbd::poll(&mut keys, &mut nkeys) {
+   381	                    kprintln!("\r\nkbd: Ctrl-Alt-Del -> hard reset");
+   382	                    wdt::hard_reset();
+   383	                }
+   384	                if nkeys > 0 {
+   385	                    match runner.write_channel(c, ChanData::Normal, &keys[..nkeys]) {
+   386	                        Ok(n) => {
+   387	                            keys.copy_within(n..nkeys, 0);
+   388	                            nkeys -= n;
+   389	                        }
+   390	                        Err(_) => nkeys = 0, // channel gone; the close check below ends the session
+   391	                    }
+   392	                }
+   393	            }
+   394	
+   395	            if runner.is_channel_eof(c) || runner.is_channel_closed(c) {
+   396	                if !finished {
+   397	                    finished = true;
+   398	                    kprintln!("\r\nssh: shell channel closed, disconnecting");
+   399	                    runner.close_output();
+   400	                }
+   401	            }
+   402	        }
+   403	
+   404	        // runner -> network
+   405	        let sock = sockets.get_mut::<tcp::Socket>(tcp_h);
+   406	        while sock.can_send() {
+   407	            let out = runner.output_buf();
+   408	            if out.is_empty() {
+   409	                break;
+   410	            }
+   411	            match sock.send_slice(out) {
+   412	                Ok(0) | Err(_) => break,
+   413	                Ok(n) => runner.consume_output(n),
+   414	            }
+   415	        }
+   416	        if finished {
+   417	            sock.close();
+   418	            for _ in 0..50 {
+   419	                iface.poll(now(), &mut dev, &mut sockets);
+   420	            }
+   421	            break;
+   422	        }
+   423	    }
+   424	    let (calls, reseeds, samples, failed) = rng::stats();
+   425	    kprintln!("kbd: {} keys dropped while the channel was not taking input", kbd::dropped());
+   426	    kprintln!("rng: {} requests served, {} reseeds, {} raw samples health-tested, failure latched: {}", calls, reseeds, samples, failed);
+   427	    if got_output {
+   428	        kprintln!("ssh: M3 reached: interactive shell over SSH, drawn on VGA, typed on PS/2");
+   429	    } else {
+   430	        kprintln!("ssh: stopped before (d)");
+   431	    }
+   432	}
+NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: skipped (LPC 00:1f.0 is not ICH9 8086:2918 / NM10 8086:27bc) (result=1)
+keymod: client key from module 0 at 0x59b000 (72 B), public key verified, module wiped
+cmdline: ~/nc110-baremetal/target/x86_64-unknown-none/release/nc110-kernel 
+time: TSC 999400 ticks/ms (PIT ch2 calibrated)
+nic: rtl8139 C+ (10ec:8139) at 00:03.0 io=0xc000 mac=52:54:00:4e:43:11
+rng: TSC granularity 1000 ticks, sample window 64000 ticks
+rng: jitter startup 4096 samples passed RCT(cut 301) + APT(W 512, cut 507); 65708 TSC ticks/sample
+rng: min-entropy per 8-bit sample: MCV 3.916 (max 233/4096, 196 distinct), lag-1 1.189; claimed 0.100
+rng: RDRAND present, mixed in (jitter alone already passed)
+dhcp: smoltcp lease 10.0.2.15/24 router Some(10.0.2.2)
+tcp: connecting 10.0.2.2:2223 from :53413
+tcp: connected to 10.0.2.2:2223
+ssh(a): server banner: SSH-2.0-OpenSSH_10.2
+ssh: host key ssh-ed25519 SHA256:CuNB3VjtmuYL5Eb0958nDAjO80F6deBx8lHK2kTbRJ0 matches pin
+ssh(b): key exchange done (curve25519-sha256, host sig verified, chacha20-poly1305)
+ssh: offering publickey ssh-ed25519 (throwaway test key)
+ssh(c): publickey auth OK as evnchn
+ssh: session channel open, pty-req xterm 80x25 (true), shell (true)
+kbd: i8042 command byte Some(97) -> translation on, decoding scancode set 1
+term: VGA now belongs to the remote shell; keyboard is live
+ssh(d): first shell output (7 bytes)
+nc110$ ssh: connection closed
+kbd: 0 keys dropped while the channel was not taking input
+rng: 13 requests served, 1 reseeds, 20480 raw samples health-tested, failure latched: false
+ssh: M3 reached: interactive shell over SSH, drawn on VGA, typed on PS/2
+DONE
+NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: skipped (LPC 00:1f.0 is not ICH9 8086:2918 / NM10 8086:27bc) (result=1)
+keymod: client key from module 0 at 0x59b000 (72 B), public key verified, module wiped
+cmdline: ~/nc110-baremetal/target/x86_64-unknown-none/release/nc110-kernel 
+time: TSC 1001000 ticks/ms (PIT ch2 calibrated)
+nic: rtl8139 C+ (10ec:8139) at 00:03.0 io=0xc000 mac=52:54:00:4e:43:11
+rng: TSC granularity 1000 ticks, sample window 64000 ticks
+rng: jitter startup 4096 samples passed RCT(cut 301) + APT(W 512, cut 507); 65780 TSC ticks/sample
+rng: min-entropy per 8-bit sample: MCV 3.675 (max 279/4096, 229 distinct), lag-1 0.994; claimed 0.100
+rng: RDRAND present, mixed in (jitter alone already passed)
+dhcp: smoltcp lease 10.0.2.15/24 router Some(10.0.2.2)
+tcp: connecting 10.0.2.2:2223 from :58245
+tcp: connected to 10.0.2.2:2223
+ssh(a): server banner: SSH-2.0-OpenSSH_10.2
+ssh: host key ssh-ed25519 SHA256:CuNB3VjtmuYL5Eb0958nDAjO80F6deBx8lHK2kTbRJ0 matches pin
+ssh(b): key exchange done (curve25519-sha256, host sig verified, chacha20-poly1305)
+ssh: offering publickey ssh-ed25519 (throwaway test key)
+ssh(c): publickey auth OK as evnchn
+ssh: session channel open, pty-req xterm 80x25 (true), shell (true)
+kbd: i8042 command byte Some(97) -> translation on, decoding scancode set 1
+term: VGA now belongs to the remote shell; keyboard is live
+ssh(d): first shell output (7 bytes)
+nc110$ NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: skipped (LPC 00:1f.0 is not ICH9 8086:2918 / NM10 8086:27bc) (result=1)
+keymod: client key from module 0 at 0x59b000 (72 B), public key verified, module wiped
+cmdline: ~/nc110-baremetal/target/x86_64-unknown-none/release/nc110-kernel 
+time: TSC 999900 ticks/ms (PIT ch2 calibrated)
+nic: rtl8139 C+ (10ec:8139) at 00:03.0 io=0xc000 mac=52:54:00:4e:43:11
+rng: TSC granularity 1000 ticks, sample window 64000 ticks
+rng: jitter startup 4096 samples passed RCT(cut 301) + APT(W 512, cut 507); 65705 TSC ticks/sample
+rng: min-entropy per 8-bit sample: MCV 2.993 (max 462/4096, 155 distinct), lag-1 1.112; claimed 0.100
+rng: RDRAND present, mixed in (jitter alone already passed)
+dhcp: smoltcp lease 10.0.2.15/24 router Some(10.0.2.2)
+tcp: connecting 10.0.2.2:2223 from :56079
+tcp: connected to 10.0.2.2:2223
+ssh(a): server banner: SSH-2.0-OpenSSH_10.2
+ssh: host key ssh-ed25519 SHA256:CuNB3VjtmuYL5Eb0958nDAjO80F6deBx8lHK2kTbRJ0 matches pin
+ssh(b): key exchange done (curve25519-sha256, host sig verified, chacha20-poly1305)
+ssh: offering publickey ssh-ed25519 (throwaway test key)
+ssh(c): publickey auth OK as evnchn
+ssh: session channel open, pty-req xterm 80x25 (true), shell (true)
+kbd: i8042 command byte Some(97) -> translation on, decoding scancode set 1
+term: VGA now belongs to the remote shell; keyboard is live
+ssh(d): first shell output (7 bytes)
+nc110$ 
+
+kbd: Ctrl-Alt-Del -> hard reset
+wdt: hard reset via 0xCF9
+
+exec
+/bin/zsh -lc "rg --files ~/.cargo/registry/src | rg '/(smoltcp-0.12.0/src/socket/tcp.rs|sunset-0.6.0/src/.*rs)"'$'"'" in ~/nc110-baremetal
+ succeeded in 0ms:
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/sunsetlog.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/ident.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/traffic.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/cliauth.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/sign.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/conn.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/ssh_chapoly.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/packets.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/servauth.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/event.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/server.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/encrypt.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/auth.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/sshwire.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/lib.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/config.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/sshnames.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/error.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/client.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/channel.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/termmodes.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/test.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/random.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/kex.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/namelist.rs
+
+exec
+/bin/zsh -lc "rg --files | rg '(tcp.rs|AGENTS)'; rg -n 'smoltcp|version' Cargo.toml; rg --files ~/.cargo/registry/src | rg 'smoltcp-.*/src/socket/tcp.rs"'$'"'; rg -n 'close_input|input_closed|Defunct' ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/{runner,conn,traffic}.rs; git rev-parse HEAD; nl -ba src/kbd.rs | sed -n '62,230p'" in ~/nc110-baremetal
+ succeeded in 57ms:
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smoltcp-0.14.0/src/socket/tcp.rs
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs:374:                return Ok(Event::Cli(CliEvent::Defunct));
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs:376:                return Ok(Event::Serv(ServEvent::Defunct));
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs:451:    pub fn close_input(&mut self) {
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs:452:        trace!("close_input");
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs:501:        trace!("close_input");
+b13657877bd6105dff9ddb31697edc326c00a023
+    62	    m
+    63	};
+    64	
+    65	fn drain() -> usize {
+    66	    let mut n = 0;
+    67	    unsafe {
+    68	        while inb(STATUS) & 1 != 0 && n < 64 {
+    69	            let _ = inb(DATA);
+    70	            n += 1;
+    71	        }
+    72	    }
+    73	    n
+    74	}
+    75	
+    76	/// Drain firmware leftovers, then read the i8042 command byte (cmd 0x20) and require translation (bit 6):
+    77	/// that is what makes the keyboard's set 2 arrive here as set 1. Returns the command byte if it was readable.
+    78	pub fn init() -> Option<u8> {
+    79	    drain();
+    80	    let cfg = unsafe {
+    81	        let mut ok = false;
+    82	        for _ in 0..1_000_000 {
+    83	            if inb(STATUS) & 2 == 0 {
+    84	                ok = true;
+    85	                break;
+    86	            }
+    87	        }
+    88	        if ok {
+    89	            crate::port::outb(STATUS, 0x20);
+    90	            let mut v = None;
+    91	            for _ in 0..1_000_000 {
+    92	                let st = inb(STATUS);
+    93	                if st & 1 != 0 {
+    94	                    let b = inb(DATA);
+    95	                    if st & 0x20 == 0 {
+    96	                        v = Some(b);
+    97	                        break;
+    98	                    }
+    99	                }
+   100	            }
+   101	            v
+   102	        } else {
+   103	            None
+   104	        }
+   105	    };
+   106	    unsafe {
+   107	        ENABLED = matches!(cfg, Some(c) if c & 0x40 != 0);
+   108	        crate::kprintln!(
+   109	            "kbd: i8042 command byte {:?} -> translation {}",
+   110	            cfg,
+   111	            if ENABLED { "on, decoding scancode set 1" } else { "OFF or unreadable: keyboard disabled (set 2 not supported)" }
+   112	        );
+   113	    }
+   114	    drain();
+   115	    cfg
+   116	}
+   117	
+   118	/// Translate one scancode; appends 0..4 bytes to `out` and returns how many.
+   119	fn translate(sc: u8, out: &mut [u8; 4]) -> usize {
+   120	    unsafe {
+   121	        if sc == 0xE0 {
+   122	            E0 = true;
+   123	            return 0;
+   124	        }
+   125	        let ext = E0;
+   126	        E0 = false;
+   127	        let brk = sc & 0x80 != 0;
+   128	        let code = sc & 0x7F;
+   129	        match (ext, code) {
+   130	            (false, 0x2A) => SHIFT_L = !brk,
+   131	            (false, 0x36) => SHIFT_R = !brk,
+   132	            (_, 0x1D) => CTRL = !brk, // left ctrl, or E0 1D right ctrl
+   133	            (_, 0x38) => ALT = !brk,  // left alt, or E0 38 right alt
+   134	            (false, 0x3A) if !brk => CAPS = !CAPS,
+   135	            _ => {}
+   136	        }
+   137	        if brk {
+   138	            return 0;
+   139	        }
+   140	        if ext {
+   141	            let seq: &[u8] = match code {
+   142	                0x48 => b"\x1b[A",
+   143	                0x50 => b"\x1b[B",
+   144	                0x4D => b"\x1b[C",
+   145	                0x4B => b"\x1b[D",
+   146	                0x47 => b"\x1b[H",
+   147	                0x4F => b"\x1b[F",
+   148	                0x53 => b"\x1b[3~",
+   149	                0x1C => b"\r", // keypad Enter
+   150	                0x35 => b"/",  // keypad /
+   151	                _ => b"",
+   152	            };
+   153	            out[..seq.len()].copy_from_slice(seq);
+   154	            return seq.len();
+   155	        }
+   156	        if (code as usize) >= MAP.len() {
+   157	            return 0;
+   158	        }
+   159	        let (lo, hi) = MAP[code as usize];
+   160	        if lo == 0 {
+   161	            return 0;
+   162	        }
+   163	        let shift = SHIFT_L || SHIFT_R;
+   164	        let mut c = if shift { hi } else { lo };
+   165	        if CAPS && lo.is_ascii_lowercase() {
+   166	            c = if shift { lo } else { hi };
+   167	        }
+   168	        if CTRL {
+   169	            c = match c {
+   170	                b'a'..=b'z' | b'A'..=b'Z' => c & 0x1F,
+   171	                b'@' | b' ' | b'2' => 0x00,
+   172	                b'[' => 0x1B,
+   173	                b'\\' => 0x1C,
+   174	                b']' => 0x1D,
+   175	                b'_' | b'-' => 0x1F,
+   176	                _ => c,
+   177	            };
+   178	        }
+   179	        out[0] = c;
+   180	        1
+   181	    }
+   182	}
+   183	
+   184	/// Poll the controller and append the bytes typed so far to `buf[*len..]`. Mouse (AUX) bytes are dropped.
+   185	/// Always drains the controller so modifier releases are never missed; if `buf` is full (the SSH channel is not
+   186	/// taking input), the key's bytes are dropped and counted rather than left to overflow the controller.
+   187	/// Returns true on Ctrl-Alt-Del.
+   188	pub fn poll(buf: &mut [u8], len: &mut usize) -> bool {
+   189	    unsafe {
+   190	        if !ENABLED {
+   191	            drain();
+   192	            return false;
+   193	        }
+   194	        for _ in 0..64 {
+   195	            let st = inb(STATUS);
+   196	            if st & 1 == 0 {
+   197	                break;
+   198	            }
+   199	            let sc = inb(DATA);
+   200	            if st & 0x20 != 0 {
+   201	                continue; // AUX (touchpad) byte
+   202	            }
+   203	            if E0 && sc == 0x53 && CTRL && ALT {
+   204	                return true;
+   205	            }
+   206	            let mut tmp = [0u8; 4];
+   207	            let n = translate(sc, &mut tmp);
+   208	            if buf.len() - *len >= n {
+   209	                buf[*len..*len + n].copy_from_slice(&tmp[..n]);
+   210	                *len += n;
+   211	            } else {
+   212	                DROPPED = DROPPED.wrapping_add(1);
+   213	            }
+   214	        }
+   215	        false
+   216	    }
+   217	}
+   218	
+   219	/// Keys dropped because the channel was not taking input.
+   220	pub fn dropped() -> u32 {
+   221	    unsafe { DROPPED }
+   222	}
+
+exec
+/bin/zsh -lc "rg -n 'keep_alive|timeout|remote_last_ts|fn may_recv' ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smoltcp-0.14.0/src/socket/tcp.rs | head -75; sed -n '355,395p;440,465p' ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs; nl -ba src/term.rs | sed -n '165,265p'" in ~/nc110-baremetal
+ succeeded in 0ms:
+193:    fn retransmission_timeout(&self) -> Duration {
+285:        keep_alive_at: Option<Instant>,
+306:            keep_alive_at: None,
+310:    fn should_keep_alive(&self, timestamp: Instant) -> bool {
+313:                keep_alive_at: Some(keep_alive_at),
+314:            } if timestamp >= keep_alive_at => true,
+344:                keep_alive_at: Some(keep_alive_at),
+345:            } => PollAt::Time(keep_alive_at),
+347:                keep_alive_at: None,
+358:            keep_alive_at: interval.map(|interval| timestamp + interval),
+362:    fn set_keep_alive(&mut self) {
+363:        if let Timer::Idle { keep_alive_at } = self
+364:            && keep_alive_at.is_none()
+366:            *keep_alive_at = Some(Instant::from_millis(0))
+370:    fn rewind_keep_alive(&mut self, timestamp: Instant, interval: Option<Duration>) {
+371:        if let Timer::Idle { keep_alive_at } = self {
+372:            *keep_alive_at = interval.map(|interval| timestamp + interval)
+479:    timeout: Option<Duration>,
+481:    keep_alive: Option<Duration>,
+516:    remote_last_ts: Option<Instant>,
+597:            timeout: None,
+598:            keep_alive: None,
+612:            remote_last_ts: None,
+729:    /// Return the timeout duration.
+731:    /// See also the [set_timeout](#method.set_timeout) method.
+732:    pub fn timeout(&self) -> Option<Duration> {
+733:        self.timeout
+787:    /// Set the timeout duration.
+789:    /// A socket with a timeout duration set will abort the connection if either of the following
+796:    ///   * After enabling [keep-alive](#method.set_keep_alive), the remote endpoint exceeds
+798:    pub fn set_timeout(&mut self, duration: Option<Duration>) {
+799:        self.timeout = duration
+827:    /// See also the [set_keep_alive](#method.set_keep_alive) method.
+828:    pub fn keep_alive(&self) -> Option<Duration> {
+829:        self.keep_alive
+842:    /// The keep-alive functionality together with the timeout functionality allows to react
+844:    pub fn set_keep_alive(&mut self, interval: Option<Duration>) {
+845:        self.keep_alive = interval;
+846:        if self.keep_alive.is_some() {
+849:            self.timer.set_keep_alive();
+926:        self.remote_last_ts = None;
+1197:    pub fn may_recv(&self) -> bool {
+1249:            // The connection might have been idle for a long time, and so remote_last_ts
+1253:                self.remote_last_ts = None
+1259:                let delay = self.rtte.retransmission_timeout();
+1795:                    // If we're in the TIME-WAIT state, restart the TIME-WAIT timeout, since
+1933:                self.timer.set_for_idle(cx.now(), self.keep_alive);
+2060:        self.remote_last_ts = Some(cx.now());
+2178:                    self.timer.set_for_idle(cx.now(), self.keep_alive);
+2181:                    let rto = self.rtte.retransmission_timeout();
+2187:                self.timer.set_for_idle(cx.now(), self.keep_alive);
+2197:            let delay = self.rtte.retransmission_timeout();
+2203:            self.timer.set_for_idle(cx.now(), self.keep_alive);
+2293:        match (self.remote_last_ts, self.timeout) {
+2294:            (Some(remote_last_ts), Some(timeout)) => timestamp >= remote_last_ts + timeout,
+2454:        if self.remote_last_ts.is_none() {
+2460:            // So, we start counting the timeout not from the last received packet
+2462:            self.remote_last_ts = Some(cx.now());
+2471:            // If a timeout expires, we should abort the connection.
+2472:            net_debug!("timeout exceeded");
+2509:            self.timer.set_for_idle(cx.now(), self.keep_alive);
+2533:        } else if self.timer.should_keep_alive(cx.now()) {
+2745:        let is_keep_alive;
+2746:        if self.timer.should_keep_alive(cx.now()) && repr.is_empty() {
+2749:            is_keep_alive = true;
+2751:            is_keep_alive = false;
+2755:        if is_keep_alive {
+2795:        self.timer.rewind_keep_alive(cx.now(), self.keep_alive);
+2817:        if is_keep_alive {
+2842:            let rto = self.rtte.retransmission_timeout();
+2865:        } else if self.remote_last_ts.is_none() {
+2887:            let timeout_poll_at = match (self.remote_last_ts, self.timeout) {
+2889:                // when the timeout would expire.
+2890:                (Some(remote_last_ts), Some(timeout)) => PollAt::Time(remote_last_ts + timeout),
+2891:                // Otherwise we have no timeout.
+                DispatchEvent::CliEvent(_) | DispatchEvent::ServEvent(_) => {
+                    // will return as an event
+                }
+                DispatchEvent::None => {
+                    // packets have been completed
+                    self.traf_in.done_payload()
+                }
+                DispatchEvent::KexDone => {
+                    // Wake any channels that were paused during KEX
+                    self.channel_wake_write();
+                    self.traf_in.done_payload();
+                    disp.event = DispatchEvent::None;
+                }
+                // TODO, may get used later?
+                DispatchEvent::Progressed => return Error::bug(),
+            }
+        } else if self.closed_input {
+            // all incoming packets have been consumed, and we're closed for input,
+            if CS::is_client() {
+                return Ok(Event::Cli(CliEvent::Defunct));
+            } else {
+                return Ok(Event::Serv(ServEvent::Defunct));
+            }
+        }
+
+        // If there isn't any pending event for the application, run conn.progress()
+        // (which may return other events).
+        if disp.event.is_none() {
+            let mut s = self.traf_out.sender(&mut self.keys);
+            disp = self.conn.progress(&mut s)?;
+            trace!("prog disp {disp:?}");
+            match disp.event {
+                DispatchEvent::CliEvent(_)
+                | DispatchEvent::ServEvent(_)
+                | DispatchEvent::None
+                | DispatchEvent::Progressed => (),
+                // Don't expect data from conn.progress()
+                DispatchEvent::Data(_) | DispatchEvent::KexDone => {
+                    return Error::bug();
+                }
+            }
+        }
+
+        self.conn.initial_sent() && self.traf_in.is_input_ready()
+    }
+
+    /// Set a waker to be notified when [`input()`](Self::input) is ready to be called.
+    pub fn set_input_waker(&mut self, waker: &Waker) {
+        set_waker(&mut self.input_waker, waker)
+    }
+
+    /// Indicate that the input SSH tcp socket has closed
+    pub fn close_input(&mut self) {
+        trace!("close_input");
+        self.closed_input = true;
+    }
+
+    /// Write any pending output to the wire, returning the size written
+    pub fn output(&mut self, buf: &mut [u8]) -> usize {
+        let out = self.output_buf();
+        let l = out.len().min(buf.len());
+        buf.copy_from_slice(&out[..l]);
+        self.consume_output(l);
+        l
+    }
+
+    /// Returns a buffer of output to send over the wire.
+   165	    t.wrap = false;
+   166	}
+   167	
+   168	/// Feed one byte of the remote's output.
+   169	pub fn feed(b: u8) {
+   170	    let t = unsafe { &mut *core::ptr::addr_of_mut!(T) };
+   171	    match t.st {
+   172	        St::Ground => match b {
+   173	            0x1B => t.st = St::Esc,
+   174	            b'\r' => {
+   175	                t.col = 0;
+   176	                t.wrap = false;
+   177	            }
+   178	            b'\n' | 0x0B | 0x0C => {
+   179	                lf(t);
+   180	                t.wrap = false;
+   181	            }
+   182	            0x08 => {
+   183	                t.col = t.col.saturating_sub(1);
+   184	                t.wrap = false;
+   185	            }
+   186	            b'\t' => t.col = ((t.col + 8) & !7).min(W - 1),
+   187	            0x80..=0xBF => {} // UTF-8 continuation byte
+   188	            _ if b < 0x20 || b == 0x7F => {} // BEL and other controls
+   189	            _ => {
+   190	                if t.wrap {
+   191	                    t.col = 0;
+   192	                    lf(t);
+   193	                    t.wrap = false;
+   194	                }
+   195	                let ch = if b >= 0x80 { b'?' } else { b };
+   196	                put(t.row, t.col, ATTR | ch as u16);
+   197	                if t.col == W - 1 {
+   198	                    t.wrap = true;
+   199	                } else {
+   200	                    t.col += 1;
+   201	                }
+   202	            }
+   203	        },
+   204	        St::Esc => {
+   205	            t.st = St::Ground;
+   206	            match b {
+   207	                b'[' => {
+   208	                    t.st = St::Csi;
+   209	                    t.p = [0; 8];
+   210	                    t.np = 0;
+   211	                    t.private = false;
+   212	                }
+   213	                b']' => t.st = St::Osc,
+   214	                b'(' | b')' | b'*' | b'+' | b'#' | b'%' => t.st = St::EscSkip,
+   215	                b'7' => t.saved = (t.row, t.col),
+   216	                b'8' => (t.row, t.col) = t.saved,
+   217	                b'D' => lf(t),
+   218	                b'E' => {
+   219	                    t.col = 0;
+   220	                    lf(t);
+   221	                }
+   222	                b'M' => {
+   223	                    if t.row == 0 {
+   224	                        scroll_down(0);
+   225	                    } else {
+   226	                        t.row -= 1;
+   227	                    }
+   228	                }
+   229	                b'c' => init(),
+   230	                _ => {} // '=', '>', ...
+   231	            }
+   232	        }
+   233	        St::EscSkip => t.st = St::Ground,
+   234	        St::Csi => match b {
+   235	            b'0'..=b'9' => {
+   236	                if t.np == 0 {
+   237	                    t.np = 1;
+   238	                }
+   239	                let i = t.np - 1;
+   240	                if i < t.p.len() {
+   241	                    t.p[i] = t.p[i].saturating_mul(10).saturating_add((b - b'0') as u16);
+   242	                }
+   243	            }
+   244	            b';' => {
+   245	                if t.np == 0 {
+   246	                    t.np = 1;
+   247	                }
+   248	                t.np += 1;
+   249	            }
+   250	            b'?' | b'>' | b'<' | b'=' => t.private = true,
+   251	            0x20..=0x2F => {} // intermediates
+   252	            0x40..=0x7E => {
+   253	                t.st = St::Ground;
+   254	                csi(t, b);
+   255	            }
+   256	            0x1B => t.st = St::Esc,
+   257	            _ => {} // controls inside CSI: ignored
+   258	        },
+   259	        St::Osc => match b {
+   260	            0x07 => t.st = St::Ground,
+   261	            0x1B => t.st = St::OscEsc,
+   262	            _ => {}
+   263	        },
+   264	        St::OscEsc => t.st = if b == b'\\' { St::Ground } else { St::Osc },
+   265	    }
+
+codex
+The TCP close fix matches Sunset’s EOF handling, and the fixed/reverted logs support the original hang diagnosis. The backpressure and SGR changes also address their reported defects. I’m checking the command-byte read for races with keyboard input and confirming the pinned smoltcp version’s timeout behavior.
+exec
+/bin/zsh -lc "sed -n '787,800p;832,850p;1190,1215p;2280,2310p;2445,2485p' ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smoltcp-0.14.0/src/socket/tcp.rs; sed -n '300,355p' ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs; rg -n 'hard_reset|DONE' src/{main,wdt}.rs; nl -ba run-m3.py | sed -n '118,133p'" in ~/nc110-baremetal
+ succeeded in 0ms:
+    /// Set the timeout duration.
+    ///
+    /// A socket with a timeout duration set will abort the connection if either of the following
+    /// occurs:
+    ///
+    ///   * After a [connect](#method.connect) call, the remote endpoint does not respond within
+    ///     the specified duration;
+    ///   * After establishing a connection, there is data in the transmit buffer and the remote
+    ///     endpoint exceeds the specified duration between any two packets it sends;
+    ///   * After enabling [keep-alive](#method.set_keep_alive), the remote endpoint exceeds
+    ///     the specified duration between any two packets it sends.
+    pub fn set_timeout(&mut self, duration: Option<Duration>) {
+        self.timeout = duration
+    }
+    /// Set the keep-alive interval.
+    ///
+    /// An idle socket with a keep-alive interval set will transmit a "keep-alive ACK" packet
+    /// every time it receives no communication during that interval. As a result, three things
+    /// may happen:
+    ///
+    ///   * The remote endpoint is fine and answers with an ACK packet.
+    ///   * The remote endpoint has rebooted and answers with an RST packet.
+    ///   * The remote endpoint has crashed and does not answer.
+    ///
+    /// The keep-alive functionality together with the timeout functionality allows to react
+    /// to these error conditions.
+    pub fn set_keep_alive(&mut self, interval: Option<Duration>) {
+        self.keep_alive = interval;
+        if self.keep_alive.is_some() {
+            // If the connection is idle and we've just set the option, it would not take effect
+            // until the next packet, unless we wind up the timer explicitly.
+            self.timer.set_keep_alive();
+        }
+    /// This function returns true if it's possible to receive data from the remote endpoint.
+    /// It will return true while there is data in the receive buffer, and if there isn't,
+    /// as long as the remote endpoint has not closed the connection.
+    ///
+    /// In terms of the TCP state machine, the socket must be in the `ESTABLISHED`,
+    /// `FIN-WAIT-1`, or `FIN-WAIT-2` state, or have data in the receive buffer instead.
+    #[inline]
+    pub fn may_recv(&self) -> bool {
+        match self.state {
+            State::Established => true,
+            // In FIN-WAIT-1/2, we have closed our transmit half of the connection but
+            // we still can receive indefinitely.
+            State::FinWait1 | State::FinWait2 => true,
+            // If we have something in the receive buffer, we can receive that.
+            _ if self.can_recv() => true,
+            _ => false,
+        }
+    }
+
+    /// Check whether the transmit half of the full-duplex connection is open
+    /// (see [may_send](#method.may_send)), and the transmit buffer is not full.
+    #[inline]
+    pub fn can_send(&self) -> bool {
+        if !self.may_send() {
+            return false;
+        }
+        //  2) a segment arrives that fills in all or part of a gap in sequence space.
+        if !self.assembler.is_empty() || !assembler_was_empty {
+            // Note that we change the transmitter state here.
+            // This is fine because smoltcp assumes that it can always transmit zero or one
+            // packets for every packet it receives.
+            tcp_trace!("ACKing incoming segment");
+            Some(self.ack_reply(ip_repr, repr))
+        } else {
+            None
+        }
+    }
+
+    fn timed_out(&self, timestamp: Instant) -> bool {
+        match (self.remote_last_ts, self.timeout) {
+            (Some(remote_last_ts), Some(timeout)) => timestamp >= remote_last_ts + timeout,
+            (_, _) => false,
+        }
+    }
+
+    fn seq_to_transmit(&self, cx: &mut Context) -> bool {
+        // Fast retransmits should always send, even if later congestion checks would disallow
+        if self.pending_fast_retransmit && !self.tx_buffer.is_empty() {
+            return true;
+        }
+
+        let ip_header_len = match self.tuple.unwrap().local.addr {
+            #[cfg(feature = "proto-ipv4")]
+            IpAddress::Ipv4(_) => crate::wire::IPV4_HEADER_LEN,
+            #[cfg(feature = "proto-ipv6")]
+            IpAddress::Ipv6(_) => crate::wire::IPV6_HEADER_LEN,
+        };
+        // If not (e.g. the interface's IP changed), reset the socket.
+        // We use reset() instead of set_state(Closed) to avoid sending
+        // an RST packet with the now-invalid source IP.
+        if !cx.has_ip_addr(tuple.local.addr) {
+            net_debug!("source IP address no longer available, closing socket");
+            self.reset();
+            return Ok(());
+        }
+
+        if self.remote_last_ts.is_none() {
+            // We get here in exactly two cases:
+            //  1) This socket just transitioned into SYN-SENT.
+            //  2) This socket had an empty transmit buffer and some data was added there.
+            // Both are similar in that the socket has been quiet for an indefinite
+            // period of time, it isn't anymore, and the local endpoint is talking.
+            // So, we start counting the timeout not from the last received packet
+            // but from the first transmitted one.
+            self.remote_last_ts = Some(cx.now());
+        }
+
+        self.congestion_controller
+            .inner_mut()
+            .pre_transmit(cx.now());
+
+        // Check if any state needs to be changed because of a timer.
+        if self.timed_out(cx.now()) {
+            // If a timeout expires, we should abort the connection.
+            net_debug!("timeout exceeded");
+            self.set_state(State::Closed);
+        } else if self.timer.should_retransmit(cx.now()) {
+            if let Timer::Retransmit { .. } = self.timer {
+                // If a retransmit timer expired, we should resend data starting at the last ACK.
+                net_debug!("retransmitting after rto");
+
+                // Inform the congestion controller that we're retransmitting and should enter the slow start state
+                let in_flight = self.flight_size();
+                self.congestion_controller
+                    .inner_mut()
+                    .on_rto(cx.now(), in_flight);
+
+                // Rewind "last sequence number sent", as if we never
+    /// Drives connection progress, handling received payload and queueing
+    /// packets to send as required.
+    pub fn progress(&mut self) -> Result<Event<'_, 'a>> {
+        // Any previous Event must have been dropped to be able to call progress()
+        // again, since it borrows from Runner. We can check if it was dropped
+        // without a required response, or complete the payload handling otherwise.
+        let prev = self.resume_event.take();
+        if prev.needs_resume() {
+            // Events that need a response would have cleared runner.resume_event in their
+            // resume handler.
+            debug!("No response provided to {:?} event", prev);
+            return error::BadUsage.fail();
+        }
+
+        // Another event may be pending from the same payload, emit it.
+        let ex = self.extra_resume_event.take();
+        if ex.is_some() {
+            self.resume_event = ex.clone();
+            return CS::dispatch_into_event(self, ex);
+        }
+
+        // Previous event payload is complete
+        if prev.is_event() {
+            self.traf_in.done_payload();
+        }
+
+        // Try moving packets from the deferred queue to the
+        // normal output. Can't happen during kex since non-kex
+        // packets are disallowed.
+        // KEX packets aren't included in the deferred list.
+        if !self.conn.is_kex_sending() {
+            match self.traf_out.send_deferred_packets(&mut self.keys) {
+                Ok(()) => (),
+                Err(Error::NoRoom { .. }) => {
+                    // try again once there's space
+                    return Ok(Event::None);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let mut disp = Dispatched::default();
+
+        // Handle incoming packets
+        if let Some((payload, seq)) = self.traf_in.payload() {
+            let mut s = self.traf_out.sender(&mut self.keys);
+            disp = self.conn.handle_payload(payload, seq, &mut s)?;
+
+            match disp.event {
+                DispatchEvent::Data(data_in) => {
+                    // incoming channel data, we haven't finished with payload
+                    let (num, dt) = self.traf_in.set_read_channel_data(data_in)?;
+                    self.channel_wake_read(num, dt);
+                    disp.event = DispatchEvent::None
+                }
+                DispatchEvent::CliEvent(_) | DispatchEvent::ServEvent(_) => {
+src/wdt.rs:124:pub fn hard_reset() -> ! {
+src/main.rs:48:        wdt::hard_reset();
+src/main.rs:70:    kprintln!("DONE");
+   118	        # Terminal escapes: CSI 1 D (cursor left) then CSI K (erase to EOL): screen must read "AXZ", not "ABXZ".
+   119	        typ("printf 'AB\\033[1DX\\033[KZ\\n'\n")
+   120	        steps.append(wait_for(lambda s: "\x1b[1DX\x1b[KZ" in s.replace("^[", "\x1b") and prompts(s) >= 5, "CSI D/K test", 20))
+   121	        # Deferred wrap must survive an ignored SGR: 80 zeros fill the row, then ESC[0m, then B starts the next row.
+   122	        typ("printf '%080d\\033[0mB\\n' 0\n")
+   123	        steps.append(wait_for(lambda s: "0\x1b[0mB" in s.replace("^[", "\x1b") and prompts(s) >= 6, "SGR keeps pending wrap", 20))
+   124	        time.sleep(0.3)
+   125	        hmp(f"screendump {PNG0} -f png")  # before scrolling: echo / 42 / ^C / CSI lines
+   126	        typ("seq 1 30\n")  # forces the 80x25 screen to scroll
+   127	        steps.append(wait_for(lambda s: "\r\n30\r\n" in s and prompts(s) >= 7, "scroll test", 20))
+   128	        typ("uname -a\n")
+   129	        steps.append(wait_for(lambda s: "Darwin" in s and prompts(s) >= 8, "uname -a output", 20))
+   130	        time.sleep(0.5)
+   131	        hmp(f"screendump {PNG} -f png")
+   132	        typ("exit\n")
+   133	        steps.append(wait_for(lambda s: "DONE" in s, "session closed, DONE", 20))
+
+web search: 
+web search: https://raw.githubusercontent.com/torvalds/linux/master/drivers/input/serio/i8042.c
+codex
+The fixes resolve the original TCP hang, keyboard backpressure defect, and SGR wrap bug. The hardware translation check is an improvement, but its new command-byte read has a race. **No remaining MUST-FIX found for the demonstrated QEMU workflow.**
+
+Reviewed `b136578`, the pinned dependency implementations, and the supplied logs. No files edited; no new QEMU run.
+
+| Original finding | Verdict |
+|---|---|
+| Dead sessions spin while petting watchdog | **Resolved for the reported failure modes.** Drained FIN now calls `close_input()`, which lets Sunset produce `Defunct`. Reset/timeout exits through the closed-socket branch. The fixed peer-kill log reaches `connection closed` and `DONE`; the reverted log stops at the prompt. |
+| Keyboard backpressure loses modifier releases | **Resolved.** Polling continues with a full application queue, translates modifier releases, and drops/counts whole key sequences that cannot fit. Partial SSH writes still preserve the unsent suffix. |
+| SGR cancels deferred wrap | **Resolved.** Ignored CSI commands return before clearing `wrap`; `80 × A`, `ESC[0m`, `B` now wraps correctly by inspection. |
+| Unverified set-1 assumption | **Partially resolved.** Translation-off/unreadable configurations are explicitly gated, but the read can misidentify a keystroke as controller configuration. Actual NC110 scan-mode validation remains outstanding. |
+
+**SHOULD-FIX — Command-byte read races with incoming keystrokes.** [kbd.rs:78](~/nc110-baremetal/src/kbd.rs:78)
+
+After the initial drain, keyboard input remains enabled. A scancode arriving before the command response can become the first non-AUX byte consumed as `cfg`. For example, `A` make (`0x1E`) would falsely disable an otherwise supported keyboard; a byte with bit 6 set could falsely pass the gate. The final drain can then discard the actual response. False disabling also removes Ctrl-Alt-Del recovery.
+
+Quiesce keyboard delivery around the controller transaction, drain pending input, read the response with bounded waits, then restore the interface. This is a timing-dependent regression, not something demonstrated by the supplied logs.
+
+**There is no unbounded initialization loop:** both waits and both drains have finite iteration limits. Their elapsed time is hardware-dependent.
+
+**SHOULD-FIX — Track left/right modifiers separately for reliable Ctrl-Alt-Del.** [kbd.rs:132](~/nc110-baremetal/src/kbd.rs:132)
+
+Both Ctrl keys share one boolean, as do both Alt keys. Press left Ctrl, press right Ctrl, release right Ctrl, then press Alt+Delete: left Ctrl remains physically held, but `CTRL` is false and reset does not trigger. The Ctrl bookkeeping predates this patch; the new emergency-reset feature inherits it, and Alt adds the same problem.
+
+Ordinary Ctrl-Alt-Del detection is correct: it requires extended Delete **make**, checks before queue-capacity handling, and therefore works under application backpressure. The CAD log confirms reaching the hard-reset routine; the serial log alone cannot prove QEMU exited.
+
+**NIT — The SGR proof assertion does not test rendering.** [run-m3.py:123](~/nc110-baremetal/run-m3.py:123)
+
+It checks mirrored output bytes, which would also pass with the old wrap bug. Assert VGA cell contents or inspect the captured screenshot to establish the visual result.
+
+The keepalive/timeout configuration matches smoltcp 0.14.0: a responsive idle peer survives, while a silent peer times out after roughly 60 seconds without received traffic. This establishes TCP liveness, not SSH-process responsiveness. The startup deadline now remains active until channel output arrives. Blackhole recovery is supported by code inspection but is not exercised by these logs.
+
+**Score: 8/10.**
+tokens used
+38,870
+The fixes resolve the original TCP hang, keyboard backpressure defect, and SGR wrap bug. The hardware translation check is an improvement, but its new command-byte read has a race. **No remaining MUST-FIX found for the demonstrated QEMU workflow.**
+
+Reviewed `b136578`, the pinned dependency implementations, and the supplied logs. No files edited; no new QEMU run.
+
+| Original finding | Verdict |
+|---|---|
+| Dead sessions spin while petting watchdog | **Resolved for the reported failure modes.** Drained FIN now calls `close_input()`, which lets Sunset produce `Defunct`. Reset/timeout exits through the closed-socket branch. The fixed peer-kill log reaches `connection closed` and `DONE`; the reverted log stops at the prompt. |
+| Keyboard backpressure loses modifier releases | **Resolved.** Polling continues with a full application queue, translates modifier releases, and drops/counts whole key sequences that cannot fit. Partial SSH writes still preserve the unsent suffix. |
+| SGR cancels deferred wrap | **Resolved.** Ignored CSI commands return before clearing `wrap`; `80 × A`, `ESC[0m`, `B` now wraps correctly by inspection. |
+| Unverified set-1 assumption | **Partially resolved.** Translation-off/unreadable configurations are explicitly gated, but the read can misidentify a keystroke as controller configuration. Actual NC110 scan-mode validation remains outstanding. |
+
+**SHOULD-FIX — Command-byte read races with incoming keystrokes.** [kbd.rs:78](~/nc110-baremetal/src/kbd.rs:78)
+
+After the initial drain, keyboard input remains enabled. A scancode arriving before the command response can become the first non-AUX byte consumed as `cfg`. For example, `A` make (`0x1E`) would falsely disable an otherwise supported keyboard; a byte with bit 6 set could falsely pass the gate. The final drain can then discard the actual response. False disabling also removes Ctrl-Alt-Del recovery.
+
+Quiesce keyboard delivery around the controller transaction, drain pending input, read the response with bounded waits, then restore the interface. This is a timing-dependent regression, not something demonstrated by the supplied logs.
+
+**There is no unbounded initialization loop:** both waits and both drains have finite iteration limits. Their elapsed time is hardware-dependent.
+
+**SHOULD-FIX — Track left/right modifiers separately for reliable Ctrl-Alt-Del.** [kbd.rs:132](~/nc110-baremetal/src/kbd.rs:132)
+
+Both Ctrl keys share one boolean, as do both Alt keys. Press left Ctrl, press right Ctrl, release right Ctrl, then press Alt+Delete: left Ctrl remains physically held, but `CTRL` is false and reset does not trigger. The Ctrl bookkeeping predates this patch; the new emergency-reset feature inherits it, and Alt adds the same problem.
+
+Ordinary Ctrl-Alt-Del detection is correct: it requires extended Delete **make**, checks before queue-capacity handling, and therefore works under application backpressure. The CAD log confirms reaching the hard-reset routine; the serial log alone cannot prove QEMU exited.
+
+**NIT — The SGR proof assertion does not test rendering.** [run-m3.py:123](~/nc110-baremetal/run-m3.py:123)
+
+It checks mirrored output bytes, which would also pass with the old wrap bug. Assert VGA cell contents or inspect the captured screenshot to establish the visual result.
+
+The keepalive/timeout configuration matches smoltcp 0.14.0: a responsive idle peer survives, while a silent peer times out after roughly 60 seconds without received traffic. This establishes TCP liveness, not SSH-process responsiveness. The startup deadline now remains active until channel output arrives. Blackhole recovery is supported by code inspection but is not exercised by these logs.
+
+**Score: 8/10.**

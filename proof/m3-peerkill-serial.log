@@ -1,0 +1,28 @@
+NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: skipped (LPC 00:1f.0 is not ICH9 8086:2918 / NM10 8086:27bc) (result=1)
+keymod: client key from module 0 at 0x59b000 (72 B), public key verified, module wiped
+cmdline: ~/nc110-baremetal/target/x86_64-unknown-none/release/nc110-kernel 
+time: TSC 999600 ticks/ms (PIT ch2 calibrated)
+nic: rtl8139 C+ (10ec:8139) at 00:03.0 io=0xc000 mac=52:54:00:4e:43:11
+rng: TSC granularity 1000 ticks, sample window 64000 ticks
+rng: jitter startup 4096 samples passed RCT(cut 301) + APT(W 512, cut 507); 65674 TSC ticks/sample
+rng: min-entropy per 8-bit sample: MCV 3.237 (max 386/4096, 115 distinct), lag-1 1.388; claimed 0.100
+rng: RDRAND present, mixed in (jitter alone already passed)
+dhcp: smoltcp lease 10.0.2.15/24 router Some(10.0.2.2)
+tcp: connecting 10.0.2.2:2223 from :50802
+tcp: connected to 10.0.2.2:2223
+ssh(a): server banner: SSH-2.0-OpenSSH_10.2
+ssh: host key ssh-ed25519 SHA256:CuNB3VjtmuYL5Eb0958nDAjO80F6deBx8lHK2kTbRJ0 matches pin
+ssh(b): key exchange done (curve25519-sha256, host sig verified, chacha20-poly1305)
+ssh: offering publickey ssh-ed25519 (throwaway test key)
+ssh(c): publickey auth OK as evnchn
+ssh: session channel open, pty-req xterm 80x25 (true), shell (true)
+kbd: i8042 command byte Some(113) -> translation on, decoding scancode set 1
+term: VGA now belongs to the remote shell; keyboard is live
+ssh(d): first shell output (7 bytes)
+nc110$ ssh: connection closed
+kbd: 0 keys dropped while the channel was not taking input
+rng: 13 requests served, 1 reseeds, 20480 raw samples health-tested, failure latched: false
+ssh: M3 reached: interactive shell over SSH, drawn on VGA, typed on PS/2
+DONE

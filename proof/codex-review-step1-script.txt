@@ -1,0 +1,689 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a149b9-6e3d-77e2-931b-675aa897a655
+--------
+user
+Calibrated adversarial review of tools/step1-linux-wdt.sh (git show HEAD~1 HEAD for history; context in ~/party/nc110-m1/M1-RESULT.md and the script header). It will run against a REAL netbook's running Slot A Linux (BusyBox userland likely, iTCO_wdt v2, TCO_LOCK=1, heartbeat 30, nowayout=0) to learn whether the TCO watchdog resets the board or the firmware SMI handler swallows timeouts. Attack: (1) can the holder leave Slot A to reboot LATER unexpectedly (unclean close, killed holder, trap paths, Bash tool SIGKILL of this script)? (2) Can SWALLOW or RESET be reported wrongly (ping blips, open failure, other pingers)? (3) Does anything write /boot or grubenv? (4) Shell bugs: quoting across the ssh boundary, BusyBox incompatibilities (dd/od/setsid/pidof/ls -l /proc/*/fd), the REGS snippet, bash vs remote sh. Tier MUST-FIX/SHOULD-FIX/NIT, signal over volume, 'most is sound' is valid. Do not edit files. End with a 0-10 score.
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll read the script, its recent history, and the hardware results, then trace the failure and cleanup paths. I won’t edit files.
+exec
+/bin/zsh -lc "pwd; rg --files -g AGENTS.md -g 'step1-linux-wdt.sh'; git status --short; git show HEAD~1 HEAD -- tools/step1-linux-wdt.sh; cat tools/step1-linux-wdt.sh; cat ~/party/nc110-m1/M1-RESULT.md" in ~/nc110-baremetal
+ succeeded in 0ms:
+~/nc110-baremetal
+tools/step1-linux-wdt.sh
+?? grub-test/wdt-locked-accept.iso
+?? grub-test/wdt-locked-refuse.iso
+?? proof/codex-review-step1-script.txt
+commit 8fb5d3a293b839fa3553b3a6bb5e82ade2a351e6
+Author: evnchn <user1@example.invalid>
+Date:   Sat Oct 17 19:54:00 2026 +0800
+
+    tools: step1-linux-wdt.sh, the Linux-side TCO reset-or-swallow test (not run; waits for evnchn's go 1)
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/tools/step1-linux-wdt.sh b/tools/step1-linux-wdt.sh
+new file mode 100755
+index 0000000..04ad3a4
+--- /dev/null
++++ b/tools/step1-linux-wdt.sh
+@@ -0,0 +1,84 @@
++#!/usr/bin/env bash
++# NC110 pane brief step 1: does the TCO watchdog reset this board, or does the Phoenix SMI handler swallow it?
++# Run ONLY after evnchn typed "go 1" in the NC110 pane, with `hw claim nc110:host` held. Slot A, Linux only.
++# Without GO=1 it runs the read-only preflight and stops.
++# Read-only on /boot and grubenv. The netbook is not rebooted by us; a reset can only come from the TCO.
++#
++# Method: Slot A's kernel pings the running TCO itself (iTCO_wdt WDOG_HW_RUNNING keepalive; sysfs state=inactive).
++# Opening /dev/watchdog hands the ping duty to userspace; our holder then never writes. iTCO v2 with TMR=30 s
++# resets on the 2nd expiry, about 60 s after the open. If the box is still up at 90 s + margin, the firmware
++# swallows the timeouts, and the holder closes with the magic 'V' (timer halted, no reset).
++# Self-disarming twice: the on-box holder magic-closes by itself at HOLD_MAX s, and this script's EXIT trap
++# asks it to magic-close at once if the box is still answering.
++set -u
++OUT=${OUT:-$HOME/party/nc110-m1/step1-$(date +%Y%m%dT%H%M%S)}
++HOST=root@192.168.50.118
++HOLD_MAX=${HOLD_MAX:-110}   # holder self-closes after this; must stay > SWALLOW_AT
++SWALLOW_AT=${SWALLOW_AT:-100}
++mkdir -p "$OUT"
++ssh_nb() { ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=2 -o ServerAliveCountMax=2 \
++  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
++  -i "$HOME/.ssh/id_ed25519_homelab" "$HOST" "$@"; }
++log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT/run.log"; }
++
++REGS='p() { printf "%s=%s " "$1" "$(dd if=/dev/port bs=1 skip=$(($2)) count=$3 2>/dev/null | od -An -tx$3 | tr -d " ")"; }
++p RLD 0x1060 2; p TCO1_STS 0x1064 2; p TCO2_STS 0x1066 2; p TCO1_CNT 0x1068 2; p TMR 0x1072 2; p SMI_EN 0x1030 4
++w=/sys/class/watchdog/watchdog0; echo "state=$(cat $w/state) timeleft=$(cat $w/timeleft 2>/dev/null) boot=$(cat $w/bootstatus) up=$(cut -d" " -f1 /proc/uptime)"'
++
++disarm() {
++  ssh_nb 'touch /dev/shm/nc110-wdt-stop' 2>/dev/null && log "trap: asked holder to magic-close" || log "trap: box not answering"
++}
++
++# 1. Preflight, read-only. Any surprise stops here before /dev/watchdog is opened.
++ssh_nb 'hostname; awk "\$2==\"/\"{print \$1}" /proc/mounts; grub-editenv /boot/grub/grubenv list;
++  /usr/local/sbin/slotlab-status 2>/dev/null; echo "pid_watchdog=$(pidof watchdog)";
++  echo "dev_watchdog_holders=$(ls -l /proc/[0-9]*/fd 2>/dev/null | grep -c "/dev/watchdog")";
++  sha256sum /boot/grub/grub.cfg /boot/grub/grubenv' > "$OUT/00-preflight.txt" 2>&1
++ssh_nb "$REGS" >> "$OUT/00-preflight.txt" 2>&1
++cat "$OUT/00-preflight.txt"
++pf=$(cat "$OUT/00-preflight.txt")
++grep -qx nc110 <<<"$pf" && grep -qx /dev/sda2 <<<"$pf" && grep -qx saved_entry=0 <<<"$pf" \
++  && ! grep -q 'next_entry=.' <<<"$pf" && grep -q 'dev_watchdog_holders=0' <<<"$pf" && grep -q 'pid_watchdog=$' <<<"$pf" \
++  && grep -q 'TMR=0032' <<<"$pf" && grep -q 'state=inactive' <<<"$pf" \
++  || { log "preflight differs from what this test assumes: STOP, nothing armed"; exit 2; }
++# ponytail: a Slot A return timer would show in slotlab-status; read 00-preflight.txt by eye before GO=1.
++[ "${GO:-}" = 1 ] || { log "preflight OK; rerun with GO=1 to open /dev/watchdog"; exit 0; }
++
++# 2. Holder: open, never write, magic-close on the stop flag or at HOLD_MAX. setsid so an ssh drop cannot kill it
++#    (killing it would be an unclean close, which also leaves the timer running).
++trap disarm EXIT
++ssh_nb "rm -f /dev/shm/nc110-wdt-stop; sync; setsid sh -c 'exec 3>/dev/watchdog; i=0
++  while [ \$i -lt $HOLD_MAX ] && [ ! -e /dev/shm/nc110-wdt-stop ]; do sleep 1; i=\$((i+1)); done
++  printf V >&3; exec 3>&-; echo closed-after-\$i > /dev/shm/nc110-wdt-done' </dev/null >/dev/null 2>&1 &"
++T0=$(date +%s); log "holder started (t0), expect reset ~60 s, swallow verdict at ${SWALLOW_AT} s"
++
++# 3. Watch: on-box registers once a second, plus ping from the Mac.
++ssh_nb "while :; do $REGS; sleep 1; done" > "$OUT/01-regs.txt" 2>&1 &
++RP=$!
++last_up=$T0
++while :; do
++  now=$(date +%s); t=$((now - T0))
++  if ping -c1 -t1 192.168.50.118 >/dev/null 2>&1; then last_up=$now; fi
++  if [ $((now - last_up)) -ge 5 ]; then log "RESET: no ping since t=$((last_up - T0)) s"; verdict=reset; break; fi
++  if [ $t -ge "$SWALLOW_AT" ]; then log "SWALLOW: still answering at t=$t s"; verdict=swallow; break; fi
++  sleep 1
++done
++kill "$RP" 2>/dev/null
++tail -5 "$OUT/01-regs.txt"
++
++# 4. Outcome.
++if [ "$verdict" = swallow ]; then
++  disarm; trap - EXIT; sleep 3; ssh_nb 'cat /dev/shm/nc110-wdt-done; dmesg | tail -5' | tee -a "$OUT/run.log"
++  exit 0
++fi
++trap - EXIT
++log "waiting up to 5 min for Slot A"
++for _ in $(seq 60); do
++  if ssh_nb 'hostname; awk "\$2==\"/\"{print \$1}" /proc/mounts; grub-editenv /boot/grub/grubenv list; cut -d" " -f1 /proc/uptime' \
++      > "$OUT/02-after.txt" 2>&1; then
++    ssh_nb "$REGS; dmesg | grep -i -e tco -e watchdog" >> "$OUT/02-after.txt" 2>&1
++    cat "$OUT/02-after.txt"; log "back after $(( $(date +%s) - T0 )) s from t0"; exit 0
++  fi
++  sleep 5
++done
++log "NOT BACK within 5 min: STOP, do not retry, card evnchn: NC110 needs a power cycle"; exit 3
+
+commit 57dacd7fb196da13f8a088f45448af7d05f0b6fe
+Author: evnchn <user1@example.invalid>
+Date:   Sat Oct 17 19:57:31 2026 +0800
+
+    step1-linux-wdt: fail-closed SWALLOW (needs state=active and timeleft<=2), VOID otherwise; gate on no return timer, writable /dev/shm, no slotlab run; post-reset sha256
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/tools/step1-linux-wdt.sh b/tools/step1-linux-wdt.sh
+index 04ad3a4..f9c3a2c 100755
+--- a/tools/step1-linux-wdt.sh
++++ b/tools/step1-linux-wdt.sh
+@@ -1,5 +1,6 @@
+ #!/usr/bin/env bash
+ # NC110 pane brief step 1: does the TCO watchdog reset this board, or does the Phoenix SMI handler swallow it?
++# Run with Bash timeout 600000 (reset path: ~65 s + up to 300 s wait).
+ # Run ONLY after evnchn typed "go 1" in the NC110 pane, with `hw claim nc110:host` held. Slot A, Linux only.
+ # Without GO=1 it runs the read-only preflight and stops.
+ # Read-only on /boot and grubenv. The netbook is not rebooted by us; a reset can only come from the TCO.
+@@ -33,6 +34,8 @@ disarm() {
+ ssh_nb 'hostname; awk "\$2==\"/\"{print \$1}" /proc/mounts; grub-editenv /boot/grub/grubenv list;
+   /usr/local/sbin/slotlab-status 2>/dev/null; echo "pid_watchdog=$(pidof watchdog)";
+   echo "dev_watchdog_holders=$(ls -l /proc/[0-9]*/fd 2>/dev/null | grep -c "/dev/watchdog")";
++  f=/data/slotlab/fastinit-return.pid; [ -f $f ] && kill -0 "$(cat $f)" 2>/dev/null && echo return_timer=armed || echo return_timer=none;
++  touch /dev/shm/.nc110w && rm /dev/shm/.nc110w && echo shm=ok;
+   sha256sum /boot/grub/grub.cfg /boot/grub/grubenv' > "$OUT/00-preflight.txt" 2>&1
+ ssh_nb "$REGS" >> "$OUT/00-preflight.txt" 2>&1
+ cat "$OUT/00-preflight.txt"
+@@ -40,14 +43,14 @@ pf=$(cat "$OUT/00-preflight.txt")
+ grep -qx nc110 <<<"$pf" && grep -qx /dev/sda2 <<<"$pf" && grep -qx saved_entry=0 <<<"$pf" \
+   && ! grep -q 'next_entry=.' <<<"$pf" && grep -q 'dev_watchdog_holders=0' <<<"$pf" && grep -q 'pid_watchdog=$' <<<"$pf" \
+   && grep -q 'TMR=0032' <<<"$pf" && grep -q 'state=inactive' <<<"$pf" \
++  && grep -qx return_timer=none <<<"$pf" && grep -qx shm=ok <<<"$pf" && ! pgrep -f nc110-slotlab >/dev/null \
+   || { log "preflight differs from what this test assumes: STOP, nothing armed"; exit 2; }
+-# ponytail: a Slot A return timer would show in slotlab-status; read 00-preflight.txt by eye before GO=1.
+ [ "${GO:-}" = 1 ] || { log "preflight OK; rerun with GO=1 to open /dev/watchdog"; exit 0; }
+ 
+ # 2. Holder: open, never write, magic-close on the stop flag or at HOLD_MAX. setsid so an ssh drop cannot kill it
+ #    (killing it would be an unclean close, which also leaves the timer running).
+ trap disarm EXIT
+-ssh_nb "rm -f /dev/shm/nc110-wdt-stop; sync; setsid sh -c 'exec 3>/dev/watchdog; i=0
++ssh_nb "rm -f /dev/shm/nc110-wdt-*; sync; setsid sh -c 'exec 3>/dev/watchdog; touch /dev/shm/nc110-wdt-opened; i=0
+   while [ \$i -lt $HOLD_MAX ] && [ ! -e /dev/shm/nc110-wdt-stop ]; do sleep 1; i=\$((i+1)); done
+   printf V >&3; exec 3>&-; echo closed-after-\$i > /dev/shm/nc110-wdt-done' </dev/null >/dev/null 2>&1 &"
+ T0=$(date +%s); log "holder started (t0), expect reset ~60 s, swallow verdict at ${SWALLOW_AT} s"
+@@ -68,7 +71,15 @@ tail -5 "$OUT/01-regs.txt"
+ 
+ # 4. Outcome.
+ if [ "$verdict" = swallow ]; then
+-  disarm; trap - EXIT; sleep 3; ssh_nb 'cat /dev/shm/nc110-wdt-done; dmesg | tail -5' | tee -a "$OUT/run.log"
++  disarm; trap - EXIT; sleep 3; ssh_nb "ls /dev/shm/nc110-wdt-*; cat /dev/shm/nc110-wdt-done; $REGS; dmesg | tail -5" | tee -a "$OUT/run.log"
++  # Fail closed: SWALLOW only if the open really took (state=active) and the countdown really reached ~0.
++  # Otherwise nothing was measured (open failed, or some other pinger still feeds it).
++  mintl=$(grep -o 'timeleft=[0-9]*' "$OUT/01-regs.txt" | cut -d= -f2 | sort -n | head -1)
++  if grep -q state=active "$OUT/01-regs.txt" && [ -n "$mintl" ] && [ "$mintl" -le 2 ]; then
++    log "VERDICT SWALLOW: open took, timeleft reached $mintl, no reset by t=$SWALLOW_AT s. TMR_HLT now set (Slot A unwatched until next boot)"
++  else
++    log "VERDICT VOID: state=active seen? $(grep -c state=active "$OUT/01-regs.txt") lines, min timeleft=${mintl:-none}. Nothing measured"
++  fi
+   exit 0
+ fi
+ trap - EXIT
+@@ -77,7 +88,8 @@ for _ in $(seq 60); do
+   if ssh_nb 'hostname; awk "\$2==\"/\"{print \$1}" /proc/mounts; grub-editenv /boot/grub/grubenv list; cut -d" " -f1 /proc/uptime' \
+       > "$OUT/02-after.txt" 2>&1; then
+     ssh_nb "$REGS; dmesg | grep -i -e tco -e watchdog" >> "$OUT/02-after.txt" 2>&1
+-    cat "$OUT/02-after.txt"; log "back after $(( $(date +%s) - T0 )) s from t0"; exit 0
++    ssh_nb 'sha256sum /boot/grub/grub.cfg /boot/grub/grubenv' >> "$OUT/02-after.txt" 2>&1
++    cat "$OUT/02-after.txt"; log "VERDICT RESET: back after $(( $(date +%s) - T0 )) s from t0 (check uptime < that and sha256 = preflight)"; exit 0
+   fi
+   sleep 5
+ done
+#!/usr/bin/env bash
+# NC110 pane brief step 1: does the TCO watchdog reset this board, or does the Phoenix SMI handler swallow it?
+# Run with Bash timeout 600000 (reset path: ~65 s + up to 300 s wait).
+# Run ONLY after evnchn typed "go 1" in the NC110 pane, with `hw claim nc110:host` held. Slot A, Linux only.
+# Without GO=1 it runs the read-only preflight and stops.
+# Read-only on /boot and grubenv. The netbook is not rebooted by us; a reset can only come from the TCO.
+#
+# Method: Slot A's kernel pings the running TCO itself (iTCO_wdt WDOG_HW_RUNNING keepalive; sysfs state=inactive).
+# Opening /dev/watchdog hands the ping duty to userspace; our holder then never writes. iTCO v2 with TMR=30 s
+# resets on the 2nd expiry, about 60 s after the open. If the box is still up at 90 s + margin, the firmware
+# swallows the timeouts, and the holder closes with the magic 'V' (timer halted, no reset).
+# Self-disarming twice: the on-box holder magic-closes by itself at HOLD_MAX s, and this script's EXIT trap
+# asks it to magic-close at once if the box is still answering.
+set -u
+OUT=${OUT:-$HOME/party/nc110-m1/step1-$(date +%Y%m%dT%H%M%S)}
+HOST=root@192.168.50.118
+HOLD_MAX=${HOLD_MAX:-110}   # holder self-closes after this; must stay > SWALLOW_AT
+SWALLOW_AT=${SWALLOW_AT:-100}
+mkdir -p "$OUT"
+ssh_nb() { ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=2 -o ServerAliveCountMax=2 \
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+  -i "$HOME/.ssh/id_ed25519_homelab" "$HOST" "$@"; }
+log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT/run.log"; }
+
+REGS='p() { printf "%s=%s " "$1" "$(dd if=/dev/port bs=1 skip=$(($2)) count=$3 2>/dev/null | od -An -tx$3 | tr -d " ")"; }
+p RLD 0x1060 2; p TCO1_STS 0x1064 2; p TCO2_STS 0x1066 2; p TCO1_CNT 0x1068 2; p TMR 0x1072 2; p SMI_EN 0x1030 4
+w=/sys/class/watchdog/watchdog0; echo "state=$(cat $w/state) timeleft=$(cat $w/timeleft 2>/dev/null) boot=$(cat $w/bootstatus) up=$(cut -d" " -f1 /proc/uptime)"'
+
+disarm() {
+  ssh_nb 'touch /dev/shm/nc110-wdt-stop' 2>/dev/null && log "trap: asked holder to magic-close" || log "trap: box not answering"
+}
+
+# 1. Preflight, read-only. Any surprise stops here before /dev/watchdog is opened.
+ssh_nb 'hostname; awk "\$2==\"/\"{print \$1}" /proc/mounts; grub-editenv /boot/grub/grubenv list;
+  /usr/local/sbin/slotlab-status 2>/dev/null; echo "pid_watchdog=$(pidof watchdog)";
+  echo "dev_watchdog_holders=$(ls -l /proc/[0-9]*/fd 2>/dev/null | grep -c "/dev/watchdog")";
+  f=/data/slotlab/fastinit-return.pid; [ -f $f ] && kill -0 "$(cat $f)" 2>/dev/null && echo return_timer=armed || echo return_timer=none;
+  touch /dev/shm/.nc110w && rm /dev/shm/.nc110w && echo shm=ok;
+  sha256sum /boot/grub/grub.cfg /boot/grub/grubenv' > "$OUT/00-preflight.txt" 2>&1
+ssh_nb "$REGS" >> "$OUT/00-preflight.txt" 2>&1
+cat "$OUT/00-preflight.txt"
+pf=$(cat "$OUT/00-preflight.txt")
+grep -qx nc110 <<<"$pf" && grep -qx /dev/sda2 <<<"$pf" && grep -qx saved_entry=0 <<<"$pf" \
+  && ! grep -q 'next_entry=.' <<<"$pf" && grep -q 'dev_watchdog_holders=0' <<<"$pf" && grep -q 'pid_watchdog=$' <<<"$pf" \
+  && grep -q 'TMR=0032' <<<"$pf" && grep -q 'state=inactive' <<<"$pf" \
+  && grep -qx return_timer=none <<<"$pf" && grep -qx shm=ok <<<"$pf" && ! pgrep -f nc110-slotlab >/dev/null \
+  || { log "preflight differs from what this test assumes: STOP, nothing armed"; exit 2; }
+[ "${GO:-}" = 1 ] || { log "preflight OK; rerun with GO=1 to open /dev/watchdog"; exit 0; }
+
+# 2. Holder: open, never write, magic-close on the stop flag or at HOLD_MAX. setsid so an ssh drop cannot kill it
+#    (killing it would be an unclean close, which also leaves the timer running).
+trap disarm EXIT
+ssh_nb "rm -f /dev/shm/nc110-wdt-*; sync; setsid sh -c 'exec 3>/dev/watchdog; touch /dev/shm/nc110-wdt-opened; i=0
+  while [ \$i -lt $HOLD_MAX ] && [ ! -e /dev/shm/nc110-wdt-stop ]; do sleep 1; i=\$((i+1)); done
+  printf V >&3; exec 3>&-; echo closed-after-\$i > /dev/shm/nc110-wdt-done' </dev/null >/dev/null 2>&1 &"
+T0=$(date +%s); log "holder started (t0), expect reset ~60 s, swallow verdict at ${SWALLOW_AT} s"
+
+# 3. Watch: on-box registers once a second, plus ping from the Mac.
+ssh_nb "while :; do $REGS; sleep 1; done" > "$OUT/01-regs.txt" 2>&1 &
+RP=$!
+last_up=$T0
+while :; do
+  now=$(date +%s); t=$((now - T0))
+  if ping -c1 -t1 192.168.50.118 >/dev/null 2>&1; then last_up=$now; fi
+  if [ $((now - last_up)) -ge 5 ]; then log "RESET: no ping since t=$((last_up - T0)) s"; verdict=reset; break; fi
+  if [ $t -ge "$SWALLOW_AT" ]; then log "SWALLOW: still answering at t=$t s"; verdict=swallow; break; fi
+  sleep 1
+done
+kill "$RP" 2>/dev/null
+tail -5 "$OUT/01-regs.txt"
+
+# 4. Outcome.
+if [ "$verdict" = swallow ]; then
+  disarm; trap - EXIT; sleep 3; ssh_nb "ls /dev/shm/nc110-wdt-*; cat /dev/shm/nc110-wdt-done; $REGS; dmesg | tail -5" | tee -a "$OUT/run.log"
+  # Fail closed: SWALLOW only if the open really took (state=active) and the countdown really reached ~0.
+  # Otherwise nothing was measured (open failed, or some other pinger still feeds it).
+  mintl=$(grep -o 'timeleft=[0-9]*' "$OUT/01-regs.txt" | cut -d= -f2 | sort -n | head -1)
+  if grep -q state=active "$OUT/01-regs.txt" && [ -n "$mintl" ] && [ "$mintl" -le 2 ]; then
+    log "VERDICT SWALLOW: open took, timeleft reached $mintl, no reset by t=$SWALLOW_AT s. TMR_HLT now set (Slot A unwatched until next boot)"
+  else
+    log "VERDICT VOID: state=active seen? $(grep -c state=active "$OUT/01-regs.txt") lines, min timeleft=${mintl:-none}. Nothing measured"
+  fi
+  exit 0
+fi
+trap - EXIT
+log "waiting up to 5 min for Slot A"
+for _ in $(seq 60); do
+  if ssh_nb 'hostname; awk "\$2==\"/\"{print \$1}" /proc/mounts; grub-editenv /boot/grub/grubenv list; cut -d" " -f1 /proc/uptime' \
+      > "$OUT/02-after.txt" 2>&1; then
+    ssh_nb "$REGS; dmesg | grep -i -e tco -e watchdog" >> "$OUT/02-after.txt" 2>&1
+    ssh_nb 'sha256sum /boot/grub/grub.cfg /boot/grub/grubenv' >> "$OUT/02-after.txt" 2>&1
+    cat "$OUT/02-after.txt"; log "VERDICT RESET: back after $(( $(date +%s) - T0 )) s from t0 (check uptime < that and sha256 = preflight)"; exit 0
+  fi
+  sleep 5
+done
+log "NOT BACK within 5 min: STOP, do not retry, card evnchn: NC110 needs a power cycle"; exit 3
+# NC110 M1 (hardware): STOPPED at the read-only gate, nothing written (2026-10-17 ~02:37 HKT)
+
+Run by a subagent of session f460ea31 (pane w2N:p1). hwlock `nc110:host` was pre-claimed by evnchn@Mac.
+
+## Verdict
+TCO_LOCK is SET on this firmware, so the M1 GRUB guard (`tco-arm.cfg`) would refuse to arm, by design.
+Per the run rules ("if ANY differs from what the GRUB guard expects, STOP before writing anything") no step was run:
+no grub.cfg backup/edit, no /boot/baremetal, no next_entry, no reboot. The netbook was never rebooted.
+
+## Read-backs (Slot A, read-only; files 00-04 here)
+| Check | Expected (guard) | Read | OK? |
+|---|---|---|---|
+| hostname / root | nc110 / /dev/sda2 | nc110 / /dev/sda2 (stock vmlinuz-lts, up 2 d 23 h) | yes |
+| grubenv | saved_entry=0, no next_entry | `saved_entry=0`, `next_entry=` (empty) | yes |
+| one-shot clear in LIVE grub.cfg | before the menu | lines 19-27 (`set next_entry=` + `save_env next_entry`); first menuentry at line 110 | yes |
+| LPC 00:1f.0 0x00 | 27bc8086 | 27bc8086 | yes |
+| PMBASE 0x40 | 1001 | 00001001 | yes |
+| RCBA 0xF0 | fed1c001 | fed1c001 | yes |
+| TCO1_CNT 0x1068 bit 12 TCO_LOCK | 0 | **0x1000, so TCO_LOCK=1** (8/8 byte-wise reads) | **NO** |
+| SMI_EN 0x1030 bit 13 TCO_EN | must be clearable | **0x00022033, so TCO_EN=1** (locked by TCO_LOCK) | **NO** |
+
+Other values read:
+- TMR_HLT (bit 11) = 0, so the timer is RUNNING.
+- TCO_TMR=0x32 (50 ticks = 30 s, which matches Linux iTCO_wdt heartbeat=30).
+- TCO_RLD counted down 0x2e to 0x21 over ~8 s (0.6 s/tick).
+- TCO1_STS=0, TCO2_STS=0.
+- sysfs watchdog0: state=inactive, bootstatus=0, nowayout=0.
+- GCS (0xfed1f410) not readable from Linux: /dev/mem says "Bad address".
+- BIOS: 01VG.M013.20110704.RHU.
+
+## What it means (datasheet reading; the SMI part is an inference, not tested)
+- TCO_LOCK cannot be cleared by software once it is set. The BIOS set it during POST, so expect GRUB to see it set on every boot. (Inferred from reading it set now; I did not confirm the exact reset domain in the datasheet.)
+- With TCO_LOCK set, SMI_EN.TCO_EN cannot be cleared, so the first TCO timeout ALWAYS raises an SMI to the firmware.
+- Whether the Phoenix SMI handler reloads the timer (swallowing every timeout, so no reset ever happens) is exactly the unknown.
+- The GRUB design assumed it could clear TCO_EN, and correctly refuses when it can't. Checked: `re_lock_clear` does not match `1000`, so `tco_arm` prints "TCO_LOCK set, NOT arming" and reboots.
+- NO_REBOOT IS clearable: this box's iTCO_wdt.ko.gz contains "unable to reset NO_REBOOT flag, device disabled by hardware/BIOS", the probe aborts on that path, and dmesg shows only "initialized". Only TCO_EN is locked.
+- The timer runs under Linux while sysfs says inactive. That suggests (inference) the kernel watchdog core is pinging a TCO the firmware left running.
+- If the firmware SMI handler swallows timeouts, a hang under the current design would need a power cycle. That is why we stopped.
+
+## Not done
+- Steps 0, 1 and 2 were not run.
+- No sha256 manifest: nothing was built or copied. The iPXE image was not built.
+- No syslog server was started.
+
+Final state (05-final-state.txt):
+- grub.cfg sha256 433c88ac… and grubenv 7bec425e…, unchanged from 01-live-grubcfg.txt.
+- No /boot/baremetal.
+- Uptime unbroken, no reboot.
+
+## Notes for the next run
+- **Step 0 is unaffected by this finding.** It is the pure one-shot probe and arms nothing, so it could be green-lit alone.
+- **The guard strings matched over a different read path.** netbook has no setpci/lspci, so I read sysfs config space and /dev/port. GRUB's own `setpci` echo of lpcid/pmbase/rcba has still never been seen on this box.
+
+## Proposed next step (operator's call, not taken)
+A Linux-side watchdog test. It carries no hang risk:
+- **Reset:** the TCO reset path works even with TCO_EN locked on.
+- **No reset:** the firmware swallows the timeouts. Linux keeps running, so no power cycle is needed.
+
+NM10 is iTCO v2: it resets on the 2nd expiry and Linux does not halve TMR (TMR=50 matches heartbeat=30).
+- With heartbeat N, expect the reset at about 2N.
+- Call it "firmware swallows" only if the box still answers after about 3N.
+
+Where to run it:
+- **Preferred: a one-shot "Slot B fastinit" boot**, so the unclean reset lands on the expendable slot.
+  1. Disarm the 75 s return timer (formula invariant 6).
+  2. SIGKILL fastinit's `watchdog` daemon. No magic close happens, so that kill is the test.
+  3. Either outcome returns to Slot A via saved_entry=0.
+- **Fallback: from Slot A.** Run `sync`, open /dev/watchdog, and never write to it. Cost: one unclean reset of a mounted Slot A (ext4 journal).
+
+If the test resets, tco-arm.cfg needs a reviewed change: accept TCO_LOCK=1 / TCO_EN=1 only on this evidence.
+
+exec
+/bin/zsh -lc "nl -ba tools/step1-linux-wdt.sh; rg --files ~/party/nc110-m1 | head -30; rg -n 'slotlab-status|iTCO|WDOG_HW_RUNNING' tools | head -60; command -v busybox; bash -n tools/step1-linux-wdt.sh" in ~/nc110-baremetal
+ succeeded in 0ms:
+     1	#!/usr/bin/env bash
+     2	# NC110 pane brief step 1: does the TCO watchdog reset this board, or does the Phoenix SMI handler swallow it?
+     3	# Run with Bash timeout 600000 (reset path: ~65 s + up to 300 s wait).
+     4	# Run ONLY after evnchn typed "go 1" in the NC110 pane, with `hw claim nc110:host` held. Slot A, Linux only.
+     5	# Without GO=1 it runs the read-only preflight and stops.
+     6	# Read-only on /boot and grubenv. The netbook is not rebooted by us; a reset can only come from the TCO.
+     7	#
+     8	# Method: Slot A's kernel pings the running TCO itself (iTCO_wdt WDOG_HW_RUNNING keepalive; sysfs state=inactive).
+     9	# Opening /dev/watchdog hands the ping duty to userspace; our holder then never writes. iTCO v2 with TMR=30 s
+    10	# resets on the 2nd expiry, about 60 s after the open. If the box is still up at 90 s + margin, the firmware
+    11	# swallows the timeouts, and the holder closes with the magic 'V' (timer halted, no reset).
+    12	# Self-disarming twice: the on-box holder magic-closes by itself at HOLD_MAX s, and this script's EXIT trap
+    13	# asks it to magic-close at once if the box is still answering.
+    14	set -u
+    15	OUT=${OUT:-$HOME/party/nc110-m1/step1-$(date +%Y%m%dT%H%M%S)}
+    16	HOST=root@192.168.50.118
+    17	HOLD_MAX=${HOLD_MAX:-110}   # holder self-closes after this; must stay > SWALLOW_AT
+    18	SWALLOW_AT=${SWALLOW_AT:-100}
+    19	mkdir -p "$OUT"
+    20	ssh_nb() { ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=2 -o ServerAliveCountMax=2 \
+    21	  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+    22	  -i "$HOME/.ssh/id_ed25519_homelab" "$HOST" "$@"; }
+    23	log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT/run.log"; }
+    24	
+    25	REGS='p() { printf "%s=%s " "$1" "$(dd if=/dev/port bs=1 skip=$(($2)) count=$3 2>/dev/null | od -An -tx$3 | tr -d " ")"; }
+    26	p RLD 0x1060 2; p TCO1_STS 0x1064 2; p TCO2_STS 0x1066 2; p TCO1_CNT 0x1068 2; p TMR 0x1072 2; p SMI_EN 0x1030 4
+    27	w=/sys/class/watchdog/watchdog0; echo "state=$(cat $w/state) timeleft=$(cat $w/timeleft 2>/dev/null) boot=$(cat $w/bootstatus) up=$(cut -d" " -f1 /proc/uptime)"'
+    28	
+    29	disarm() {
+    30	  ssh_nb 'touch /dev/shm/nc110-wdt-stop' 2>/dev/null && log "trap: asked holder to magic-close" || log "trap: box not answering"
+    31	}
+    32	
+    33	# 1. Preflight, read-only. Any surprise stops here before /dev/watchdog is opened.
+    34	ssh_nb 'hostname; awk "\$2==\"/\"{print \$1}" /proc/mounts; grub-editenv /boot/grub/grubenv list;
+    35	  /usr/local/sbin/slotlab-status 2>/dev/null; echo "pid_watchdog=$(pidof watchdog)";
+    36	  echo "dev_watchdog_holders=$(ls -l /proc/[0-9]*/fd 2>/dev/null | grep -c "/dev/watchdog")";
+    37	  f=/data/slotlab/fastinit-return.pid; [ -f $f ] && kill -0 "$(cat $f)" 2>/dev/null && echo return_timer=armed || echo return_timer=none;
+    38	  touch /dev/shm/.nc110w && rm /dev/shm/.nc110w && echo shm=ok;
+    39	  sha256sum /boot/grub/grub.cfg /boot/grub/grubenv' > "$OUT/00-preflight.txt" 2>&1
+    40	ssh_nb "$REGS" >> "$OUT/00-preflight.txt" 2>&1
+    41	cat "$OUT/00-preflight.txt"
+    42	pf=$(cat "$OUT/00-preflight.txt")
+    43	grep -qx nc110 <<<"$pf" && grep -qx /dev/sda2 <<<"$pf" && grep -qx saved_entry=0 <<<"$pf" \
+    44	  && ! grep -q 'next_entry=.' <<<"$pf" && grep -q 'dev_watchdog_holders=0' <<<"$pf" && grep -q 'pid_watchdog=$' <<<"$pf" \
+    45	  && grep -q 'TMR=0032' <<<"$pf" && grep -q 'state=inactive' <<<"$pf" \
+    46	  && grep -qx return_timer=none <<<"$pf" && grep -qx shm=ok <<<"$pf" && ! pgrep -f nc110-slotlab >/dev/null \
+    47	  || { log "preflight differs from what this test assumes: STOP, nothing armed"; exit 2; }
+    48	[ "${GO:-}" = 1 ] || { log "preflight OK; rerun with GO=1 to open /dev/watchdog"; exit 0; }
+    49	
+    50	# 2. Holder: open, never write, magic-close on the stop flag or at HOLD_MAX. setsid so an ssh drop cannot kill it
+    51	#    (killing it would be an unclean close, which also leaves the timer running).
+    52	trap disarm EXIT
+    53	ssh_nb "rm -f /dev/shm/nc110-wdt-*; sync; setsid sh -c 'exec 3>/dev/watchdog; touch /dev/shm/nc110-wdt-opened; i=0
+    54	  while [ \$i -lt $HOLD_MAX ] && [ ! -e /dev/shm/nc110-wdt-stop ]; do sleep 1; i=\$((i+1)); done
+    55	  printf V >&3; exec 3>&-; echo closed-after-\$i > /dev/shm/nc110-wdt-done' </dev/null >/dev/null 2>&1 &"
+    56	T0=$(date +%s); log "holder started (t0), expect reset ~60 s, swallow verdict at ${SWALLOW_AT} s"
+    57	
+    58	# 3. Watch: on-box registers once a second, plus ping from the Mac.
+    59	ssh_nb "while :; do $REGS; sleep 1; done" > "$OUT/01-regs.txt" 2>&1 &
+    60	RP=$!
+    61	last_up=$T0
+    62	while :; do
+    63	  now=$(date +%s); t=$((now - T0))
+    64	  if ping -c1 -t1 192.168.50.118 >/dev/null 2>&1; then last_up=$now; fi
+    65	  if [ $((now - last_up)) -ge 5 ]; then log "RESET: no ping since t=$((last_up - T0)) s"; verdict=reset; break; fi
+    66	  if [ $t -ge "$SWALLOW_AT" ]; then log "SWALLOW: still answering at t=$t s"; verdict=swallow; break; fi
+    67	  sleep 1
+    68	done
+    69	kill "$RP" 2>/dev/null
+    70	tail -5 "$OUT/01-regs.txt"
+    71	
+    72	# 4. Outcome.
+    73	if [ "$verdict" = swallow ]; then
+    74	  disarm; trap - EXIT; sleep 3; ssh_nb "ls /dev/shm/nc110-wdt-*; cat /dev/shm/nc110-wdt-done; $REGS; dmesg | tail -5" | tee -a "$OUT/run.log"
+    75	  # Fail closed: SWALLOW only if the open really took (state=active) and the countdown really reached ~0.
+    76	  # Otherwise nothing was measured (open failed, or some other pinger still feeds it).
+    77	  mintl=$(grep -o 'timeleft=[0-9]*' "$OUT/01-regs.txt" | cut -d= -f2 | sort -n | head -1)
+    78	  if grep -q state=active "$OUT/01-regs.txt" && [ -n "$mintl" ] && [ "$mintl" -le 2 ]; then
+    79	    log "VERDICT SWALLOW: open took, timeleft reached $mintl, no reset by t=$SWALLOW_AT s. TMR_HLT now set (Slot A unwatched until next boot)"
+    80	  else
+    81	    log "VERDICT VOID: state=active seen? $(grep -c state=active "$OUT/01-regs.txt") lines, min timeleft=${mintl:-none}. Nothing measured"
+    82	  fi
+    83	  exit 0
+    84	fi
+    85	trap - EXIT
+    86	log "waiting up to 5 min for Slot A"
+    87	for _ in $(seq 60); do
+    88	  if ssh_nb 'hostname; awk "\$2==\"/\"{print \$1}" /proc/mounts; grub-editenv /boot/grub/grubenv list; cut -d" " -f1 /proc/uptime' \
+    89	      > "$OUT/02-after.txt" 2>&1; then
+    90	    ssh_nb "$REGS; dmesg | grep -i -e tco -e watchdog" >> "$OUT/02-after.txt" 2>&1
+    91	    ssh_nb 'sha256sum /boot/grub/grub.cfg /boot/grub/grubenv' >> "$OUT/02-after.txt" 2>&1
+    92	    cat "$OUT/02-after.txt"; log "VERDICT RESET: back after $(( $(date +%s) - T0 )) s from t0 (check uptime < that and sha256 = preflight)"; exit 0
+    93	  fi
+    94	  sleep 5
+    95	done
+    96	log "NOT BACK within 5 min: STOP, do not retry, card evnchn: NC110 needs a power cycle"; exit 3
+~/party/nc110-m1/03-guard-readback-pre.txt
+~/party/nc110-m1/04-guard-readback-confirm.txt
+~/party/nc110-m1/02-grub-tooling.txt
+~/party/nc110-m1/05-final-state.txt
+~/party/nc110-m1/08-hwlock-after-release.txt
+~/party/nc110-m1/M1-RESULT.md
+~/party/nc110-m1/00-preflight-state.txt
+~/party/nc110-m1/06-hwlock-before-release.txt
+~/party/nc110-m1/07-hwlock-release.txt
+~/party/nc110-m1/01-live-grubcfg.txt
+tools/step1-linux-wdt.sh:8:# Method: Slot A's kernel pings the running TCO itself (iTCO_wdt WDOG_HW_RUNNING keepalive; sysfs state=inactive).
+tools/step1-linux-wdt.sh:9:# Opening /dev/watchdog hands the ping duty to userspace; our holder then never writes. iTCO v2 with TMR=30 s
+tools/step1-linux-wdt.sh:35:  /usr/local/sbin/slotlab-status 2>/dev/null; echo "pid_watchdog=$(pidof watchdog)";
+
+web search: 
+web search: https://raw.githubusercontent.com/torvalds/linux/master/drivers/watchdog/iTCO_wdt.c
+codex
+Two concrete issues stand out: ping loss can produce a RESET verdict without proving a reboot, and cleanup removes the EXIT trap before confirming the watchdog stopped. I’m checking the shell quoting and kernel close behavior to pin down the delayed-reset risk.
+web search: 
+web search: https://raw.githubusercontent.com/torvalds/linux/v6.12/drivers/watchdog/iTCO_wdt.c
+exec
+/bin/zsh -lc "python3 - <<'PY'
+import pathlib, subprocess
+s=pathlib.Path('tools/step1-linux-wdt.sh').read_text()
+cmd=s.split(\"ssh_nb '\",2)[2].split(\"' >\",1)[0]
+awk=cmd.split('; ')[1].split(' /proc/mounts')[0]
+print('Remote awk command:',awk)
+r=subprocess.run(['/bin/sh','-c', 'awk() { printf \"argument=<%s>\\\\n\" \""'$@"; }; '"'+awk],text=True,capture_output=True)
+print(r.stdout,r.stderr)
+regs=s.split(\"REGS='\",1)[1].split(\"'\\n\",1)[0]
+r=subprocess.run(['/bin/sh','-n'],input=regs,text=True,capture_output=True)
+print('REGS sh syntax exit:',r.returncode,r.stderr)
+PY
+cat ~/party/nc110-m1/00-preflight-state.txt; rg --files ~/party | rg 'slotlab-status|fastinit' | head -20" in ~/nc110-baremetal
+ succeeded in 0ms:
+zsh:1: can't create temp file for here document: operation not permitted
+Warning: Permanently added '192.168.50.118' (ED25519) to the list of known hosts.
+nc110
+/dev/sda2 on / type ext4 (rw,relatime)
+BOOT_IMAGE=/vmlinuz-lts root=UUID=b86fb3d7-5127-4800-b36b-b47279ee86ae ro quiet modules=sd-mod,ahci,ata_piix,ext4 rootfstype=ext4 rootdelay=5
+--- grubenv
+saved_entry=0
+next_entry=
+--- slotlab-status
+config:
+ROOT_A_UUID=b86fb3d7-5127-4800-b36b-b47279ee86ae
+ROOT_B_UUID=88c701b2-88ad-4399-878f-99432759e030
+BOOT_UUID=c0954bc7-86a0-440c-8401-2c3e95549743
+DATA_UUID=98c7fb72-a2d1-4e27-81e6-97da16a20753
+SLOT_A_ENTRY="Alpine NC110, with Linux lts"
+SLOT_B_ENTRY="Slot B (reserved /dev/sda3)"
+WATCHDOG_DEVICE=/dev/watchdog
+WATCHDOG_TIMEOUT=90
+WATCHDOG_TICK=10
+
+state:
+status=failed_recovered_to_slot_a
+recorded_at=2026-08-25T10:58:09+00:00
+elapsed_seconds=45
+root_uuid=b86fb3d7-5127-4800-b36b-b47279ee86ae
+
+grubenv:
+saved_entry=0
+next_entry=
+
+watchdog:
+state=inactive
+timeout=30
+timeleft=27
+nowayout=0
+identity=iTCO_wdt
+
+root_uuid=b86fb3d7-5127-4800-b36b-b47279ee86ae
+
+recent events:
+2026-08-25T10:56:43+00:00 fastinit up=3.95 modprobe iTCO_vendor_support ok
+2026-08-25T10:56:43+00:00 fastinit up=4.00 modprobe iTCO_wdt ok
+2026-08-25T10:56:44+00:00 fastinit up=4.65 mdev done
+2026-08-25T10:56:44+00:00 fastinit up=4.67 watchdog started pid=1746
+2026-08-25T10:56:44+00:00 fastinit up=4.78 modprobe libphy ok
+2026-08-25T10:56:44+00:00 fastinit up=4.87 modprobe r8169 ok
+2026-08-25T10:56:44+00:00 fastinit up=4.88 net modules probe launched
+2026-08-25T10:56:44+00:00 fastinit up=4.90 return timer started pid=1823
+2026-08-25T10:56:45+00:00 fastinit up=5.58 net mdev done
+2026-08-25T10:56:45+00:00 fastinit up=5.90 static network configured
+2026-08-25T10:56:46+00:00 fastinit up=6.15 ssh host keys ready
+2026-08-25T10:56:46+00:00 fastinit up=6.17 getty tty1 started
+2026-08-25T10:56:46+00:00 fastinit up=6.26 sshd started
+2026-08-25T10:57:22+00:00 armed slot-B attempt returned to slot A; treating slot B as failed/unbootable elapsed=51s
+2026-08-25T10:57:24+00:00 arming one-shot boot to entry: Slot B fastcustom (no initrd)
+2026-08-25T10:57:25+00:00 watchdog keeper started pid=3071 tick=10 timeout=90 dev=/dev/watchdog
+2026-08-25T10:57:34+00:00 fastinit up=1.16 entered
+2026-08-25T10:57:34+00:00 fastinit up=1.21 modprobe lpc_ich failed
+2026-08-25T10:57:34+00:00 fastinit up=1.23 modprobe iTCO_vendor_support failed
+2026-08-25T10:57:34+00:00 fastinit up=1.25 modprobe iTCO_wdt failed
+2026-08-25T10:57:34+00:00 fastinit up=1.87 mdev done
+2026-08-25T10:57:34+00:00 fastinit up=1.89 watchdog started pid=889
+2026-08-25T10:57:34+00:00 fastinit up=1.91 modprobe libphy failed
+2026-08-25T10:57:34+00:00 fastinit up=1.92 modprobe r8169 failed
+2026-08-25T10:57:34+00:00 fastinit up=1.94 net modules probe launched
+2026-08-25T10:57:34+00:00 fastinit up=1.96 return timer started pid=921
+2026-08-25T10:57:35+00:00 fastinit up=2.56 net mdev done
+2026-08-25T10:57:35+00:00 fastinit up=2.88 static network configured
+2026-08-25T10:57:36+00:00 fastinit up=3.17 ssh host keys ready
+2026-08-25T10:57:36+00:00 fastinit up=3.18 getty tty1 started
+2026-08-25T10:57:36+00:00 fastinit up=3.27 sshd started
+2026-08-25T10:58:09+00:00 armed slot-B attempt returned to slot A; treating slot B as failed/unbootable elapsed=45s
+2026-08-25T12:09:36+00:00 normal boot root_uuid=b86fb3d7-5127-4800-b36b-b47279ee86ae
+2026-08-25T12:18:35+00:00 normal boot root_uuid=b86fb3d7-5127-4800-b36b-b47279ee86ae
+2026-08-25T12:20:00+00:00 normal boot root_uuid=b86fb3d7-5127-4800-b36b-b47279ee86ae
+2026-08-25T12:20:50+00:00 normal boot root_uuid=b86fb3d7-5127-4800-b36b-b47279ee86ae
+2026-08-25T12:22:39+00:00 normal boot root_uuid=88c701b2-88ad-4399-878f-99432759e030
+2026-08-25T12:24:43+00:00 normal boot root_uuid=b86fb3d7-5127-4800-b36b-b47279ee86ae
+2026-08-25T12:25:53+00:00 normal boot root_uuid=88c701b2-88ad-4399-878f-99432759e030
+2026-10-14T03:36:01+00:00 normal boot root_uuid=b86fb3d7-5127-4800-b36b-b47279ee86ae
+--- uptime
+ 02:36:42 up 2 days, 23:00,  0 users,  load average: 0.08, 0.01, 0.00
+255657.29 1019245.95
+Linux nc110 6.18.44-0-lts #1-Alpine SMP PREEMPT_DYNAMIC 2026-08-10 09:54:13 i686 Linux
+
+exec
+/bin/zsh -lc "python3 -c 'import pathlib,subprocess; s=pathlib.Path(\"tools/step1-linux-wdt.sh\").read_text(); line=s.splitlines()[33]; q=chr(39); cmd=line.split(q,1)[1].split(\"; \")[1]; print(\"Remote command:\",cmd); mock=\"awk() { printf \"+q+\"argument=<%s>\\\\n\"+q+\" \\\""'$@'"\\\"; }; \"; r=subprocess.run([\"/bin/sh\",\"-c\",mock+cmd],capture_output=True,text=True); print(r.stdout,r.stderr); regs=s.split(\"REGS=\"+q,1)[1].split(q+\"\\n\",1)[0]; r=subprocess.run([\"/bin/sh\",\"-n\"],input=regs,text=True,capture_output=True); print(\"REGS syntax:\",r.returncode,r.stderr)'" in ~/nc110-baremetal
+ succeeded in 0ms:
+Remote command: awk "\$2==\"/\"{print \$1}" /proc/mounts
+argument=<$2=="/"{print $1}>
+argument=</proc/mounts>
+ 
+REGS syntax: 0 
+
+web search: 
+web search: https://github.com/torvalds/linux/blob/master/drivers/watchdog/iTCO_wdt.c
+web search: 
+web search: 'static unsigned int iTCO_wdt_get_timeleft'
+codex
+**I would fix the verdict and cleanup paths before running this on Slot A.** The basic holder design and SSH quoting are sound, but the script can return success while the original test is still armed.
+
+Reviewed both commits, the script header, and M1-RESULT.md. No files changed; no netbook commands executed.
+
+**MUST-FIX**
+
+1. **A ping interruption can produce RESET and leave a reset pending.** [Lines 65–92](~/nc110-baremetal/tools/step1-linux-wdt.sh:65)
+
+   Concrete sequence: open succeeds → network drops for five seconds → script selects RESET and removes its cleanup trap → SSH returns on the **same boot** → script prints `VERDICT RESET` and exits zero. The holder remains open until its deadline, so the actual watchdog reset can happen **after the script reports completion**.
+
+   Compare pre/post boot IDs, validate Slot A, and treat ping loss only as loss of contact. If the boot has not changed, disarm and verify cleanup before returning. A changed boot establishes a reboot; watchdog attribution still needs supporting evidence.
+
+2. **Cleanup is requested, never verified; killing the holder defeats both “self-disarming” mechanisms.** [Lines 29–30, 53–55, 74–79](~/nc110-baremetal/tools/step1-linux-wdt.sh:29)
+
+   `disarm` only touches a file. Both mechanisms depend on the same holder remaining alive and executing `printf V`. The holder has no signal traps. If killed before writing `V`, its final FD closure is unclean; the watchdog core leaves it running and sends another keepalive, potentially moving the reset later. Even a successful `close()` does not prove the driver stopped: the core’s release operation returns zero regardless. [Linux watchdog core](https://raw.githubusercontent.com/torvalds/linux/master/drivers/watchdog/watchdog_dev.c)
+
+   The SWALLOW branch removes the EXIT trap even if `disarm` fails, then unconditionally claims “TMR_HLT now set.” Require a current-run completion acknowledgement **and actual inactive/HLT readback** before claiming safe completion. Add holder cleanup for catchable signals; covering holder SIGKILL requires an independent recovery mechanism.
+
+   **Calibration:** SIGKILL of the **local script alone** normally leaves the detached remote holder alive. That is a useful safeguard: it still closes at its deadline if Linux keeps running. It does not cancel the test immediately, so the intended reset can still occur after local termination. `setsid` does not protect the holder itself from explicit signals.
+
+3. **The SWALLOW gate does not establish a complete, uninterrupted experiment.** [Lines 53–59, 77–79](~/nc110-baremetal/tools/step1-linux-wdt.sh:53)
+
+   It requires one `state=active` sample and one low `timeleft` sample anywhere in the log. It does not require successful holder startup, continued ownership, telemetry through the observation deadline, or the same boot throughout. A holder that closes early after reaching low timeleft can satisfy the gate while the machine survives because the timer was stopped.
+
+   Require an acknowledged open, timestamp the observation window from that acknowledgement, and verify holder/boot continuity through the deadline. Emit provisional wording before these checks; line 66 already announces `SWALLOW` even when the eventual verdict is VOID.
+
+   **Calibration:** an isolated open failure with no competing owner normally becomes VOID under HEAD’s added check. Ordinary competing `/dev/watchdog` opens are excluded by the kernel’s single-open enforcement. However, a racing replacement owner can supply the active/low-timeleft evidence; reaching ≤2 once does not exclude subsequent feeding. [Linux watchdog core](https://raw.githubusercontent.com/torvalds/linux/master/drivers/watchdog/watchdog_dev.c)
+
+**SHOULD-FIX**
+
+- **Validate the timing overrides.** [Lines 17–18, 54](~/nc110-baremetal/tools/step1-linux-wdt.sh:17) Require bounded positive integers and sufficient observation/cleanup margins. `HOLD_MAX < SWALLOW_AT` directly enables an early-close false SWALLOW. `HOLD_MAX` is also interpolated into remote shell source without validation. The defaults avoid that particular problem.
+
+- **Make prerequisite failures explicit.** [Lines 34–46, 53](~/nc110-baremetal/tools/step1-linux-wdt.sh:34) Missing `pidof` yields an empty value and passes; a failed FD listing can look like zero holders. Missing `setsid` or failed open disappears into `/dev/null`, while asynchronous launch still appears successful. Check required applets, fresh `nowayout=0`/identity, launch status, and the opened acknowledgement. The `pgrep` check runs **on the Mac**—appropriate only if that is intentionally where `nc110-slotlab` runs.
+
+**Sound parts and shell findings**
+
+- **No explicit `/boot` or grubenv writes.** `grub-editenv … list` and hashes are reads; marker writes target `/dev/shm`. `sync` flushes existing dirty data. A real reboot can execute the documented GRUB `save_env next_entry`, so unchanged grubenv bytes are a separate observation. I have not inspected the externally invoked `slotlab-status` implementation.
+- **SSH quoting is correct for the default numeric settings.** The remote awk receives `$2=="/"{print $1}` intact. Expanding `"$REGS"` locally does not recursively evaluate its embedded substitutions; the remote shell evaluates them.
+- **REGS has valid shell syntax.** Its arithmetic, functions and substitutions do not require remote Bash. `dd` reads ports; it does not write them. Bytewise register reads can straddle a counter update, so an isolated sample is weaker evidence than a trace.
+- **No demonstrated BusyBox incompatibility.** These are conventional applet forms, but availability/options depend on the build. The FD listing is a heuristic, not an ownership proof. `ping -t1` executes locally on macOS. [BusyBox documentation](https://busybox.net/downloads/BusyBox.html)
+- `bash -n` passed; the extracted REGS snippet passed local `sh -n`. BusyBox execution was not tested.
+
+**NIT:** “up to 5 min” excludes SSH execution/connect time, and HOLD_MAX counts loop iterations rather than elapsed seconds.
+
+**Score: 5/10 — sensible experiment structure, but unsafe completion claims and insufficient verdict validation.**
+tokens used
+42,221
+**I would fix the verdict and cleanup paths before running this on Slot A.** The basic holder design and SSH quoting are sound, but the script can return success while the original test is still armed.
+
+Reviewed both commits, the script header, and M1-RESULT.md. No files changed; no netbook commands executed.
+
+**MUST-FIX**
+
+1. **A ping interruption can produce RESET and leave a reset pending.** [Lines 65–92](~/nc110-baremetal/tools/step1-linux-wdt.sh:65)
+
+   Concrete sequence: open succeeds → network drops for five seconds → script selects RESET and removes its cleanup trap → SSH returns on the **same boot** → script prints `VERDICT RESET` and exits zero. The holder remains open until its deadline, so the actual watchdog reset can happen **after the script reports completion**.
+
+   Compare pre/post boot IDs, validate Slot A, and treat ping loss only as loss of contact. If the boot has not changed, disarm and verify cleanup before returning. A changed boot establishes a reboot; watchdog attribution still needs supporting evidence.
+
+2. **Cleanup is requested, never verified; killing the holder defeats both “self-disarming” mechanisms.** [Lines 29–30, 53–55, 74–79](~/nc110-baremetal/tools/step1-linux-wdt.sh:29)
+
+   `disarm` only touches a file. Both mechanisms depend on the same holder remaining alive and executing `printf V`. The holder has no signal traps. If killed before writing `V`, its final FD closure is unclean; the watchdog core leaves it running and sends another keepalive, potentially moving the reset later. Even a successful `close()` does not prove the driver stopped: the core’s release operation returns zero regardless. [Linux watchdog core](https://raw.githubusercontent.com/torvalds/linux/master/drivers/watchdog/watchdog_dev.c)
+
+   The SWALLOW branch removes the EXIT trap even if `disarm` fails, then unconditionally claims “TMR_HLT now set.” Require a current-run completion acknowledgement **and actual inactive/HLT readback** before claiming safe completion. Add holder cleanup for catchable signals; covering holder SIGKILL requires an independent recovery mechanism.
+
+   **Calibration:** SIGKILL of the **local script alone** normally leaves the detached remote holder alive. That is a useful safeguard: it still closes at its deadline if Linux keeps running. It does not cancel the test immediately, so the intended reset can still occur after local termination. `setsid` does not protect the holder itself from explicit signals.
+
+3. **The SWALLOW gate does not establish a complete, uninterrupted experiment.** [Lines 53–59, 77–79](~/nc110-baremetal/tools/step1-linux-wdt.sh:53)
+
+   It requires one `state=active` sample and one low `timeleft` sample anywhere in the log. It does not require successful holder startup, continued ownership, telemetry through the observation deadline, or the same boot throughout. A holder that closes early after reaching low timeleft can satisfy the gate while the machine survives because the timer was stopped.
+
+   Require an acknowledged open, timestamp the observation window from that acknowledgement, and verify holder/boot continuity through the deadline. Emit provisional wording before these checks; line 66 already announces `SWALLOW` even when the eventual verdict is VOID.
+
+   **Calibration:** an isolated open failure with no competing owner normally becomes VOID under HEAD’s added check. Ordinary competing `/dev/watchdog` opens are excluded by the kernel’s single-open enforcement. However, a racing replacement owner can supply the active/low-timeleft evidence; reaching ≤2 once does not exclude subsequent feeding. [Linux watchdog core](https://raw.githubusercontent.com/torvalds/linux/master/drivers/watchdog/watchdog_dev.c)
+
+**SHOULD-FIX**
+
+- **Validate the timing overrides.** [Lines 17–18, 54](~/nc110-baremetal/tools/step1-linux-wdt.sh:17) Require bounded positive integers and sufficient observation/cleanup margins. `HOLD_MAX < SWALLOW_AT` directly enables an early-close false SWALLOW. `HOLD_MAX` is also interpolated into remote shell source without validation. The defaults avoid that particular problem.
+
+- **Make prerequisite failures explicit.** [Lines 34–46, 53](~/nc110-baremetal/tools/step1-linux-wdt.sh:34) Missing `pidof` yields an empty value and passes; a failed FD listing can look like zero holders. Missing `setsid` or failed open disappears into `/dev/null`, while asynchronous launch still appears successful. Check required applets, fresh `nowayout=0`/identity, launch status, and the opened acknowledgement. The `pgrep` check runs **on the Mac**—appropriate only if that is intentionally where `nc110-slotlab` runs.
+
+**Sound parts and shell findings**
+
+- **No explicit `/boot` or grubenv writes.** `grub-editenv … list` and hashes are reads; marker writes target `/dev/shm`. `sync` flushes existing dirty data. A real reboot can execute the documented GRUB `save_env next_entry`, so unchanged grubenv bytes are a separate observation. I have not inspected the externally invoked `slotlab-status` implementation.
+- **SSH quoting is correct for the default numeric settings.** The remote awk receives `$2=="/"{print $1}` intact. Expanding `"$REGS"` locally does not recursively evaluate its embedded substitutions; the remote shell evaluates them.
+- **REGS has valid shell syntax.** Its arithmetic, functions and substitutions do not require remote Bash. `dd` reads ports; it does not write them. Bytewise register reads can straddle a counter update, so an isolated sample is weaker evidence than a trace.
+- **No demonstrated BusyBox incompatibility.** These are conventional applet forms, but availability/options depend on the build. The FD listing is a heuristic, not an ownership proof. `ping -t1` executes locally on macOS. [BusyBox documentation](https://busybox.net/downloads/BusyBox.html)
+- `bash -n` passed; the extracted REGS snippet passed local `sh -n`. BusyBox execution was not tested.
+
+**NIT:** “up to 5 min” excludes SSH execution/connect time, and HOLD_MAX counts loop iterations rather than elapsed seconds.
+
+**Score: 5/10 — sensible experiment structure, but unsafe completion claims and insufficient verdict validation.**

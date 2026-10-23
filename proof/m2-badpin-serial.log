@@ -1,0 +1,14 @@
+NC110 bare-metal M2: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: skipped (LPC 00:1f.0 is not ICH9 8086:2918 / NM10 8086:27bc) (result=1)
+cmdline: /private/tmp/claude-501/-Users-evnchn/4414efff-9a6f-4920-b773-131552ca86c6/scratchpad/k-badpin.elf 
+time: TSC 1011200 ticks/ms (PIT ch2 calibrated)
+nic: rtl8139 (10ec:8139) C+ mode [stand-in for RTL8101E 10ec:8136] io=0xc000 mac=52:54:00:4e:43:11
+rng: RDRAND (CPUID.1:ECX[30]=1), self-check ok
+dhcp: smoltcp lease 10.0.2.15/24 router Some(10.0.2.2)
+tcp: connecting 10.0.2.2:2223 from :53728
+tcp: connected to 10.0.2.2:2223
+ssh(a): server banner: SSH-2.0-OpenSSH_10.2
+ssh: hostkey MISMATCH: got SHA256:CuNB3VjtmuYL5Eb0958nDAjO80F6deBx8lHK2kTbRJ0 pinned SHA256:fQJRSj7YC0ttZ3MM27+Kra5YiJPxGUZv72rbNX/5kP0 -> rejecting
+ssh: stopped before (d)
+DONE

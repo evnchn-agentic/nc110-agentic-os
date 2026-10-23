@@ -1,0 +1,43 @@
+[package]
+name = "nc110-kernel"
+version = "0.1.0"
+edition = "2021"
+license = "MIT AND GPL-2.0-only AND BSD-2-Clause"
+
+[features]
+neg-control = []
+grub-armed = []
+attended = []  # NC110 with evnchn at the machine: no watchdog gate (the TCO hangs this board instead of resetting it), 0xCF9 reset after 60 s
+badpin = []  # negative control: flip one bit of the pinned host key
+badjitter = []  # negative control: constant TSC in the jitter source, startup health test must refuse SSH
+
+[dependencies]
+# M2: pinned exact versions (Cargo.lock is committed too).
+sunset = { version = "=0.6.0", default-features = false }
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "medium-ip", "proto-ipv4", "socket-tcp", "socket-dhcpv4", "socket-udp", "socket-dns", "auto-icmp-echo-reply"] }
+getrandom = { version = "0.4", default-features = false }
+log = "0.4"
+heapless = { version = "=0.9.3", default-features = false }  # M3: sunset::Pty.term is a heapless::String
+sha2 = { version = "=0.11.1", default-features = false }
+chacha20 = { version = "=0.9.1", default-features = false }  # bmctl AEAD (RFC 8439), same versions sunset already pulls in
+poly1305 = { version = "=0.9.1", default-features = false }
+# WPA2-PSK in the WiFi driver: PSK (PBKDF2-HMAC-SHA1), PTK PRF and EAPOL MIC (HMAC-SHA1), GTK unwrap (AES key wrap)
+sha1 = { version = "=0.11.0", default-features = false }
+hmac = { version = "=0.13.0", default-features = false }
+pbkdf2 = { version = "=0.13.0", default-features = false, features = ["hmac"] }
+aes = { version = "=0.9.3", default-features = false }
+# WireGuard (wg.rs): X25519; same version sunset already pulls in
+x25519-dalek = { version = "=3.0.0", default-features = false }
+
+[[bin]]
+name = "nc110-kernel"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = "s"

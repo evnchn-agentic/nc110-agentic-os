@@ -1,0 +1,167 @@
+nano-ask: model=deepseek/deepseek-v4.1-flash quota_tokens=24475 out=6000
+I reviewed the diff against the five refutation targets. Below I rely only on quoted code.
+
+---
+
+## MUST-FIX
+
+### MF-1. `console::pointer` / `cell` / `cursor` index with `Option<usize>` positions that can be `>= MAXW*MAXH` or `>= cols()*rows()`, and `corner` does arithmetic that can underflow — `cursor(0)` on the FRAMEBUFFER path can panic-free-overflow but reread stale `SHADOW`.
+
+Look at `corner`:
+
+```rust
+let at = cols() - 5;
+```
+
+`cols()` is `COLS`, which is `80` at `new()` / static init but is then set from `set_font` to `min(fb.w/f.w, MAXW)`. On the framebuffer with the **6x12 font on 1024x600**, `fb.w / f.w = 1024/6 = 170`, `min(170, MAXW=170) = 170` — fine. But `use_framebuffer`/`set_font` derive `c = (fb.w as usize / f.w).min(MAXW)`. With the 12x24 font and a framebuffer narrower than the check requires, you can get `c < 5`? No — `use_framebuffer` requires `fb.w >= 80*f.w`. But `set_font` is called again later and **recomputes** `c` with only `.min(MAXW)`, no lower bound:
+
+```rust
+let (c, r) = ((fb.w as usize / f.w).min(MAXW), (fb.h as usize / f.h).min(MAXH));
+```
+
+`resize` clamps to `clamp(20, MAXW)` on `Term`, **not** `console`. So the `console` grid `COLS` has no floor. On the real panel it is ≥80 for all three fonts, so this specific netbook is safe; still `corner`'s `cols() - 5` and `splash_shown`'s `(cols() - 58) / 2` **underflow** (usize wrap) if `cols() < 58`. With `W=1024`, 6x12 → 170, 8x16 → 128, 12x24 → 85, so not hit on the NC110. Acceptable on-target but fragile; see SHOULD.
+
+The real index bug: `menu_hit` and `mouse_step` compute `col,row`, then `console::menu_hit(col,row)` and `console::pointer(Some(row*cw + col))`. `mouse_step`:
+
+```rust
+let (x, y) = ((x0 + dx).clamp(0, cw * MX - 1), (y0 - dy).clamp(0, ch * MY - 1));
+...
+let (col, row) = ((x / MX) as usize, (y / MY) as usize);
+```
+
+This clamps into the **current** grid, so `row*cols()+col < n` — OK. But `PTR` is a static that is **never re-clamped when the grid shrinks** via `Z` (font cycle) while a session is live. `next_font()` → `set_font` → `CURSOR=None; POINTER=None; SHADOW.fill(0)`, and `COLS/ROWS` change. `PTR` is untouched. The next `mouse_step` uses the new `cw/ch`, so `x0 + dx` may be far past `cw*MX-1`; it is clamped, so `x,y` are in range and the index is fine. That one is safe.
+
+However `console::pointer` is also called from... only `mouse_step`. And `corner` calls `cell(at+i, *x)` with `at = cols()-5`, `i in 0..5` → indices `cols()-5..cols()`, which are `< cols()` only if `row==0`; `corner` writes row 0, so `at..at+5 = cols()-5..cols()` are within row 0. Safe on-target. But if `cols() < 5` (not reachable on target) → wrap. Net: **not a MUST-FIX on the NC110**, demote.
+
+### MF-1 (real MUST-FIX): `term::flush` iterates `0..t.w*t.h` and calls `console::cell(i, t.cells[i])`, where `t.w*t.h` is the `Term` grid but the console `SHADOW` and `draw` use `console::cols()`. If `Term::resize` and `console::set_font` disagree, `cell(i,...)` indexes `SHADOW[i]` with `i < MAXN` (170*50), so **no OOB**, but `draw` computes `i % cols()` — if `t.w != cols()` the visual grid and the terminal grid diverge, and cells at `i >= cols()*rows()` land on the wrong row/cell. Both are set from `console::cols()/rows()` at `term::init`, and `set_font` doesn't resize the `Term`. `Z` (font cycle) calls `console::set_font` → new `COLS/ROWS`, **but the live `Term` still has the old `w/h`**, and the next `term::flush` will do `for i in 0..t.w*t.h` with the *old* `t.w*t.h` while `console::cell`/`draw` use the *new* `cols()`. That is the bug:
+
+```rust
+// home (Z): console::next_font() ... NO term::resize
+(b'z', false) => { if let Some((c,r)) = console::next_font() { ... } }
+```
+
+and in `term::hw::flush`:
+
+```rust
+for i in 0..t.w * t.h { crate::console::cell(i, t.cells[i]); }
+crate::console::cursor(if t.cursor_on { Some(t.row * t.w + t.col.min(t.w - 1)) } else { None });
+```
+
+So after `Z` the terminal (in an active SSH session) paints with mismatched dimensions: `draw` uses `i % cols()` (new grid) for an `i` that was computed with the old `t.w`. Result: garbled terminal, cursor placed at `row*t.w+col` which the console maps via `% cols()` to a different cell. Not fatal, but this is a user-visible regression introduced by making cols runtime, and it is exactly the (3) "resize while active" class. Scenario: SSH xterm session up, user presses `Z` on home menu (or a click on the Z chip) → screen corrupts, and it also does not send SSH window-change. Because `Z` only exists when `!log_view` and home is showing... but home and an SSH session are **not** simultaneous (home loop vs session loop), so `Z` is only reachable at home with no live Term. So in practice the Term is not on screen during `Z`. Still, `term::init` is called at boot only; the ssh session path calls `term::init`? Let me not overclaim. Downgrade to SHOULD unless `term::init` is re-run. Given the code shown, `term::init()` is called once. I'll move this to SHOULD with the note.
+
+Let me reconsider the true MUST-FIXes.
+
+### MF-A. `menu_hit` uses `status_row()+4`, `splash_row()`, and `splash_shown()` indexing `SHADOW[splash_row()*cols()+x0]` where `x0=(cols()-58)/2`. On framebuffer with 6x12 (cols=170, rows=50): `splash_row() = (50-25)/2+6 = 18`, `x0=(170-58)/2=56`, index `18*170+56 = 3116 < 8500` MAXN — OK. On VGA text 80x25: `splash_row()=6`, `x0=11`, index `6*80+11=491 < 2000` — OK.
+
+But `put_center(status_row(), ...)`: `status_row() = splash_row()+9`. On a **small** grid — but `use_framebuffer` guarantees ≥80x25, and VGA is 80x25, so `splash_row()=6`, `status_row()=15`, menu row `19`, footer `rows()-1`. Fine. But note `put_center(row,...)` uses `put(row, 0, bg, &[b' '; MAXW][..cols()])` → index up to `row*cols()+cols()-1`; if `row >= rows()` this exceeds `cols()*rows()` but is still `< MAXN` only if `row*cols() < MAXN - cols()`. On 80x25 with row=24 → fine. The `splash_row()+...` are all within 25 rows. Not a bug on target.
+
+### MF-B (genuine): `mb::framebuffer` reads GRUB's multiboot1 fb fields at `info+88`, `+96`, `+100`, `+104`, `+108`, `+109`, `+112..`. In **Multiboot 1** the framebuffer fields are `framebuffer_addr` at offset **88** (u64), `pitch` at **96**, `width` at **100**, `height` at **104**, `bpp` at **108**, `type` at **109**, then the color union at **110**. The code reads color at `112` with the comment "GRUB aligns the colour union to 4: 112, not the spec's 110". If GRUB actually writes per spec at 110, then the real GRUB (the one in use) could be either. If it's 110 and you read 112, `rgb` is shifted by 2 bytes → wrong field sizes/positions → `pixel()` produces garbage colors, plausibly a black screen. This is a correctness risk depending on the exact GRUB build; it should be verified against the actual toolchain, and mismatched reads won't crash (still bounded by `bytes<=4` check in `use_framebuffer`). This is high-risk but I cannot prove it wrong; call it SHOULD with strong wording, or MUST-FIX "verify". I'll put as MUST-FIX "verify offsets against the shipping GRUB; a wrong union offset yields wrong colours, and an all-zero `rgb` gives `ch()` shifts by bogus pos/size → black/garbled but not OOB".
+
+Actually check `pixel`:
+
+```rust
+let ch = |v: u32, (pos, size): (u8, u8)| (v >> (8 - size.min(8))) << pos;
+```
+
+If `size=0`, `v >> 8` then `<< pos` where `pos` could be up to 255 → **shift by >= 32 is UB/panic in debug, and in release `<<` by ≥32 is undefined for u32**. `pos: u8` cast to u32 in `<< pos`? In Rust `u32 << u8` promotes; shift amount ≥ 32 is a panic in debug and **UB-ish/wrap** in release (Rust defines it as panic in debug; in release it's `overflow-checks` off → masking or LLVM UB). If the union offset is wrong, `(pos,size)` could be anything up to (255,255) → `<< pos` with pos up to 255. **This is a real memory-unsafe-adjacent UB path.** Quote:
+
+```rust
+fn pixel(fb: &Fb, rgb: u32) -> u32 {
+    let ch = |v: u32, (pos, size): (u8, u8)| (v >> (8 - size.min(8))) << pos;
+```
+
+`8 - size.min(8)`: if `size.min(8)` is fine, `8-...` in `0..8`, OK. But `<< pos` has **no mask**. Even with correct GRUB data, sizes/positions in 0..8 for the real 32bpp mode are fine (pos 16/8/0). For 24/16bpp GRUB modes positions could still be ≤24. But a hostile/wrong multiboot info (GRUB is trusted, but a corrupted info) → pos≥32 → UB. Given GRUB is the bootloader (trusted), and the check `bytes 2..=4` passes, the realistic failure is a wrong union offset producing garbage pos — this is the MUST-FIX: mask `pos & 31` (or `pos.min(31)`) and validate. I'll flag.
+
+### MF-C (genuine, bmctl/watchdog): `mouse_init`'s reset wait blocks in `read_byte`/`aux` with large spin counts and a 1500ms wait, called from `kbd::init()`, which is called in the **home** loop setup and possibly during boot. Look at `read_byte`:
+
+```rust
+for _ in 0..200_000 { let st = inb(STATUS); ... }
+```
+
+and `aux`:
+
+```rust
+for _ in 0..1_000_000 { if inb(STATUS) & 2 == 0 { outb(DATA, b); return read_byte(true) == Some(0xFA); } }
+```
+
+`mouse_init` sequences `aux(0xFF)` then a `while bat.is_none() && now_ms()-t < 1500` then `aux(0xF6) && ... aux(0xF2)` — **8 to 10 `aux()` calls plus the reset wait**. Each `aux` can spin up to 1M iterations of `inb` plus a 200k `read_byte`, and one nested inside the 1500ms window. If the touchpad is dead/stuck (buffer full, clock held low), each `aux` can burn its full 1M-iteration budget with **no `wdt::pet()`**. The keyboard path is also inside `kbd::init`, which runs before the main watchdog loop. If the watchdog is already armed (attended feature) and hardware WDT has a short timeout, `mouse_init` can exceed it with no petting → **board resets during boot before bmctl is even up**. This is the (1)/(5) intersection. Quote the init call:
+
+```rust
+if let Some(c) = cfg { mouse_init(c); }
+```
+
+at the end of `kbd::init()`, and `mouse_init` has no `wdt::pet()` anywhere. With `cfg` present and a mouse that doesn't ACK, worst case ~several million `inb` + 1.5s. **MUST-FIX**: pet the watchdog inside these waits, or bound the whole `mouse_init` with a single deadline, and prefer not to reset unless necessary. Also: this runs even when there's no mouse and blocks the boot long enough to matter for "no Ethernet → 5 s restart" (it eats into idle). This is the strongest finding.
+
+### MF-D (genuine, bootability): `gma::native_fb` clears the aperture by writing `(gmadr + i*4)` for `0..1024*600`:
+
+```rust
+for i in 0..(1024*600) as u64 { unsafe { core::ptr::write_volatile((gmadr + i*4) as *mut u32, 0); } }
+```
+
+`gmadr` is the **PCI BAR at 0x18** (GMADR), i.e. the PCI aperture window. It is `map`ped how? The code only calls `nic::map_uc_4k(bar + off)` for **MMADR registers**, never for `gmadr`. Clearing `gmadr` writes through the identity-mapped aperture. Is the aperture mapped cacheable/write-combining? If the identity PDE covering GMADR is not marked UC and there's **no MTRR WC**, these 2.4 MB of 4-byte volatile writes at 1024×600 go through cache and may never flush to stolen memory before the plane turns on → you may DMA stale/zero memory, or worse the writes are **posted** and the underrun check (which only reads PIPEBSTAT) passes while the plane fetches uncached garbage. More importantly: **is `gmadr` even mapped at identity 1:1?** `use_framebuffer` calls `nic::map_fb(fb.addr, ...)` **after** `native_fb` returns — but `native_fb` clears the aperture **before** `use_framebuffer`/`map_fb` runs. So the clear happens through whatever mapping exists at boot (identity 2MiB by `boot.s`/`paging`?), possibly **not present** → page fault on boot → **unbootable**. The diff does not show `gmadr` being mapped before the clear. This is the (4)/(2) blocker: **you write to the GMADR aperture before mapping it**. Even if the boot identity map covers 0..4G, the aperture may be above RAM (a real PCI hole) and not mapped → fault. MUST-FIX: map `gmadr` (UC) before clearing, and clear after the plane is set up or use the same `map_fb` path. Quote:
+
+```rust
+// Clear the first screen of the aperture before the plane shows it.
+for i in 0..(1024 * 600) as u64 { ... (gmadr + i * 4) ... }
+```
+
+Also the aperture writes are **not** done through `fb.addr`/`map_fb` first, so the "UC so pixels reach the screen" intent isn't applied to the clear.
+
+### MF-E (bootability): `restore_vga_regs` writes `0x61230 = VBIOS_PFIT` and `0x6101c = VBIOS_PIPEBSRC` on the **VGA text boot** path too:
+
+```rust
+if rd(bar,0x71180)&(1<<31)!=0 && rd(bar,0x71400)&(1<<31)!=0 { restore_vga_regs(bar); ... }
+```
+
+This only fires if a prior native kernel left plane B on. On the **GRUB chain-load text boot**, `restore_vga_if_needed` is called when `!native`. But `native = cfg!(feature="attended") && !nogma || gmafb`. For an **unattended** build without `gmafb`, `native=false` → `restore_vga_if_needed()` runs. It writes those registers based on a **different hardware instance's VBIOS values** (hard-coded `VBIOS_PFIT=0x8000_2668`). If the VBIOS on this unit set a different PFIT/PIPEBSRC (or the register is PP_STATUS as the comment itself warns: "0x61200 on gen3/4; 0x61200 is PP_STATUS"—and note `REGS` lists `0x61200 "PP_STATUS"` while `native_fb` writes `0x61230` and the comment says PFIT is at 0x61230 not 0x61200) — if the offsets are wrong you **write PP_STATUS / backlight / panel power registers** with arbitrary values. Quote:
+
+```rust
+const VBIOS_PFIT: u32 = 0x8000_2668;
+const VBIOS_PIPEBSRC: u32 = 0x027F_018F;
+fn restore_vga_regs(bar: u64) {
+    ...
+    wr(bar, 0x61230, VBIOS_PFIT);
+```
+
+Writing PP_STATUS (if it's actually 0x61230 on this silicon) can **disable backlight or power the panel off** → "screen unusable without remote recovery" if the display is the only feedback. This violates rule (b). At minimum verify the offset; do not blindly write hard-coded VBIOS values that were captured from one machine. MUST-FIX.
+
+Also `native_fb` writes `wr(bar, 0x71400, rd(bar,0x71400) | (1<<31))` to turn VGA plane off, then later `restore_vga_regs` turns it on, but there is **no path that restores VGACNTRL if `use_framebuffer` returns false** after a successful `native_fb` (plane B on, VGA plane off, but `use_framebuffer` fails on the `map_fb`/size check). Sequence in main:
+
+```rust
+if native { if let Some(fb) = gma::native_fb() { let ok = console::use_framebuffer(fb); ... } }
+```
+
+If `use_framebuffer` returns false (e.g. `nic::map_fb` refuses because aperture overlaps RAM or a PDE is split), you have already turned the VGA plane off and plane B on, but the console stays on VGA text (`use_framebuffer` returned false) → **VGA text is now invisible** (plane is off). Dead screen, no recovery without reboot. MUST-FIX: if `use_framebuffer` fails after `native_fb` succeeded, call `restore_vga_regs`. Quote main:
+
+```rust
+if let Some(fb) = gma::native_fb() { let ok = console::use_framebuffer(fb); kprintln!("gma: console on the native framebuffer: {}", ok); }
+```
+
+### MF-F (keyboard dead): `mouse_init` re-writes the controller command byte:
+
+```rust
+outb(DATA, cfg & !0x10 & !0x20 & !0x02);
+```
+
+`cfg` was read earlier while "the keyboard is paused". The comment claims bit 4 set. But this **clears bit 4 (keyboard clock disable) — good — and bit 5 (AUX clock) — good — and bit 2**. If `cfg` originally had bit 0 (keyboard interrupt) or bit 6 (translation), this write preserves them. Fine. But this is done via `cmd(0x60)`. If `cmd(0x60)` fails and the following poll times out, the command byte is **left as whatever** — but more importantly, after `mouse_init`, the code never re-enables the **keyboard interface explicitly** or re-checks. The earlier `init()` already did `cmd(0xAE)` before `mouse_init`. But `mouse_init`'s `cmd(0x60)` + `outb(DATA, ...)` sets the config; if that `outb` races the AUX reset sequence, the controller could be left with **AUX clock disabled but keyboard clock state unknown**. The bigger risk: if `cfg` had bit 4 **clear** (keyboard disabled) because the original `init` read it during a transient, the expression `cfg & !0x10` sets bit 4 = 1 → **disables the keyboard clock** ("bit 4 set" per the comment, but the mask `& !0x10` *preserves/sets* bit 4 to 1 only if it was already 1; `cfg & !0x10` **clears** bit 4). Wait: `cfg & !0x10` **clears** bit 4 (keyboard clock disable bit) → enables keyboard clock. Good. `cfg & !0x20` clears bit 5 (AUX disable) → enables AUX. `cfg & !0x02` clears bit 2. So if `cfg` bit 4 was 0 (keyboard enabled), this keeps it 0 — correct. The comment "cfg was read while init() had the keyboard paused: bit 4 set" is **contradicted** by the code intent; if bit 4 is actually set in `cfg`, then `& !0x10` fixes it to 0 (enabled). OK, that's correct, though the comment is wrong. Not a MUST-FIX.
+
+But: **`mouse_init` is called from `kbd::init` only if `cfg` is `Some`**, and at the end `init` does not verify the keyboard still works. If `aux(0xFF)` triggers the Elantech to reset and it **streams BAT bytes / interrupts** before `cmd(0xA8)`/config take effect, those bytes go to the controller and could be interpretable as keyboard scancodes by the `poll` loop (the `poll` separates by `st & 0x20`, so AUX bytes go to `aux_byte` — fine). Acceptable.
+
+Real keyboard risk: `poll` now begins with injected bytes before draining the controller:
+
+```rust
+if NINJ > 0 { ... buf[*len..*len+n]... }
+if !ENABLED { drain(); return false; }
+```
+
+`drain()` at the end of home / before sessions clears the controller, **but** `NINJ` bytes from a stale `key` bmctl inject (before a session opens) will be flushed into the **next** poll, possibly the SSH session or the home key handler, unexpectedly. Minor; SHOULD.
+
+Also `inject` does `q.len() - NINJ` — if `NINJ > q.len()` (it can't from `inject` alone since it clamps n, but `poll` decrements NINJ by `n` and `copy_within(n..NINJ)`, keeping `NINJ<=32`) — safe. `buf.len() - *len` in `poll`: if `*len > buf.len()` → underflow panic. `poll` is called with `*len` from callers; `nkeys` could exceed? At home `k[n]` with `n<k.len()`; session passes `&mut keys[..]`. Likely fine but `buf.len() - *len` is an unchecked subtraction — SHOULD: use `buf.len().saturating_sub(*len)`.
+
+---
+
+## SHOULD
+
+- **S1. `console::cell`/`cell_get`/`draw` take a bare `i` with no bound check**, and `term::flush` indexes `t.cells[i]` for `i in 0..t.w*t.h` while `draw` uses `i % cols()`. If `t.w != cols()` (post-`Z` font change, or if `set_font` ever computes a different `c` than the `Term`), the grid maps wrong and `cursor(Some(t.row*t.w+col))` (old width) points at a different console cell. Add a debug assert / derive console grid from `Term`. (Refutes (2) partially: not OOB because `i < MAXN`, but the **visual** desync is real and the cursor underlines the wrong cell.)
+
+- **S2. `p

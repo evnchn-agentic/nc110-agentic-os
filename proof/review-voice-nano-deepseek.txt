@@ -1,0 +1,155 @@
+nano-ask: model=deepseek/deepseek-v4.1-flash quota_tokens=14769 out=4171
+## MUST-FIX
+
+### M1. `hda::poll` is called **once per `Ctl::step`**, but `step` also `delay_ms`-blocks and the ring only holds ~340 ms → guaranteed overrun + permanent desync
+
+`hda::poll(t)` runs at the top of `step`. But `poll` only advances `LAST_POS` up to `pos` once — and `step` is not called on a fixed cadence (it has an `idle_ms` deadline, footer deadline, and commands that take time). More critically, the drain loop:
+
+```rust
+let pos = (h.r32(SD + 0x04) as usize & !3) % RING;
+while LAST_POS != pos && CLIP_LEN < CLIP_MAX {
+    ...
+    LAST_POS = (LAST_POS + 4) % RING;
+}
+```
+
+has **no overrun detection**. The hardware LPIB wraps the 64 KiB ring. If more than `RING` bytes are produced between two `poll` calls (i.e. any stall > ~340 ms: a `syn`/`lcom` command, the `say` path, a long authenticated command reply, or simply `step` being called late), the NIC/HDA has lapped the reader. `LAST_POS != pos` is then true, the loop copies *stale/overwritten* ring bytes and, on the next poll, `pos` may already be ahead again — the reader silently trails forever and records garbage interleaved with real audio, with no error surfaced. The header comment asserts "the ring holds ~340 ms" as if that bounds the gap, but nothing enforces that `poll` runs faster than that. Contrast with the watchdog discipline elsewhere in this kernel (pet-on-progress): here the capture path has no equivalent guard.
+
+Concrete failing scenario: pull-to-talk on, user types `rec`/`lcom` or the Mac issues `aud`, `step` blocks in the encrypted reply; >340 ms elapse; `poll` laps; the clip is corrupted and `PEAK`/`clip_bytes` still report success.
+
+Fix: track producer/consumer with the half/full-ring semantics HDA already provides (`SD_STS` BCIS/FIFO error bits, or a `CBL`-based write position), detect `pos` crossing `LAST_POS` more than the ring, drop the clip, and surface it.
+
+### M2. `map_uc_4k` reuses an already-split PDE it does not own, and *only* for `UC_USED` bookkeeping — the boot page tables case is real
+
+```rust
+let pt: &mut Pt = if old & (1 << 7) == 0 {
+    &mut *((old & !0xFFF) as *mut Pt) // already split: one of ours
+} else {
+    ...
+    let pt = &mut (*addr_of_mut!(UC_PT))[UC_USED];
+    UC_USED += 1;
+    ...
+};
+pt.0[((base >> 12) & 0x1FF) as usize] |= (1 << 4) | (1 << 3);
+write_volatile(pde, (pt as *const Pt as u64) | 0x3);
+```
+
+The comment says "already split: one of ours", but the code cannot verify that. A boot-page-table (or any firmware/GRUB-created) PDE with `PS=0` pointing at a page table that is **not one of our `UC_PT` slots** is indistinguishable from a prior `map_uc_4k` call. In that case:
+
+- the code indexes into a foreign table and sets `PCD|PWT` on a PTE that belongs to something else (e.g. MMIO that must stay cached, or a DMA buffer), and
+- it *overwrites the PDE* with `(pt | 0x3)` where `pt` is the foreign table address — dropping the original PDE flags (US, PWT, PCD, and especially the US bit) to a bare `present|rw`.
+
+Even in the benign "already one of ours" case, the superscript `(pt as *const Pt as u64) | 0x3` unconditionally rewrites the PDE flags to `0x3`, so the first call's `flags` (PWT/PCD from the original PDE) are lost on the second colliding call — the PTE keeps them, but if anything later walks the PDE it sees `present|rw` only. More importantly, `NUM`/`membar` case: two different `map_uc_4k` calls whose 2 MiB regions collide (e.g. HD Audio BAR and NIC register window on the same 2 MiB PDE) share a table, which is the intended design, but the **`UC_USED` counter is incremented on the `else` branch even though the collision branch never decrements or reuses** — fine — the real bug is the unverifiable `PS==0` assumption.
+
+Minimal correct fix: tag our tables (reserve a known array, or store an ownership page/sentinel), and if `old & 1` (present) and `PS==0` and the table isn't ours, **bail (`return false`) rather than mutate** — the early `map_uc_4k(bar)` in `hda::probe` returning `false` is already handled gracefully.
+
+Also note in `hda::probe`:
+
+```rust
+let Some((bar, _)) = pci::first_mem_bar(b) else { ... };
+...
+if !nic::map_uc_4k(bar) {
+    kprintln!("hda: no free UC page table");
+    return;
+}
+```
+
+`map_uc_4k` is fine to call for HDA, **but** the HDA BAR page and the NIC BAR page can land in the same 2 MiB region on this chipset; if the *first* caller split the PDE, the second call hits the `PS==0` branch — which is where M2's unverified ownership bites. The NIC already mapped its table earlier in `kmain` (`nic::probe` runs before... actually per the diff order: `hda::probe` runs in `kmain` before `nic::probe`, so HDA is the *first* splitter for its region — same reasoning holds for any later split in that region).
+
+### M3. `hda::poll` can stop the recording from inside `Ctl::step`, and `rec_stop` writes `REC_UNTIL=None` while `poll` is iterating — but `poll` re-reads `REC_UNTIL` only at entry
+
+```rust
+let (Some(h), Some(until)) = (DEV, REC_UNTIL) else { return };
+...
+if now >= until || CLIP_LEN >= CLIP_MAX {
+    rec_stop();
+    ...
+}
+```
+
+`rec_stop` does `REC_UNTIL = None` and `h.w8(SD, 0)`. That's a single `poll` invocation, so no re-entry — but `rec_stop` is `pub` and is also reachable from `ptt_toggle` (F12). F12 is processed in `ssh.rs`/`home`, **not** from inside `poll`, so no concurrent mutation. However: `poll` computes `pos` *once* and then jumps `LAST_POS` to it, draining the whole lap. If `CLIP_LEN` hits `CLIP_MAX` mid-loop (16 000×30 = 480 000 samples), the loop stops mid-drain (correct), but `LAST_POS` is left partway — fine since recording stops. This is a `SHOULD` note about the missing lap guard, folded into M1.
+
+## SHOULD
+
+### S1. `wdt::arm_probe` no longer waits long enough to distinguish "timer running" from "we misread"
+
+```rust
+let mut c1 = c0;
+for _ in 0..130 {
+    delay_ms(10);
+    c1 = inw(b) & 0x3FF;
+    if c1 != c0 { break; }
+}
+```
+
+The comment claims "same bound" (1300 ms) and the observation "drops every 0.6 s". But a count granularity of 0.6 s means the first change can legitimately occur as late as ~0.6 s after `c0` was read — the loop bounds at 1.3 s, so it *should* catch it. The real regression risk: if `c0` was read just after the timer reloaded and `TMR`/reload is not exactly 0.6 s (this is a probe; you may be running on the NM10's actual TCO period, not the assumed one), 1.3 s can see zero change while the timer *is* running, producing a false `NOT ARMED`. Under rule (a) a false negative here means the board may not get the self-reset path → **this is the one place I'd upgrade**. The old fixed `delay_ms(1300)` had identical semantics, so it's not a *new* regression — but the tightened (comment-only) claim "proving the timer runs" is weaker than before because there is no second-confirmation sample. Add a second window or check `TMR`/`TCO1_STS` to prove liveness independent of period.
+
+### S2. TCO probe `wdt::pet()` inside the widget dump (`hda::probe` → `dump` loop) is fine *only if* bmctl is not yet running
+
+```rust
+for nid in ... {
+    wdt::pet();
+    ...
+    let e = h.verb(cad, nid, 0xF02 << 8 | i as u32)...;
+```
+
+`probe` runs from `kmain` before `bmctl` is up, so petting is legitimate there. But `hdadump` (bmctl command) calls `crate::hda::dump()` → `hda::dump` calls `hda::poll`? No — `dump` does not pet. Good. However `hda::probe`'s widget loop pets **unboundedly** (`sub` widget count from codec, iterated with `wdt::pet()` each iteration) and each `verb` spins up to 1000×100 spin loops with no pet inside the inner wait. On a hostile/buggy codec that reports a huge widget count, `probe` can run for a long time petting the watchdog — *during `kmain`, before bmctl*. Since bmctl isn't served yet, this is not a rule-(a) violation, but it is a "new path that pets the watchdog" (none — probe pets, but the timer is armed by GRUB before `kmain`, so petting during `kmain` *does* extend the deadline without bmctl). That matters: if the codec stalls `probe`, the whole boot stalls while the WDT is being petted, so the reset escape hatch is defeated. Bound the widget iteration count / drop `wdt::pet()` from the dump path.
+
+### S3. `say` / `type` abuse — acceptable *relative to* authenticated peer, but `say` has no length bound
+
+```rust
+"say" => {
+    console::status(cmd.splitn(2, ' ').nth(1).unwrap_or(""));
+```
+
+`type` bounds to 1024 (`TYPED`), `say` does not: `console::status` receives an arbitrary-length slice from the authenticated command. Given the threat model ("an authenticated peer can already do much more"), this is not a new capability — but a 4-digit-NUL/over-long `say` could overflow whatever `status`/`put` does. Verify `console::status` clamps to `W`. If it doesn't, this is a MUST.
+
+### S4. t7 GRUB: `rdmsr 0x10` is **outside** the `if [ "$wdt_ok" = "yes" ]` guard for `nc110_tsc0`
+
+```sh
+insmod rdmsr
+rdmsr 0x10 -v nc110_tsc0
+...
+if [ \"\$wdt_ok\" = \"yes\" ]; then
+  rdmsr 0x10 -v nc110_tsc1
+  if multiboot /baremetal/$KN bmctl grubtsc=\${nc110_tsc0},\${nc110_tsc1}; then
+```
+
+If `rdmsr` is missing on the target GRUB build (`insmod rdmsr` fails silently or aborts the entry), or `rdmsr 0x10` faults on a CPU/GRUB combo where MSR 0x10 isn't readable, GRUB behavior on a failed `rdmsr` (it prints an error but **does not abort the menuentry** by default in most builds — `-v` stores whatever). Then `\${nc110_tsc0}` expands to an empty string, and the kernel gets `grubtsc=,` — harmless *in the kernel* (`from_str_radix` fails, the whole `grubtsc` block is skipped). So the netbook still boots. **However**: this is a single `menuentry`; if `insmod rdmsr` ever *does* abort (or if `rdmsr` is a builtin that errors fatally on some GRUB), the entry dies and — per rule (b) — you must ensure a fallback entry exists. The installer's `--set-default`/`saved_entry` logic now matches `t[0-9][0-9]*`:
+
+```sh
+E=$(S "grep -o '^menuentry \"nc110-bm-agentos-t[0-9][0-9]*-$2\"' /boot/grub/grub.cfg | tail -1 | cut -d'\"' -f2")
+```
+
+This is a **behavior change**: `t[0-9]*` → `t[0-9][0-9]*` now requires **two** digits, so `t6` (single digit) is no longer matched by `--set-default`. If a board is mid-upgrade (grub.cfg has both `t6-…` and `t7-…`), or if the digit-2 assumption is wrong for any future tag, `--set-default` silently picks the wrong entry or none. `grep -o` + `tail -1` picks the *last* match, which is fragile across GRUB's ordering. Confirm the fallback entry (t6) is still present and still the `saved_entry` fallback; if the only reason t6 exists was single-digit matching and it's now excluded, this can leave no valid default after a t7 install failure.
+
+### S5. `phy_reset` return value discarded in the keep-fallback path
+
+```rust
+if keep && st & R::LINK_STATUS == 0 {
+    kprintln!("nic: no link 1 s after keeping the PHY: resetting it after all");
+    self.phy_reset()?;
+    st = wait_link(5000);
+}
+```
+
+The `?` propagates, good. But the *primary* keep path relies on `keep` being read **before** `self.reset()`:
+
+```rust
+let keep = unsafe { self.bus.r8(r.phystatus) } & R::LINK_STATUS != 0 && unsafe { !FORCE_PHY_RESET };
+self.reset()?;
+```
+
+`self.reset()` reinitializes the MAC, and on r8169 the PHY may or may not survive. The 1 s fallback covers the "link was lost" case, and the 5 s re-check covers it, so correctness is preserved — but note the failure mode where `keep` is true (link was up), `reset()` clears link, 1 s elapses, `phy_reset()` is called, and **then** `st` is reported from a 5 s wait. That's fine. The one real gap: `phy_reset` returns `Err` on a 500 ms self-clear timeout, and that propagates out of `init_8101e` → NIC init fails → per the existing code path, no link → chip stopped. That's the correct conservative behavior. No MUST here; the ordering is sound.
+
+## NIT
+
+- `hda.rs` line: `if codecs & 1 == 0 || h.param(0, 0, 0x00) != Some(0x10ec_0269)` — hard-codes codec check *after* the dump loop ran `wdt::pet()` many times; fine but the `!=` against `Some(...)` means `None` (verb timeout) also bails, which is intended.
+- `clippy`: `for (i, x) in c.iter_mut().enumerate()` in `console::corner` — fine. The removed `let _ = i;` in `Console::write` is a pure cleanup, no semantic change.
+- `nc110-voice.py`: `st[:1] != ["clip"]` and `f[5] == "1"` index by fixed positions of the `aud` status string; any wording change in `format_args!("clip {} bytes {} recording {} peak {} ...")` silently breaks parsing. Fragile but not a kernel bug.
+- `tools/nc110-voice.py` writes clips under `proof/voice` only with `--keep`; otherwise `tempfile.mkdtemp()` — good, respects rule (c). But `bm("type", text)` sends transcript back over bmctl — correct channel.
+- `hda::probe` sets `pci::write32(b, 0x44, pci::read32(b, 0x44) & !7)` — clearing TCSEL TC bits. This is a `write32` of the *same* register Linux does (`azx_init_pci`), but it's done once at probe, not re-applied; if anything else in the system re-writes TCSEL, LPIB freezes again. Acceptable given priorities.
+
+## Verdict
+
+**5/10.** The two MUST-FIX items are real: the capture ring has no lap/overrun detection (M1) — a long blocking `step` corrupts the clip silently — and `map_uc_4k` mutates a page table it can't prove it owns (M2), which on a machine whose whole premise is "switching PDE attributes used to brick things" is the highest-consequence defect in the diff. The watchdog/GRUB/PHY paths are, on inspection, conservative and mostly correct (S1's tighter claim and S4's t6-matching change are the notable soft spots, not clean breaks). Nothing in the new paths pets the watchdog while bmctl is live except the pre-bmctl `kmain` probe, which is bounded-duration in practice but not in code (S2).

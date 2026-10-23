@@ -1,0 +1,11 @@
+NC110 bare-metal M2.5: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: skipped (LPC 00:1f.0 is not ICH9 8086:2918 / NM10 8086:27bc) (result=1)
+keymod: client key from module 0 at 0x398000 (72 B), public key verified, module wiped
+cmdline: target/badjitter/x86_64-unknown-none/release/nc110-kernel 
+time: TSC 999000 ticks/ms (PIT ch2 calibrated)
+nic: rtl8139 C+ (10ec:8139) at 00:03.0 io=0xc000 mac=52:54:00:4e:43:11
+rng: TSC never advanced in 100000 reads (dead timer?)
+rng: TSC granularity 1 ticks, sample window 32768 ticks
+rng: jitter startup health test FAILED (repetition count) -> refusing to run SSH
+DONE

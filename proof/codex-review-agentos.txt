@@ -1,0 +1,1684 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a14f87-e9f2-7771-ac82-ec64eb8f6226
+--------
+user
+Calibrated adversarial review: the NC110 netbook now boots a bare-metal 'agent OS' by DEFAULT (GRUB saved_entry), with Linux as a manual fallback (hold Shift at POST -> GRUB menu). Review tools/nc110-install-agentos.sh (git log -3 -- tools/nc110-install-agentos.sh; its generated entry: tools/nc110-install-agentos.sh --print-entry target/attended/x86_64-unknown-none/release/nc110-kernel), grub-test/nc110-grubarm-func.cfg, grub-test/tco-arm.cfg, proof/nc110-agentos-default.md, and the kernel's recovery paths (src/main.rs attended flow, src/bmctl.rs idle reset, src/loader.rs). evnchn's requirement: the agent provisioning channel must not break; anything that leaves the box stuck in a way that is NOT remotely recoverable needs his hands, so find those. Attack: (1) every boot path from power-on: GRUB arm fails, kernel missing, key module missing/corrupt, NIC init fails, DHCP fails, bmctl never answers, the kernel hangs before/after arming, a network-loaded kernel that pets forever without bmctl; (2) GRUB save_env semantics (grubenv on ext2 /boot, what if save_env fails), boot loops (e.g. TCO reset during GRUB before the menu, keystatus Shift reachability), and whether a reset loop can wear anything; (3) the 10-min idle reset as a self-heal for wedged NICs; (4) what still needs Linux (updating the netloader kernel on /boot) and whether the remote path to Linux is adequate. Tier MUST-FIX/SHOULD-FIX/NIT, signal over volume. Do not edit. End 0-10 for 'provisioning channel cannot break without needing hands'.
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll trace the boot and recovery paths, check the GRUB persistence assumptions, and rank the cases that could leave provisioning dependent on physical access. I won’t edit files.
+exec
+/bin/zsh -lc "pwd; rg --files -g AGENTS.md -g '*grub*' -g '*tco*' -g 'main.rs' -g 'bmctl.rs' -g 'loader.rs' -g 'nc110-agentos-default.md' -g 'nc110-install-agentos.sh'" in ~/nc110-baremetal
+ succeeded in 0ms:
+~/nc110-baremetal
+src/loader.rs
+src/main.rs
+src/bmctl.rs
+tools/nc110-install-agentos.sh
+proof/nc110-agentos-default.md
+proof/wdt-grub-badrcba.log
+proof/wdt-grub-locked-accept.trace.txt
+proof/m25-grub-keymod-serial.log
+proof/attended-q35-grub-serial.log
+proof/wdt-grub-locked-accept.log
+proof/wdt-grub.log
+proof/wdt-grub-locked-refuse.log
+grub-test/nc110-grubarm-func.cfg
+grub-test/keymod-iso/boot/grub/grub.cfg
+grub-test/iso/boot/grub/grub.cfg
+grub-test/iso/boot/grub/tco-arm.cfg
+grub-test/tco-arm.cfg
+
+exec
+/bin/zsh -lc 'git log -3 -- tools/nc110-install-agentos.sh; cat tools/nc110-install-agentos.sh; cat grub-test/nc110-grubarm-func.cfg; cat grub-test/tco-arm.cfg; cat proof/nc110-agentos-default.md' in ~/nc110-baremetal
+ succeeded in 0ms:
+commit b0a10788bf110f1c41d9ae614350c0360ae4c0a0
+Author: evnchn <user1@example.invalid>
+Date:   Sun Oct 18 23:00:19 2026 +0800
+
+    agent OS template t2: fallback leaves nc110_fallback=<sha8> in grubenv; key size check on macOS
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+commit 45a4c58697a7750809fbcc9bd2c35b43129fe1e0
+Author: evnchn <user1@example.invalid>
+Date:   Sun Oct 18 22:53:09 2026 +0800
+
+    agent OS: tools/nc110-install-agentos.sh (versioned nc110-bm-agentos-<sha8> entry: GRUB-armed, any GRUB-side failure -> next_entry=0 one Linux boot; dedicated key ~/.nc110/agentos.key outside the repo; --set-default backs up grubenv; --print-entry for rehearsal); bmctl.py defaults to the agent-OS key; q35 GRUB 2.14 rehearsal: boots + answers with agent-OS key, test key rejected, missing kernel takes the fallback branch
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+#!/usr/bin/env bash
+# Install a kernel as an agent-OS version on the NC110 (run while Slot A Linux is up). Adds ONE new entry
+# "nc110-bm-agentos-<sha8>" (never edits an existing one), copies /baremetal/k-agentos-<sha8>.elf and the agent-OS
+# key module (~/.nc110/agentos.key -> /baremetal/nc110-agentos.key). Does NOT change the default: that is
+#   tools/nc110-install-agentos.sh --set-default <sha8>     (backs up grubenv first)
+# Entry behaviour: GRUB arms the TCO (nc110_tco_consts, lock_mode=accept), then multiboot + module + boot. ANY
+# GRUB-side failure (arming refused, kernel or module missing) sets next_entry=0 and reboots: one boot of Slot A
+# Linux instead of a loop, and leaves the breadcrumb nc110_fallback=<sha8> in grubenv (read it from Linux). Manual fallback any time: hold Shift through POST -> GRUB menu -> "Alpine NC110 ...".
+set -u
+cd "$(dirname "$0")/.."
+S() { ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o LogLevel=ERROR -i "$HOME/.ssh/id_ed25519_homelab" root@192.168.50.118 "$@"; }
+SC() { scp -q -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+  -i "$HOME/.ssh/id_ed25519_homelab" "$@"; }
+gen_entry() {  # $1 sha8 -> the exact menuentry text (also printed by --print-entry for the q35 rehearsal)
+  local H=$1 E="nc110-bm-agentos-t2-$1" KN="k-agentos-$1.elf"   # t2: template 2 (fallback breadcrumb)
+  ENTRY="menuentry \"$E\" {
+    insmod ext2
+    search --no-floppy --fs-uuid --set=root c0954bc7-86a0-440c-8401-2c3e95549743
+    terminal_output console
+    set gfxpayload=text
+    insmod multiboot
+    nc110_tco_consts
+    tco_arm
+    if [ \"\$wdt_ok\" = \"yes\" ]; then
+      echo \"nc110-agentos $H: TCO armed by GRUB, loading /baremetal/$KN\"
+      if multiboot /baremetal/$KN bmctl; then
+        if module /baremetal/nc110-agentos.key; then
+          boot
+        fi
+      fi
+      echo \"nc110-agentos $H: kernel or key module failed to load\"
+    else
+      echo \"nc110-agentos $H: GRUB did NOT arm the TCO\"
+    fi
+    echo \"nc110-agentos: one boot of Slot A Linux instead (next_entry=0)\"
+    set next_entry=0
+    set nc110_fallback=$H
+    save_env next_entry nc110_fallback
+    sleep 5
+    reboot
+  }"
+}
+if [ "${1:-}" = "--print-entry" ]; then
+  gen_entry "$(shasum -a 256 "$2" | cut -c1-8)"; printf '%s\n' "$ENTRY"; exit 0
+fi
+st=$(S 'hostname; awk "\$2==\"/\"{print \$1}" /proc/mounts') || { echo "Slot A not reachable"; exit 2; }
+grep -qx nc110 <<<"$st" && grep -qx /dev/sda2 <<<"$st" || { echo "not on Slot A: STOP"; exit 2; }
+T=$(date -u +%Y%m%dT%H%M%SZ)
+if [ "${1:-}" = "--set-default" ]; then
+  E="nc110-bm-agentos-t2-$2"
+  S "grep -q '^menuentry \"$E\"' /boot/grub/grub.cfg" || { echo "no entry $E"; exit 2; }
+  S "cp -p /boot/grub/grubenv /boot/grub/grubenv.bak-agentos-$T && grub-editenv /boot/grub/grubenv set saved_entry='$E' && sync && grub-editenv /boot/grub/grubenv list"
+  exit $?
+fi
+K=${1:?kernel path}; KEY=$HOME/.nc110/agentos.key
+[ "$(wc -c <"$KEY" | tr -d " ")" = 72 ] || { echo "agent-OS key missing/bad"; exit 2; }
+H=$(shasum -a 256 "$K" | cut -c1-8); E="nc110-bm-agentos-t2-$H"; KN=k-agentos-$H.elf
+S "grep -q '^menuentry \"$E\"' /boot/grub/grub.cfg" && { echo "$E already installed"; exit 0; }
+S "grep -q '^function nc110_tco_consts' /boot/grub/grub.cfg" || { echo "GRUB arming function missing"; exit 2; }
+gen_entry "$H"
+BK=/boot/grub/grub.cfg.bak-nc110bm-$T
+S "cp -p /boot/grub/grub.cfg $BK" || exit 2
+S "[ -e /boot/baremetal/$KN ]" || SC "$K" "root@192.168.50.118:/boot/baremetal/$KN" || exit 2
+SC "$KEY" root@192.168.50.118:/boot/baremetal/nc110-agentos.key && S "chmod 600 /boot/baremetal/nc110-agentos.key" || exit 2
+printf '%s\n' "$ENTRY" | S "cat >> /boot/grub/grub.cfg" || { S "cp -p $BK /boot/grub/grub.cfg"; exit 2; }
+ESHA=$(printf '%s\n' "$ENTRY" | shasum -a 256 | cut -c1-64); ELEN=$(printf '%s\n' "$ENTRY" | wc -c | tr -d ' ')
+v=$(S "sync; sha256sum /boot/baremetal/$KN | cut -c1-64; sha256sum /boot/baremetal/nc110-agentos.key | cut -c1-64; head -c \$(stat -c %s $BK) /boot/grub/grub.cfg | sha256sum | cut -c1-64; sha256sum $BK | cut -c1-64; tail -c $ELEN /boot/grub/grub.cfg | sha256sum | cut -c1-64; grub-script-check /boot/grub/grub.cfg && echo check-ok")
+mapfile -t vv <<<"$v"
+[ "${vv[0]}" = "$(shasum -a 256 "$K" | cut -c1-64)" ] && [ "${vv[1]}" = "$(shasum -a 256 "$KEY" | cut -c1-64)" ] && [ "${vv[2]}" = "${vv[3]}" ] \
+  && [ "${vv[4]}" = "$ESHA" ] && [ "${vv[5]:-}" = check-ok ] || { echo "verify FAILED, restoring grub.cfg"; S "cp -p $BK /boot/grub/grub.cfg; sync"; exit 2; }
+echo "installed $E (default unchanged). Test once: next_entry=$E; make default: $0 --set-default $H"
+# Appended once to the NC110 grub.cfg (2026-10-18). Defines the GRUB-side TCO arming used by nc110-bm-* entries
+# made with GRUBARM=1. lock_mode=accept: the NC110 BIOS sets TCO_LOCK=1/TCO_EN=1; the gate in m1-nc110-entry.cfg
+# ("only after a reset at ~2x heartbeat on THIS board") is met by k5/k6/k9 on 2026-10-17: the same register state
+# (NO_REBOOT cleared, TCO_EN left set, TMR programmed, timer running) reset the board unaided 60 s after a hang.
+function nc110_tco_consts {
+  insmod iorw
+  insmod memrw
+  insmod setpci
+  insmod regexp
+  search --no-floppy --fs-uuid --set=root c0954bc7-86a0-440c-8401-2c3e95549743
+  source /baremetal/tco-arm.cfg
+  set lpc_expect=27bc8086
+  set pmbase_expect=1001
+  set rcba_expect=fed1c001
+  set gcs_addr=0xfed1f410
+  set smi_en=0x1030
+  set tco_rld=0x1060
+  set tco1_sts=0x1064
+  set tco2_sts=0x1066
+  set tco1_cnt=0x1068
+  set tco_tmr=0x1072
+  set tmr_val=0x64
+  set tmr_re='^([0-9a-f]*[048c])?64$'
+  set lock_mode=accept
+}
+# Shared iTCO v2 arm + verify for GRUB 2 (needs insmod iorw memrw setpci regexp). Used verbatim by the QEMU
+# rehearsal (grub-test/iso/boot/grub/grub.cfg) and the proposed NC110 entry (grub-test/m1-nc110-entry.cfg).
+# Caller sets: lpc_expect pmbase_expect rcba_expect gcs_addr smi_en tco_rld tco1_sts tco2_sts tco1_cnt tco_tmr
+#              tmr_val tmr_re. GRUB prints values as %x (lowercase, no 0x, no padding); bit tests are regexps.
+# Optional caller override: lock_mode (default refuse, set below). Callers source this file FIRST, then set it.
+#   Policy is consumed per call: tco_arm resets lock_mode to refuse first thing, so set it before EACH call.
+#   refuse : TCO_LOCK set -> do not arm (the original M1 design: it needs SMI_EN.TCO_EN cleared).
+#   accept : TCO_LOCK set -> arm anyway, preserving TCO_LOCK and never writing SMI_EN: TCO_EN is not checked, so the
+#            first timeout raises an SMI to the firmware and the reset relies on the second timeout. Only valid
+#            once a hardware test showed this firmware's SMI handler does NOT swallow the timeout (NC110 step 1).
+#            Linux iTCO_wdt does the same on v2 by default (turn_SMI_watchdog_clear_off=1 < version 2).
+set lock_mode=refuse
+# tco_arm sets wdt_ok=yes ONLY if every live predicate holds. The caller must boot only inside that branch.
+
+# Bit predicates on %x strings:
+#   GCS bit 5 (NO_REBOOT) clear      : nibble 1 in {0,1,4,5,8,9,c,d}
+#   TCO1_CNT bit 11 (TMR_HLT) clear  : nibble 2 < 8
+#   TCO1_CNT bit 12 (TCO_LOCK) clear : nibble 3 even
+#   SMI_EN bit 13 (TCO_EN) clear     : nibble 3 in {0,1,4,5,8,9,c,d}
+set re_noreboot_clear='^([0-9a-f]|[0-9a-f]*[014589cd][0-9a-f])$'
+set re_hlt_clear='^([0-9a-f]{1,2}|[0-7][0-9a-f]{2}|[0-9a-f]*[0-9a-f][0-7][0-9a-f]{2})$'
+set re_lock_clear='^([0-9a-f]{1,3}|[0-9a-f]*[02468ace][0-9a-f]{3})$'
+set re_tcoen_clear='^([0-9a-f]{1,3}|[0-9a-f]*[014589cd][0-9a-f]{3})$'
+set re_hex16='^[0-9a-f]{1,4}$'
+
+function tco_re_check {
+  # $1 = regexp, $2 = value, $3 = expected (yes/no). Sets re_bad=yes on a wrong answer.
+  if regexp "$1" "$2"; then set got=yes; else set got=no; fi
+  if [ "$got" != "$3" ]; then echo "wdt: selftest FAILED: $2 vs $1 gave $got"; set re_bad=yes; fi
+}
+
+function tco_selftest {
+  # Proves THIS GRUB's regexp/test behave as the predicates assume, before they guard anything.
+  set re_bad=no
+  tco_re_check "$re_noreboot_clear" "0" yes
+  tco_re_check "$re_noreboot_clear" "fed1f401" yes
+  tco_re_check "$re_noreboot_clear" "20" no
+  tco_re_check "$re_noreboot_clear" "fed1f421" no
+  tco_re_check "$re_hlt_clear" "0" yes
+  tco_re_check "$re_hlt_clear" "1200" yes
+  tco_re_check "$re_hlt_clear" "800" no
+  tco_re_check "$re_hlt_clear" "1a00" no
+  tco_re_check "$re_lock_clear" "800" yes
+  tco_re_check "$re_lock_clear" "2000" yes
+  tco_re_check "$re_lock_clear" "1000" no
+  tco_re_check "$re_lock_clear" "3800" no
+  tco_re_check "$re_tcoen_clear" "21" yes
+  tco_re_check "$re_tcoen_clear" "1021" yes
+  tco_re_check "$re_tcoen_clear" "2021" no
+  tco_re_check "$re_tcoen_clear" "f021" no
+  tco_re_check "$re_hex16" "1000" yes
+  tco_re_check "$re_hex16" "unset" no
+  tco_re_check "$re_hex16" "11000" no
+  tco_re_check '^5$' "5" yes
+  tco_re_check '^5$' "4005" no
+  if [ "a" != "a" -o "b" != "c" ]; then set got=yes; else set got=no; fi
+  if [ "$got" != "yes" ]; then echo "wdt: selftest FAILED: test -o"; set re_bad=yes; fi
+  if [ "$re_bad" = "no" ]; then echo "wdt: selftest OK (21 regexp cases + test -o)"; fi
+}
+
+function tco_arm {
+  set wdt_ok=no
+  set tco_mode="$lock_mode"
+  set lock_mode=refuse
+  tco_selftest
+  if [ "$re_bad" != "no" ]; then echo "wdt: GRUB predicates untrustworthy, NOT arming"; return 1; fi
+  set lpcid=unset; set pmbase=unset; set rcba=unset
+  setpci -s 00:1f.0 -v lpcid 0.l
+  setpci -s 00:1f.0 -v pmbase 40.l
+  setpci -s 00:1f.0 -v rcba f0.l
+  echo "wdt: lpcid=$lpcid pmbase=$pmbase rcba=$rcba"
+  if [ "$lpcid" != "$lpc_expect" -o "$pmbase" != "$pmbase_expect" -o "$rcba" != "$rcba_expect" ]; then
+    echo "wdt: chipset mismatch, NOT arming"; return 1
+  fi
+  set cntpre=unset; set sts2pre=unset; set gcspre=unset
+  inw -v cntpre $tco1_cnt
+  inw -v sts2pre $tco2_sts
+  read_dword -v gcspre $gcs_addr
+  echo "wdt: before: GCS=$gcspre TCO1_CNT=$cntpre TCO2_STS=$sts2pre (6 = last reset was the watchdog)"
+  if regexp "$re_hex16" "$cntpre"; then true; else echo "wdt: TCO1_CNT read invalid ($cntpre), NOT arming"; return 1; fi
+  if regexp "$re_lock_clear" "$cntpre"; then set tco_locked=no; else set tco_locked=yes; fi
+  if [ "$tco_locked" = "yes" ]; then
+    if [ "$tco_mode" != "accept" ]; then echo "wdt: TCO_LOCK set, NOT arming (lock_mode=$tco_mode)"; return 1; fi
+    echo "wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to firmware SMI, reset on 2nd"
+  fi
+  write_dword $gcs_addr 0 0x20       # GCS: clear NO_REBOOT (bit 5), masked RMW
+  if [ "$tco_locked" = "no" ]; then
+    outl $smi_en 0 0x2000            # SMI_EN: clear TCO_EN (bit 13), masked RMW; locked: never written
+  fi
+  outw $tco1_sts 0x0008              # TCO1_STS: clear TIMEOUT (RW1C)
+  outw $tco2_sts 0x0002              # TCO2_STS: clear SECOND_TO_STS first ...
+  outw $tco2_sts 0x0004              # ... then BOOT_STS (Intel order)
+  outw $tco_tmr $tmr_val 0x03ff      # TCO_TMR: ticks of 0.6 s in bits 9:0 only
+  outw $tco_rld 1                    # TCO_RLD: reload
+  outw $tco1_cnt 0 0x0800            # TCO1_CNT: clear TCO_TMR_HLT (bit 11), masked RMW; bit 12 TCO_LOCK written back as read
+  set gcs=unset; set cnt=unset; set tmr=unset; set smien=unset; set c0=unset; set c1=unset
+  read_dword -v gcs $gcs_addr
+  inw -v cnt $tco1_cnt
+  inw -v tmr $tco_tmr
+  inl -v smien $smi_en
+  inw -v c0 $tco_rld
+  sleep 1
+  inw -v c1 $tco_rld
+  echo "wdt: after: GCS=$gcs TCO1_CNT=$cnt TCO_TMR=$tmr SMI_EN=$smien count $c0 -> $c1 locked=$tco_locked mode=$tco_mode"
+  if regexp "$re_noreboot_clear" "$gcs"; then true; else echo "wdt: NO_REBOOT still set"; return 1; fi
+  if regexp "$re_hlt_clear" "$cnt"; then true; else echo "wdt: timer still halted"; return 1; fi
+  if [ "$tco_locked" = "no" ]; then
+    if regexp "$re_tcoen_clear" "$smien"; then true; else echo "wdt: SMI_EN.TCO_EN still set"; return 1; fi
+  fi
+  if regexp "$tmr_re" "$tmr"; then true; else echo "wdt: TCO_TMR not $tmr_val"; return 1; fi
+  if [ "$c0" = "$c1" -o "$c0" = "unset" -o "$c1" = "unset" ]; then echo "wdt: counter not moving"; return 1; fi
+  set wdt_ok=yes
+}
+# NC110 agent OS as the default boot (2026-10-18 22:43-23:00, evnchn's go 22:43, ask A179-1018-13)
+
+- Entry `nc110-bm-agentos-t2-d4275899` (tools/nc110-install-agentos.sh): GRUB arms the TCO, then multiboot
+  k-agentos-d4275899.elf with cmdline `bmctl` + module nc110-agentos.key (a dedicated key, ~/.nc110/agentos.key on the Mac,
+  not in the repo; the test key is rejected). Any GRUB-side failure sets next_entry=0, saves nc110_fallback=<sha8> and reboots.
+- grubenv: saved_entry=nc110-bm-agentos-t2-d4275899 (backup /boot/grub/grubenv.bak-agentos-*). Linux = manual fallback:
+  hold Shift through POST, GRUB menu (30 s), "Alpine NC110, with Linux lts". Nothing on Slot A rewrites saved_entry
+  (GRUB_SAVEDEFAULT=false; slotlab only reads grubenv).
+
+| Test on the real netbook | Result |
+|---|---|
+| q35 GRUB 2.14 rehearsal of the exact entry bytes | boots, answers with the agent-OS key, test key rejected; missing kernel -> fallback branch |
+| one-shot agent-OS boot from Linux | bmctl up, inherited TCO TMR=100 (GRUB-armed), key module verified |
+| broken entry (kernel missing), default already agent OS | Linux for one boot, grubenv `nc110_fallback=fallbck0` (fallback proven) |
+| plain reboot from Linux | **agent OS by default** in 20 s |
+| network-loaded kernel that hangs (wdt=probe) | watchdog reset -> back in the **agent OS** in 138 s |
+| bmctl `reboot` | back in the agent OS in 15 s |
+| soak | tools/nc110-soak.sh -> proof/nc110-soak.log (started 23:00) |
+
+exec
+/bin/zsh -lc "rg -n 'attended|bmctl|watchdog|idle|reset|dhcp|key|reboot|pet' src/main.rs src/bmctl.rs src/loader.rs; cat src/loader.rs" in ~/nc110-baremetal
+ succeeded in 0ms:
+src/loader.rs:1://! In-RAM chain loader, driven over bmctl (the DS OTA equivalent: nothing is written to /boot).
+src/loader.rs:5://! rebuilt 72-byte key module with this boot's seed), quiesces the NIC and jumps through the trampoline in boot.s,
+src/loader.rs:7://! The TCO stays armed across the hop (the attended successor re-arms it in kmain). Any refusal leaves us running.
+src/loader.rs:171:        // key module: MAGIC + seed + public key, exactly the 72 bytes GRUB's `module` line gave us
+src/loader.rs:174:        let publ = sunset::ed25519_dalek::SigningKey::from_bytes(seed).verifying_key().to_bytes();
+src/loader.rs:201:/// Point of no return: NIC quiesced (reset completed), trampoline entered. The TCO stays armed across the hop.
+src/loader.rs:202:/// If the NIC reset does not complete, its DMA may still target memory the new image would overwrite: hard reset
+src/loader.rs:206:        kprintln!("loader: NIC quiesce failed ({}): NOT jumping, hard reset", e);
+src/loader.rs:207:        crate::wdt::hard_reset();
+src/loader.rs:213:        crate::wdt::pet();
+src/main.rs:12:mod dhcp;
+src/main.rs:22:mod bmctl;
+src/main.rs:47:    if cfg!(feature = "attended") && !wdt::arm_probe() {
+src/main.rs:49:        wdt::hard_reset();
+src/main.rs:57:    if cfg!(feature = "attended") {
+src/main.rs:58:        kprintln!("wdt: ATTENDED build: TCO armed by us with NO_REBOOT cleared (one-shot boot, Slot A on any reset)");
+src/main.rs:60:        kprintln!("wdt: reset path not verified on this machine, refusing to run");
+src/main.rs:61:        wdt::hard_reset();
+src/main.rs:63:    // Key module right after the watchdog gate: copy the seed out and wipe the module before anything else.
+src/main.rs:64:    let client_seed = mb::take_client_key(info);
+src/main.rs:78:            kprintln!("nic: {} at {} {} mac={}", n.name(), n.bdf, n.bus, dhcp::Mac(n.mac));
+src/main.rs:80:                Ok(()) if cfg!(feature = "attended") => {
+src/main.rs:84:                    udplog::dhcp_probe(&mut n);
+src/main.rs:87:                        wdt::pet();
+src/main.rs:88:                        kprintln!("wdt: HANG now (probe): cli; hlt, nobody pets; expect a reset ~60 s from here");
+src/main.rs:94:                    if let (Some(seed), true) = (client_seed, cmdline.contains("bmctl")) {
+src/main.rs:95:                        bmctl::run(n, seed, info);
+src/main.rs:99:                    kprintln!("attended: final log round, then reset");
+src/main.rs:109:    if cfg!(feature = "attended") {
+src/main.rs:110:        kprintln!("attended: hard reset via 0xCF9 in 60 s");
+src/main.rs:112:            wdt::pet();
+src/main.rs:115:        wdt::hard_reset();
+src/bmctl.rs:1://! bmctl: authenticated UDP control port (5515) so an agent can inspect and drive the kernel over the LAN, the way
+src/bmctl.rs:3://! nonce = b"C2K\0"|b"K2C\0" ++ seq, AAD = this boot's random 16-byte id. Master = SHA-256("nc110-bmctl-v1" ++
+src/bmctl.rs:4://! client seed from the key module): nothing secret is compiled in. Handshake (Codex MUST-FIX x2, nonce reuse):
+src/bmctl.rs:6://! NEW session number and check = SHA-256("nc110-bmctl-v1 who" ++ master ++ Nc ++ boot id ++ session)[..16].
+src/bmctl.rs:7://! Traffic key = SHA-256("nc110-bmctl-v1 session" ++ master ++ boot id ++ session ++ Nc); seq counts from 1. A
+src/bmctl.rs:8://! replayed or forged `who` reply cannot make two client runs share a key, because Nc is fresh per run, and the
+src/bmctl.rs:11://! The loop pets the watchdog; 10 minutes without a valid command -> 0xCF9 reset.
+src/bmctl.rs:13://! (text, data, bss: stack, session table, keys), NIC registers only inside its 256-byte MMIO window as aligned
+src/bmctl.rs:15://! RAM outside the image can hold GRUB leftovers (multiboot info, maybe a copy of the key file). That is not an
+src/bmctl.rs:16://! escalation: the bmctl master key is derived from that same seed, so any authenticated peer already holds it.
+src/bmctl.rs:28:use smoltcp::socket::{dhcpv4, udp};
+src/bmctl.rs:33:const IDLE_MS: i64 = 600_000; // default; cmdline idle=<s> (5..3600) overrides it, used by the q35 stall test
+src/bmctl.rs:54:/// RFC 8439 tag over aad and ct with the one-time key from keystream block 0.
+src/bmctl.rs:66:fn cipher(key: &[u8; 32], n: &[u8; 12]) -> (ChaCha20, [u8; 32]) {
+src/bmctl.rs:67:    let mut c = ChaCha20::new(key.into(), n.into());
+src/bmctl.rs:69:    c.apply_keystream(&mut b0); // block 0 -> Poly1305 key; the stream continues at block 1
+src/bmctl.rs:75:pub fn seal(key: &[u8; 32], n: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
+src/bmctl.rs:76:    let (mut c, pk) = cipher(key, n);
+src/bmctl.rs:77:    c.apply_keystream(buf);
+src/bmctl.rs:81:pub fn open(key: &[u8; 32], n: &[u8; 12], aad: &[u8], buf: &mut [u8], t: &[u8]) -> bool {
+src/bmctl.rs:82:    let (mut c, pk) = cipher(key, n);
+src/bmctl.rs:91:    c.apply_keystream(buf);
+src/bmctl.rs:95:pub fn session_key(master: &[u8; 32], boot_id: &[u8; 16], sess: u32, nc: &[u8; 16]) -> [u8; 32] {
+src/bmctl.rs:97:    h.update(b"nc110-bmctl-v1 session");
+src/bmctl.rs:107:    h.update(b"nc110-bmctl-v1 who");
+src/bmctl.rs:117:    key: [u8; 32],
+src/bmctl.rs:126:pub fn derive_key(seed: &[u8; 32]) -> [u8; 32] {
+src/bmctl.rs:128:    h.update(b"nc110-bmctl-v1");
+src/bmctl.rs:156:                return Err("refused: kernel image (code, stack, keys)");
+src/bmctl.rs:198:    let idle_ms = crate::mb::cmdline(info).split(' ').find_map(|w| w.strip_prefix("idle=")).and_then(|v| v.parse::<i64>().ok())
+src/bmctl.rs:208:    let key = derive_key(&seed);
+src/bmctl.rs:212:        kprintln!("bmctl: entropy failed -> not starting");
+src/bmctl.rs:223:    let dhcp_h = sockets.add(dhcpv4::Socket::new());
+src/bmctl.rs:231:        wdt::pet();
+src/bmctl.rs:234:        if let Some(dhcpv4::Event::Configured(c)) = sockets.get_mut::<dhcpv4::Socket>(dhcp_h).poll() {
+src/bmctl.rs:246:        kprintln!("bmctl: no DHCP lease in 15 s -> not starting");
+src/bmctl.rs:250:    kprintln!("bmctl: listening on {}:{} boot id {} (idle reset after {} s)", ip.address(), PORT, bid, idle_ms / 1000);
+src/bmctl.rs:258:    let mut reboot_at: Option<i64> = None;
+src/bmctl.rs:262:        wdt::pet();
+src/bmctl.rs:266:        if t - last_ok > idle_ms {
+src/bmctl.rs:267:            kprintln!("bmctl: idle {} s -> reset", idle_ms / 1000);
+src/bmctl.rs:272:            kprintln!("bmctl: chain-loading the staged kernel");
+src/bmctl.rs:276:        if reboot_at.is_some_and(|r| t > r) {
+src/bmctl.rs:277:            kprintln!("bmctl: reboot requested");
+src/bmctl.rs:278:            wdt::hard_reset();
+src/bmctl.rs:284:            let _ = core::fmt::write(&mut h, format_args!("nc110 hello bmctl {}:{} boot {}", ip.address(), PORT, bid));
+src/bmctl.rs:305:            pend[slot] = Some(Sess { id, key: session_key(&key, &boot_id, id, &nc), last_seq: 0, peer: Some(from), last_t: t, retx: 0, reply: [0; 8 + 1300 + 16], reply_len: 0 });
+src/bmctl.rs:307:            hex(&who_check(&key, &nc, &boot_id, id)[..16], &mut chk);
+src/bmctl.rs:333:        if !open(&se.key, &nonce(b"C2K\0", seq), &boot_id, body, tg) {
+src/bmctl.rs:356:                .unwrap_or_else(|| (0..sess.len()).min_by_key(|&j| sess[j].as_ref().map_or(i64::MIN, |x| x.last_t)).unwrap());
+src/bmctl.rs:436:                "reboot" => {
+src/bmctl.rs:437:                    let _ = core::fmt::write(&mut w, format_args!("rebooting in 500 ms"));
+src/bmctl.rs:438:                    reboot_at = Some(t + 500);
+src/bmctl.rs:441:                    let _ = core::fmt::write(&mut w, format_args!("err unknown command (ping|stats|log <off>|peek ...|rng <n>|lbeg|ldat|lcom|reboot)"));
+src/bmctl.rs:449:        let tg = seal(&se.key, &nonce(b"K2C\0", seq), &boot_id, &mut pkt[8..8 + len]);
+//! In-RAM chain loader, driven over bmctl (the DS OTA equivalent: nothing is written to /boot).
+//! `lbeg <size> <sha256>` opens a staging buffer at STAGE; binary `ldat` ++ u32 offset ++ bytes appends in order;
+//! `lcom <cmdline>` verifies length + SHA-256 + the multiboot header (a.out kludge, flag bit 16, as GRUB applies it),
+//! checks every destination range, builds a multiboot info block (cmdline, the ORIGINAL GRUB memory map, and a
+//! rebuilt 72-byte key module with this boot's seed), quiesces the NIC and jumps through the trampoline in boot.s,
+//! which turns paging off, copies the image to load_addr, zeroes its bss and enters it like GRUB would.
+//! The TCO stays armed across the hop (the attended successor re-arms it in kmain). Any refusal leaves us running.
+use crate::kprintln;
+use crate::mb;
+use crate::nic::Rtl;
+use sha2::{Digest, Sha256};
+
+pub const STAGE: u64 = 0x0400_0000; // 64 MiB
+pub const CAP: u64 = 0x0080_0000; // 8 MiB (STAGE + CAP < 128 MiB, so q35 -m 128 works)
+const TRAMP: u64 = 0x8000; // trampoline code + its stack (< 0xC00)
+const PARAMS: u64 = 0x8C00;
+const INFO: u64 = 0x8D00;
+const MODENT: u64 = 0x8E80;
+const CMDLINE: u64 = 0x8F00; // <= 255 bytes + NUL
+const MODULE: u64 = 0x9000; // page-aligned (our header asks for it: flag bit 0)
+const MMAP: u64 = 0x9100;
+const LOW_END: u64 = 0xA000;
+const MMAP_MAX: usize = (LOW_END - MMAP) as usize;
+
+/// GRUB's boot metadata, copied out at boot (before any staging could overwrite it). (flags, mem_lower, mem_upper)
+static mut ORIG: (u32, u32, u32) = (0, 0, 0);
+static mut ORIG_MMAP: [u8; MMAP_MAX] = [0; MMAP_MAX];
+static mut ORIG_MMAP_LEN: usize = 0;
+static mut ORIG_MMAP_TOO_BIG: bool = false;
+
+/// Call once, early, with the multiboot info pointer GRUB (or a previous loader) gave us.
+pub fn snapshot_boot_info(info: u64) {
+    if info == 0 {
+        return;
+    }
+    unsafe {
+        let r32 = |a: u64| core::ptr::read_volatile(a as *const u32);
+        let f = r32(info);
+        ORIG = (f, if f & 1 != 0 { r32(info + 4) } else { 0 }, if f & 1 != 0 { r32(info + 8) } else { 0 });
+        if f & (1 << 6) != 0 {
+            let (l, a) = (r32(info + 44) as usize, r32(info + 48) as u64);
+            if l <= MMAP_MAX {
+                core::ptr::copy(a as *const u8, core::ptr::addr_of_mut!(ORIG_MMAP) as *mut u8, l);
+                ORIG_MMAP_LEN = l;
+            } else {
+                ORIG_MMAP_TOO_BIG = true;
+            }
+        }
+    }
+}
+
+extern "C" {
+    static tramp_start: u8;
+    static tramp_end: u8;
+    static __load_start: u8;
+    static __bss_end: u8;
+}
+
+pub struct Stage {
+    size: u64,
+    sha: [u8; 32],
+    got: u64,
+}
+
+fn overlaps(a: u64, al: u64, b: u64, bl: u64) -> bool {
+    a < b.saturating_add(bl) && b < a.saturating_add(al)
+}
+
+fn kernel_image() -> (u64, u64) {
+    let (s, e) = (core::ptr::addr_of!(__load_start) as u64, core::ptr::addr_of!(__bss_end) as u64);
+    (s, e - s)
+}
+
+pub fn begin(size: u64, sha_hex: &str) -> Result<Stage, &'static str> {
+    if size == 0 || size > CAP {
+        return Err("size 1..8 MiB");
+    }
+    let (ks, kl) = kernel_image();
+    if !mb::ram_contains(STAGE, size) || overlaps(STAGE, size, ks, kl) {
+        return Err("staging area not free RAM");
+    }
+    if sha_hex.len() != 64 || !sha_hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err("sha256: 64 hex chars");
+    }
+    let mut sha = [0u8; 32];
+    for (i, b) in sha.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&sha_hex[2 * i..2 * i + 2], 16).map_err(|_| "sha256: hex")?;
+    }
+    Ok(Stage { size, sha, got: 0 })
+}
+
+pub fn data(st: &mut Stage, off: u64, bytes: &[u8]) -> Result<u64, &'static str> {
+    if off != st.got {
+        return Err("out of order (send chunks in sequence)");
+    }
+    let end = off.checked_add(bytes.len() as u64).ok_or("overflow")?;
+    if end > st.size {
+        return Err("past announced size");
+    }
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), (STAGE + off) as *mut u8, bytes.len()) };
+    st.got = end;
+    Ok(end)
+}
+
+/// Everything checked, nothing moved yet. Returns (src, dst, len, bss_len, entry).
+fn plan(st: &Stage) -> Result<(u64, u64, u64, u64, u64), &'static str> {
+    if st.got != st.size {
+        return Err("incomplete image");
+    }
+    let img = unsafe { core::slice::from_raw_parts(STAGE as *const u8, st.size as usize) };
+    let d: [u8; 32] = Sha256::digest(img).into();
+    if d != st.sha {
+        return Err("sha256 mismatch");
+    }
+    let rd = |o: usize| u32::from_le_bytes(img[o..o + 4].try_into().unwrap());
+    let lim = img.len().min(8192);
+    let hoff = (0..lim.saturating_sub(31)).step_by(4).find(|&o| {
+        rd(o) == 0x1BAD_B002 && rd(o).wrapping_add(rd(o + 4)).wrapping_add(rd(o + 8)) == 0
+    }).ok_or("no multiboot header in the first 8 KiB")?;
+    let flags = rd(hoff + 4);
+    if flags & (1 << 16) == 0 {
+        return Err("multiboot header lacks the address kludge (flag 16)");
+    }
+    if flags & 0xFFFC != 0 {
+        return Err("multiboot header requires features this loader does not provide (bits 2..15)");
+    }
+    let (haddr, laddr, lend, bend, entry) =
+        (rd(hoff + 12) as u64, rd(hoff + 16) as u64, rd(hoff + 20) as u64, rd(hoff + 24) as u64, rd(hoff + 28) as u64);
+    if laddr > haddr || lend <= laddr || bend < lend || entry < laddr || entry >= lend {
+        return Err("inconsistent header addresses");
+    }
+    let foff = (hoff as u64).checked_sub(haddr - laddr).ok_or("header offset")?;
+    let len = lend - laddr;
+    if foff.checked_add(len).is_none_or(|e| e > st.size) {
+        return Err("image shorter than load_end - load_addr");
+    }
+    if laddr < 0x10_0000 || bend > STAGE || !mb::ram_contains(laddr, bend - laddr) {
+        return Err("target range not RAM in [1 MiB, staging)");
+    }
+    if overlaps(laddr, bend - laddr, TRAMP, LOW_END - TRAMP) {
+        return Err("target overlaps the trampoline/info pages");
+    }
+    Ok((STAGE + foff, laddr, len, bend - lend, entry))
+}
+
+pub struct Plan {
+    params: [u64; 6],
+}
+
+/// All checks plus writing the low pages (trampoline, info, module, cmdline, mmap). Nothing of ours is touched:
+/// the low pages are outside the kernel image; GRUB's info/mmap come from the boot-time snapshot.
+pub fn prepare(st: &Stage, cmdline: &str, seed: &[u8; 32]) -> Result<Plan, &'static str> {
+    let (src, dst, len, bss, entry) = plan(st)?;
+    let tl = (core::ptr::addr_of!(tramp_end) as u64) - (core::ptr::addr_of!(tramp_start) as u64);
+    if tl > PARAMS - TRAMP || !mb::ram_contains(TRAMP, LOW_END - TRAMP) {
+        return Err("low pages 0x8000-0xA000 not usable");
+    }
+    if cmdline.len() > 255 {
+        return Err("cmdline > 255");
+    }
+    unsafe {
+        if ORIG_MMAP_TOO_BIG {
+            return Err("GRUB memory map larger than the loader's buffer: refusing rather than dropping it");
+        }
+        let (oflags, mlo, mhi) = ORIG;
+        let ml = ORIG_MMAP_LEN;
+        let mmap = &*core::ptr::addr_of!(ORIG_MMAP);
+        let w32 = |a: u64, v: u32| core::ptr::write_volatile(a as *mut u32, v);
+        core::ptr::write_bytes(TRAMP as *mut u8, 0, (LOW_END - TRAMP) as usize);
+        core::ptr::copy_nonoverlapping(core::ptr::addr_of!(tramp_start), TRAMP as *mut u8, tl as usize);
+        // key module: MAGIC + seed + public key, exactly the 72 bytes GRUB's `module` line gave us
+        core::ptr::copy_nonoverlapping(mb::MAGIC.as_ptr(), MODULE as *mut u8, 8);
+        core::ptr::copy_nonoverlapping(seed.as_ptr(), (MODULE + 8) as *mut u8, 32);
+        let publ = sunset::ed25519_dalek::SigningKey::from_bytes(seed).verifying_key().to_bytes();
+        core::ptr::copy_nonoverlapping(publ.as_ptr(), (MODULE + 40) as *mut u8, 32);
+        w32(MODENT, MODULE as u32);
+        w32(MODENT + 4, (MODULE + 72) as u32);
+        core::ptr::copy_nonoverlapping(cmdline.as_ptr(), CMDLINE as *mut u8, cmdline.len());
+        // multiboot info: flags 0 (mem), 2 (cmdline), 3 (mods), 6 (GRUB's memory map, verbatim)
+        let mut flags = (1 << 2) | (1 << 3);
+        if oflags & 1 != 0 {
+            flags |= 1;
+            w32(INFO + 4, mlo);
+            w32(INFO + 8, mhi);
+        }
+        if ml > 0 {
+            core::ptr::copy_nonoverlapping(mmap.as_ptr(), MMAP as *mut u8, ml);
+            flags |= 1 << 6;
+            w32(INFO + 44, ml as u32);
+            w32(INFO + 48, MMAP as u32);
+        }
+        w32(INFO, flags);
+        w32(INFO + 16, CMDLINE as u32);
+        w32(INFO + 20, 1);
+        w32(INFO + 24, MODENT as u32);
+    }
+    kprintln!("loader: ready: {} B image -> {:#x}..{:#x} (+{} B bss), entry {:#x}, cmdline '{}'", st.size, dst, dst + len, bss, entry, cmdline);
+    Ok(Plan { params: [src, dst, len, bss, entry, INFO] })
+}
+
+/// Point of no return: NIC quiesced (reset completed), trampoline entered. The TCO stays armed across the hop.
+/// If the NIC reset does not complete, its DMA may still target memory the new image would overwrite: hard reset
+/// instead of jumping (back to Slot A via GRUB's default).
+pub fn jump(p: &Plan, nic: &Rtl) -> ! {
+    if let Err(e) = nic.quiesce() {
+        kprintln!("loader: NIC quiesce failed ({}): NOT jumping, hard reset", e);
+        crate::wdt::hard_reset();
+    }
+    unsafe {
+        for (i, v) in p.params.iter().enumerate() {
+            core::ptr::write_volatile((PARAMS + 8 * i as u64) as *mut u64, *v);
+        }
+        crate::wdt::pet();
+        let f: extern "sysv64" fn(u64) -> ! = core::mem::transmute(TRAMP as usize);
+        f(PARAMS)
+    }
+}
+
+exec
+/bin/zsh -lc "bash tools/nc110-install-agentos.sh --print-entry target/attended/x86_64-unknown-none/release/nc110-kernel; rg -n 'next_entry|keystatus|timeout|save_env|saved_entry|halt|disarm|Linux|linux' grub-test tools src/watchdog* src/bmctl.rs" in ~/nc110-baremetal
+ exited 1 in 0ms:
+menuentry "nc110-bm-agentos-t2-d4275899" {
+    insmod ext2
+    search --no-floppy --fs-uuid --set=root c0954bc7-86a0-440c-8401-2c3e95549743
+    terminal_output console
+    set gfxpayload=text
+    insmod multiboot
+    nc110_tco_consts
+    tco_arm
+    if [ "$wdt_ok" = "yes" ]; then
+      echo "nc110-agentos d4275899: TCO armed by GRUB, loading /baremetal/k-agentos-d4275899.elf"
+      if multiboot /baremetal/k-agentos-d4275899.elf bmctl; then
+        if module /baremetal/nc110-agentos.key; then
+          boot
+        fi
+      fi
+      echo "nc110-agentos d4275899: kernel or key module failed to load"
+    else
+      echo "nc110-agentos d4275899: GRUB did NOT arm the TCO"
+    fi
+    echo "nc110-agentos: one boot of Slot A Linux instead (next_entry=0)"
+    set next_entry=0
+    set nc110_fallback=d4275899
+    save_env next_entry nc110_fallback
+    sleep 5
+    reboot
+  }
+zsh:1: no matches found: src/watchdog*
+
+exec
+/bin/zsh -lc "cat src/main.rs; sed -n '190,370p' src/bmctl.rs; cat src/wdt.rs; rg -n 'take_client_key|MAGIC' src/mb.rs; rg -n 'keystatus|saved_entry|save_env|next_entry|timeout_style|Linux|linux' grub-test tools proof/nc110*" in ~/nc110-baremetal
+ succeeded in 0ms:
+#![no_std]
+#![no_main]
+
+use core::arch::{asm, global_asm};
+use core::fmt::Write;
+use core::panic::PanicInfo;
+
+global_asm!(include_str!("boot.s"), options(att_syntax));
+
+mod console;
+#[allow(dead_code)]
+mod dhcp;
+mod kbd;
+mod mb;
+mod net;
+mod nic;
+mod nic_regs;
+mod pci;
+mod port;
+mod rng;
+mod ssh;
+mod bmctl;
+mod loader;
+mod term;
+mod time;
+mod udplog;
+mod wdt;
+
+struct SerialLog;
+impl log::Log for SerialLog {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Warn
+    }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            kprintln!("[{}] {}", r.level(), r.args());
+        }
+    }
+    fn flush(&self) {}
+}
+static LOGGER: SerialLog = SerialLog;
+
+#[no_mangle]
+pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
+    console::init();
+    // Attended: arm the TCO before anything else can block (Codex night review MUST-FIX 1). No net -> no run.
+    if cfg!(feature = "attended") && !wdt::arm_probe() {
+        kprintln!("wdt: ATTENDED: could not arm the TCO, refusing to run");
+        wdt::hard_reset();
+    }
+    kprintln!("NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)");
+    if let Some(b) = option_env!("NC110_BUILD") {
+        kprintln!("build: {}", b);
+    }
+    kprintln!("multiboot magic={:#010x} info={:#x} -> long mode OK", magic, info);
+    wdt::report();
+    if cfg!(feature = "attended") {
+        kprintln!("wdt: ATTENDED build: TCO armed by us with NO_REBOOT cleared (one-shot boot, Slot A on any reset)");
+    } else if !wdt::is_qemu_pc() && !wdt::verify_live() && !wdt::neg_control_on_q35() {
+        kprintln!("wdt: reset path not verified on this machine, refusing to run");
+        wdt::hard_reset();
+    }
+    // Key module right after the watchdog gate: copy the seed out and wipe the module before anything else.
+    let client_seed = mb::take_client_key(info);
+    mb::parse_memory(info);
+    let cmdline = mb::cmdline(info);
+    kprintln!("cmdline: {}", cmdline);
+    wdt::rehearse(cmdline);
+
+    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
+    kprintln!("time: TSC {} ticks/ms (PIT ch2 calibrated)", time::init());
+
+    match nic::probe(cmdline.contains("nic=mmio")) {
+        Ok(mut n) => {
+            if cmdline.contains("nic=no8105e") {
+                n.skip_8105e(); // A/B switch for the rtl_hw_start_8105e tweaks
+            }
+            kprintln!("nic: {} at {} {} mac={}", n.name(), n.bdf, n.bus, dhcp::Mac(n.mac));
+            match n.init() {
+                Ok(()) if cfg!(feature = "attended") => {
+                    kprintln!("udplog: broadcasting this log to UDP 5514");
+                    udplog::set_nic(&n);
+                    udplog::dump(1);
+                    udplog::dhcp_probe(&mut n);
+                    udplog::dump(2);
+                    if cmdline.contains("wdt=probe") {
+                        wdt::pet();
+                        kprintln!("wdt: HANG now (probe): cli; hlt, nobody pets; expect a reset ~60 s from here");
+                        udplog::dump(3);
+                        loop {
+                            unsafe { asm!("cli; hlt") };
+                        }
+                    }
+                    if let (Some(seed), true) = (client_seed, cmdline.contains("bmctl")) {
+                        bmctl::run(n, seed, info);
+                    } else if client_seed.is_some() {
+                        ssh::run(n, client_seed, cmdline.contains("rng=dump"));
+                    }
+                    kprintln!("attended: final log round, then reset");
+                    udplog::dump(4);
+                }
+                Ok(()) => ssh::run(n, client_seed, cmdline.contains("rng=dump")),
+                Err(e) => kprintln!("nic: init failed: {} (bus mastering left off)", e),
+            }
+        }
+        Err(e) => kprintln!("nic: {}", e),
+    }
+    kprintln!("DONE");
+    if cfg!(feature = "attended") {
+        kprintln!("attended: hard reset via 0xCF9 in 60 s");
+        for _ in 0..60 {
+            wdt::pet();
+            wdt::delay_ms(1000);
+        }
+        wdt::hard_reset();
+    }
+    loop {
+        unsafe { asm!("cli; hlt") };
+    }
+}
+
+pub fn ram_overlaps(base: u64, len: u64) -> bool {
+    mb::ram_overlaps(base, len)
+}
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    let _ = writeln!(console::Console, "PANIC: {}", info);
+    loop {
+        unsafe { asm!("cli; hlt") };
+    }
+}
+            let _ = core::fmt::write(w, format_args!("{:#x}", v));
+        }
+        _ => return Err("peek mem <hexaddr> <len> | peek nic <hexoff> <len> | peek io <hexport> <1|2|4>"),
+    }
+    Ok(())
+}
+
+pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+    let idle_ms = crate::mb::cmdline(info).split(' ').find_map(|w| w.strip_prefix("idle=")).and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| (5..=3600).contains(v)).map_or(IDLE_MS, |v| v * 1000);
+    crate::loader::snapshot_boot_info(info);
+    let nic_mmio = match nic.bus {
+        Bus::Mmio(b) => Some(b),
+        Bus::Pio(_) => None,
+    };
+    if rng::init(false).is_err() {
+        return;
+    }
+    let key = derive_key(&seed);
+    let mut boot_id = [0u8; 16];
+    let mut rs = [0u8; 8];
+    if rng::fill(&mut boot_id).is_err() || rng::fill(&mut rs).is_err() {
+        kprintln!("bmctl: entropy failed -> not starting");
+        return;
+    }
+    let mut bid = heapless::String::<64>::new();
+    hex(&boot_id, &mut bid);
+    let mac = nic.mac;
+    let mut dev = Nic(nic);
+    let mut cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    cfg.random_seed = u64::from_le_bytes(rs);
+    let mut iface = Interface::new(cfg, &mut dev, now());
+    let mut sockets = SocketSet::new(unsafe { &mut *core::ptr::addr_of_mut!(SOCKS) }[..].as_mut());
+    let dhcp_h = sockets.add(dhcpv4::Socket::new());
+    let udp_h = sockets.add(udp::Socket::new(
+        udp::PacketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(RX_META) }[..].as_mut(), unsafe { &mut *core::ptr::addr_of_mut!(RX_BUF) }[..].as_mut()),
+        udp::PacketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(TX_META) }[..].as_mut(), unsafe { &mut *core::ptr::addr_of_mut!(TX_BUF) }[..].as_mut()),
+    ));
+    let t0 = time::now_ms();
+    let mut ip = None;
+    while ip.is_none() && time::now_ms() - t0 < 15_000 {
+        wdt::pet();
+        crate::net::rx_budget(Some(32));
+        iface.poll(now(), &mut dev, &mut sockets);
+        if let Some(dhcpv4::Event::Configured(c)) = sockets.get_mut::<dhcpv4::Socket>(dhcp_h).poll() {
+            iface.update_ip_addrs(|a| {
+                a.clear();
+                let _ = a.push(IpCidr::Ipv4(c.address));
+            });
+            if let Some(gw) = c.router {
+                let _ = iface.routes_mut().add_default_ipv4_route(gw);
+            }
+            ip = Some(c.address);
+        }
+    }
+    let Some(ip) = ip else {
+        kprintln!("bmctl: no DHCP lease in 15 s -> not starting");
+        return;
+    };
+    sockets.get_mut::<udp::Socket>(udp_h).bind(PORT).expect("bind");
+    kprintln!("bmctl: listening on {}:{} boot id {} (idle reset after {} s)", ip.address(), PORT, bid, idle_ms / 1000);
+    crate::udplog::dump(5);
+
+    let (mut last_ok, mut last_hello) = (time::now_ms(), 0i64);
+    let (mut ok, mut bad, mut replay, mut retx) = (0u32, 0u32, 0u32, 0u32);
+    let (mut next_sess, mut who_window, mut who_count) = (1u32, 0i64, 0u32);
+    let sess = unsafe { &mut *core::ptr::addr_of_mut!(SESS) };
+    let pend = unsafe { &mut *core::ptr::addr_of_mut!(PEND) };
+    let mut reboot_at: Option<i64> = None;
+    let mut stage: Option<crate::loader::Stage> = None;
+    let mut jump_at: Option<(i64, crate::loader::Plan)> = None;
+    loop {
+        wdt::pet();
+        crate::net::rx_budget(Some(32)); // bounded ingress per poll so the deadline checks below always run
+        iface.poll(now(), &mut dev, &mut sockets);
+        let t = time::now_ms();
+        if t - last_ok > idle_ms {
+            kprintln!("bmctl: idle {} s -> reset", idle_ms / 1000);
+            return;
+        }
+        if jump_at.as_ref().is_some_and(|(j, _)| t > *j) {
+            let (_, p) = jump_at.take().unwrap();
+            kprintln!("bmctl: chain-loading the staged kernel");
+            crate::udplog::dump(7);
+            crate::loader::jump(&p, &dev.0);
+        }
+        if reboot_at.is_some_and(|r| t > r) {
+            kprintln!("bmctl: reboot requested");
+            wdt::hard_reset();
+        }
+        let sock = sockets.get_mut::<udp::Socket>(udp_h);
+        if t - last_hello > 2000 {
+            last_hello = t;
+            let mut h = heapless::String::<128>::new();
+            let _ = core::fmt::write(&mut h, format_args!("nc110 hello bmctl {}:{} boot {}", ip.address(), PORT, bid));
+            let _ = sock.send_slice(h.as_bytes(), IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::BROADCAST), 5514));
+        }
+        let mut buf = [0u8; 1500];
+        let Ok((n, meta)) = sock.recv_slice(&mut buf) else { continue };
+        let from = meta.endpoint;
+        if n == 3 + 16 && &buf[..3] == b"who" {
+            if t - who_window > 1000 {
+                (who_window, who_count) = (t, 0);
+            }
+            who_count += 1;
+            if who_count > 10 {
+                continue; // global cap: at most 10 clear-text replies per second (reflection)
+            }
+            // Unauthenticated `who` only ever writes the pending table (round-robin), never an authenticated session.
+            let slot = Some((next_sess as usize) % pend.len());
+            let (Some(slot), Some(next)) = (slot, next_sess.checked_add(1)) else { continue };
+            let id = next_sess;
+            next_sess = next;
+            let mut nc = [0u8; 16];
+            nc.copy_from_slice(&buf[3..19]);
+            pend[slot] = Some(Sess { id, key: session_key(&key, &boot_id, id, &nc), last_seq: 0, peer: Some(from), last_t: t, retx: 0, reply: [0; 8 + 1300 + 16], reply_len: 0 });
+            let mut chk = heapless::String::<64>::new();
+            hex(&who_check(&key, &nc, &boot_id, id)[..16], &mut chk);
+            let mut h = heapless::String::<160>::new();
+            let _ = core::fmt::write(&mut h, format_args!("nc110 boot {} session {} check {}", bid, id, chk));
+            let _ = sock.send_slice(h.as_bytes(), from);
+            continue;
+        }
+        // Frame: [session u32 LE][seq u64 LE][ct][tag]
+        if n < 4 + 8 + 16 {
+            bad += 1;
+            continue;
+        }
+        let sid = u32::from_le_bytes(buf[..4].try_into().unwrap());
+        // Authenticated session, or a pending one from the endpoint that asked `who` (promoted below once the frame
+        // authenticates; only then may it evict the least recently used authenticated session).
+        let in_sess = sess.iter().position(|x| x.as_ref().is_some_and(|x| x.id == sid && x.peer == Some(from)));
+        let in_pend = pend.iter().position(|x| x.as_ref().is_some_and(|x| x.id == sid && x.peer == Some(from)));
+        let se = match (in_sess, in_pend) {
+            (Some(i), _) => sess[i].as_mut().unwrap(),
+            (None, Some(i)) => pend[i].as_mut().unwrap(),
+            _ => {
+                bad += 1;
+                continue;
+            }
+        };
+        let seq = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+        let (body, tg) = buf[12..n].split_at_mut(n - 12 - 16);
+        if !open(&se.key, &nonce(b"C2K\0", seq), &boot_id, body, tg) {
+            bad += 1;
+            continue;
+        }
+        if seq == se.last_seq && se.reply_len > 0 {
+            if se.retx >= 5 {
+                continue; // cap resends of one reply
+            }
+            se.retx += 1;
+            retx += 1; // retry of the last request: same bytes again (to the bound peer), nothing re-executed
+            let _ = sock.send_slice(&se.reply[..se.reply_len], from);
+            continue;
+        }
+        if seq <= se.last_seq {
+            replay += 1;
+            continue;
+        }
+        se.last_seq = seq;
+        se.last_t = t;
+        se.retx = 0;
+        last_ok = t;
+        let se = if let (None, Some(i)) = (in_sess, in_pend) {
+            let dst = (0..sess.len()).find(|&j| sess[j].is_none())
+                .unwrap_or_else(|| (0..sess.len()).min_by_key(|&j| sess[j].as_ref().map_or(i64::MIN, |x| x.last_t)).unwrap());
+            sess[dst] = pend[i].take();
+            sess[dst].as_mut().unwrap()
+        } else {
+            se
+        };
+        ok += 1;
+        let mut out = [0u8; 1300];
+        let len = {
+            let mut w = Writer { b: &mut out, n: 0 };
+            let loading = |c: &[u8]| c.starts_with(b"ldat") || c.starts_with(b"lbeg") || c.starts_with(b"lcom");
+            if jump_at.is_some() && loading(body) {
+                // committed: the staged image is frozen until the hop (Codex loader MUST-FIX 2)
+                let _ = core::fmt::write(&mut w, format_args!("err committed, jump pending"));
+            } else if body.len() >= 8 && &body[..4] == b"ldat" {
+//! TCO watchdog (ICH9 in QEMU q35, NM10 on the NC110; both iTCO v2). boot.s arms it before any
+//! Rust runs; this module reports what boot.s did, pets it, and runs the M0.5 rehearsal modes.
+use crate::port::{inl, inw, outb, outw};
+use crate::{kprintln, pci};
+use core::ptr::{addr_of, read_volatile};
+
+#[cfg(all(feature = "neg-control", feature = "grub-armed"))]
+compile_error!("neg-control is QEMU-only and must never be combined with grub-armed (the hardware artifact)");
+
+/// Negative control (`--features neg-control`, QEMU q35 only; boot.s never self-arms on NM10): boot.s SETS GCS.NO_REBOOT instead of clearing it
+/// (QEMU's GCS powers up 0 with noreboot=false, so merely skipping the clear would prove nothing).
+#[no_mangle]
+static TCO_NEG_CONTROL: u8 = cfg!(feature = "neg-control") as u8;
+
+/// `--features grub-armed`: boot.s does NOT arm; used to test the GRUB iorw/memrw arming sequence.
+#[no_mangle]
+static TCO_GRUB_ARMED: u8 = cfg!(feature = "grub-armed") as u8;
+
+extern "C" {
+    static tco_result: u32;
+    static tco_gcs_pre: u32;
+    static tco_gcs: u32;
+    static tco_base: u32;
+    static tco_sts1_pre: u16;
+    static tco_sts2_pre: u16;
+    static tco_cnt: u16;
+}
+
+fn rd<T: Copy>(p: *const T) -> T {
+    unsafe { read_volatile(p) }
+}
+
+pub fn armed() -> bool {
+    matches!(rd(addr_of!(tco_result)), 0 | 4 | 5)
+}
+
+pub fn pmbase() -> u16 {
+    (pci::read32(pci::b0(31, 0), 0x40) & 0xFF80) as u16
+}
+
+pub fn base() -> u16 {
+    pmbase() + 0x60
+}
+
+pub fn report() {
+    let r = rd(addr_of!(tco_result));
+    let what = match r {
+        0 => "armed by boot.s",
+        1 => "skipped (LPC 00:1f.0 is not ICH9 8086:2918 / NM10 8086:27bc)",
+        2 => "NOT armed: PMBASE unset",
+        3 => "NOT armed: RCBA disabled",
+        4 => "left to GRUB (grub-armed build); live registers follow",
+        5 => "NM10: boot.s does not arm (attended Rust arms it; else GRUB must); live registers follow",
+        _ => "NOT armed: unknown",
+    };
+    kprintln!("wdt: {} (result={})", what, r);
+    if r == 4 || r == 5 {
+        let b = base();
+        let gcs = unsafe { read_volatile(((pci::read32(pci::b0(31, 0), 0xF0) & 0xFFFF_C000) + 0x3410) as *const u32) };
+        let (s1, s2, cnt, tmr) = unsafe { (inw(b + 4), inw(b + 6), inw(b + 8), inw(b + 0x12)) };
+        kprintln!(
+            "wdt: live TCOBASE={:#x} GCS={:#010x} NO_REBOOT={} TCO1_CNT={:#06x} HLT={} TCO1_STS={:#06x} TCO2_STS={:#06x} TCO_TMR={}",
+            b, gcs, (gcs >> 5) & 1, cnt, (cnt >> 11) & 1, s1, s2, tmr & 0x3FF
+        );
+        return;
+    }
+    if r != 0 {
+        return;
+    }
+    let (b, gcs, s1, s2, cnt) = {
+        (rd(addr_of!(tco_base)) as u16, rd(addr_of!(tco_gcs)), rd(addr_of!(tco_sts1_pre)), rd(addr_of!(tco_sts2_pre)), rd(addr_of!(tco_cnt)))
+    };
+    kprintln!(
+        "wdt: TCOBASE={:#x} GCS {:#010x} -> {:#010x} NO_REBOOT={} TCO1_CNT={:#06x} HLT={} LOCK={}",
+        b, rd(addr_of!(tco_gcs_pre)), gcs, (gcs >> 5) & 1, cnt, (cnt >> 11) & 1, (cnt >> 12) & 1
+    );
+    kprintln!(
+        "wdt: before-clear TCO1_STS={:#06x} TCO2_STS={:#06x} SECOND_TO_STS={} BOOT_STS={}",
+        s1, s2, (s2 >> 1) & 1, (s2 >> 2) & 1
+    );
+    let tmr = unsafe { inw(b + 0x12) } & 0x3FF;
+    kprintln!("wdt: TCO_TMR={} ticks x 0.6 s, reset expected after 2nd expiry (~{} ms)", tmr, tmr as u32 * 1200);
+}
+
+/// Live check of the reset path, whoever armed it: NO_REBOOT=0, HLT=0, TMR>=4, and the counter
+/// (TCO_RLD reads back the current value on v2) decrements across ~1.3 ticks.
+pub fn verify_live() -> bool {
+    if !armed() {
+        return false;
+    }
+    let b = base();
+    let rcba = pci::read32(pci::b0(31, 0), 0xF0);
+    if rcba & 1 == 0 {
+        return false;
+    }
+    let gcs = unsafe { read_volatile(((rcba & 0xFFFF_C000) + 0x3410) as *const u32) };
+    let (cnt, tmr) = unsafe { (inw(b + 8), inw(b + 0x12) & 0x3FF) };
+    let c0 = unsafe { inw(b) } & 0x3FF;
+    delay_ms(800);
+    let c1 = unsafe { inw(b) } & 0x3FF;
+    let ok = gcs & 0x20 == 0 && cnt & 0x0800 == 0 && tmr >= 4 && c1 != c0;
+    kprintln!(
+        "wdt: verify NO_REBOOT={} HLT={} TMR={} count {}->{} => {}",
+        (gcs >> 5) & 1, (cnt >> 11) & 1, tmr, c0, c1, if ok { "VERIFIED" } else { "NOT VERIFIED" }
+    );
+    ok
+}
+
+/// QEMU `-machine pc` (PIIX3 8086:7000 at 00:01.0) has no TCO; the M0 NIC demo may run unprotected there.
+pub fn is_qemu_pc() -> bool {
+    pci::read32(pci::b0(1, 0), 0) == 0x7000_8086 && rd(addr_of!(tco_result)) == 1
+}
+
+/// The negative control must reach its hang unverified (that is the point); only on q35, never NM10.
+pub fn neg_control_on_q35() -> bool {
+    let on = cfg!(feature = "neg-control") && rd(addr_of!(tco_result)) == 0;
+    if on {
+        kprintln!("wdt: neg-control build on q35: proceeding unverified on purpose");
+    }
+    on
+}
+
+/// Hard reset via the reset control register (spec M2 `reboot`): back to the firmware / Slot A.
+pub fn hard_reset() -> ! {
+    kprintln!("wdt: hard reset via 0xCF9");
+    unsafe {
+        outb(0xCF9, 0x02);
+        outb(0xCF9, 0x06);
+    }
+    loop {
+        unsafe { core::arch::asm!("cli; hlt") };
+    }
+}
+
+/// Attended `wdt=probe`: arm the NM10 TCO ourselves without touching locked bits (SMI_EN.TCO_EN stays as the
+/// BIOS left it): clear GCS.NO_REBOOT (the BIOS leaves it SET on the NC110), clear stale status, TMR=50 ticks
+/// (30 s per stage, reset ~60 s after the last pet), reload, un-halt. Returns true if the readback says armed.
+pub fn arm_probe() -> bool {
+    let lpc = pci::read32(pci::b0(31, 0), 0);
+    let rcba_raw = pci::read32(pci::b0(31, 0), 0xF0);
+    if !(lpc == 0x27BC_8086 || lpc == 0x2918_8086) || pmbase() == 0 || rcba_raw & 1 == 0 {
+        kprintln!("wdt: probe arm: prerequisites fail (LPC {:#010x}, PMBASE {:#x}, RCBA {:#x})", lpc, pmbase(), rcba_raw);
+        return false;
+    }
+    let b = base();
+    let rcba = rcba_raw & 0xFFFF_C000;
+    let gcs_p = (rcba + 0x3410) as *mut u32;
+    unsafe {
+        let g0 = read_volatile(gcs_p);
+        let (cnt0, tmr0, rld0) = (inw(b + 8), inw(b + 0x12) & 0x3FF, inw(b) & 0x3FF);
+        kprintln!("wdt: inherited: GCS {:#x} NO_REBOOT={} TCO1_CNT={:#06x} HLT={} TMR={} RLD={} ({})", g0, (g0 >> 5) & 1, cnt0,
+            (cnt0 >> 11) & 1, tmr0, rld0, if g0 & 0x20 == 0 && cnt0 & 0x800 == 0 { "inherited enabled: NO_REBOOT clear, timer running" } else { "inherited not enabled" });
+        core::ptr::write_volatile(gcs_p, g0 & !0x20);
+        outw(b + 4, 0x0008); // TCO1_STS.TIMEOUT (RW1C)
+        outw(b + 6, 0x0002); // TCO2_STS.SECOND_TO_STS
+        outw(b + 6, 0x0004); // TCO2_STS.BOOT_STS
+        outw(b + 0x12, (inw(b + 0x12) & !0x3FF) | 50);
+        outw(b, 1);
+        outw(b + 8, inw(b + 8) & !0x0800); // un-halt; bit 12 (lock) written back as read
+        let (g1, cnt, tmr, c0) = (read_volatile(gcs_p), inw(b + 8), inw(b + 0x12) & 0x3FF, inw(b) & 0x3FF);
+        delay_ms(1300);
+        let c1 = inw(b) & 0x3FF;
+        let ok = g1 & 0x20 == 0 && cnt & 0x0800 == 0 && tmr == 50 && c1 != c0;
+        kprintln!("wdt: probe arm: GCS {:#x} -> {:#x} TCO1_CNT={:#06x} TMR={} RLD {}->{} SMI_EN={:#x} => {}",
+            g0, g1, cnt, tmr, c0, c1, inl(pmbase() + 0x30), if ok { "ARMED" } else { "NOT ARMED" });
+        ok
+    }
+}
+
+pub fn pet() {
+    unsafe { outw(base(), 1) };
+}
+
+/// ACPI PM timer (PMBASE+0x08, 3.579545 MHz, 24-bit) based delay; same block on ICH9 and NM10.
+fn pm_timer() -> u32 {
+    unsafe { inl(pmbase() + 8) & 0x00FF_FFFF }
+}
+
+pub fn delay_ms(ms: u32) {
+    let need = ms as u64 * 3_579_545 / 1000;
+    let mut last = pm_timer();
+    let mut acc = 0u64;
+    while acc < need {
+        let now = pm_timer();
+        acc += (now.wrapping_sub(last) & 0x00FF_FFFF) as u64;
+        last = now;
+    }
+}
+
+/// `wdt=pet:N` pets every 500 ms for N s, then stops and hangs. `wdt=hang` hangs at once.
+pub fn rehearse(cmdline: &str) -> bool {
+    let Some(i) = cmdline.find("wdt=") else { return false };
+    let arg = cmdline[i + 4..].split(' ').next().unwrap_or("");
+    if arg == "probe" {
+        return false; // attended net, handled in main (k5 hung here before the NIC: result 5 counts as armed)
+    }
+    if !armed() {
+        kprintln!("wdt: mode {} requested but watchdog not armed", arg);
+        return false;
+    }
+    let secs: u32 = arg.strip_prefix("pet:").and_then(|n| n.parse().ok()).unwrap_or(0);
+    for s in 0..secs {
+        for _ in 0..2 {
+            pet();
+            delay_ms(500);
+        }
+        kprintln!("wdt: alive t={}s (petting every 500 ms)", s + 1);
+    }
+    kprintln!("wdt: HANG now: cli; hlt with the timer running, nobody pets");
+    loop {
+        unsafe { core::arch::asm!("cli; hlt") };
+    }
+}
+11:pub const MAGIC: &[u8; 8] = b"NC110K1\n";
+89:pub fn take_client_key(info: u64) -> Option<[u8; 32]> {
+104:            if &m[..8] != MAGIC {
+proof/nc110-agentos-default.md:5:  not in the repo; the test key is rejected). Any GRUB-side failure sets next_entry=0, saves nc110_fallback=<sha8> and reboots.
+proof/nc110-agentos-default.md:6:- grubenv: saved_entry=nc110-bm-agentos-t2-d4275899 (backup /boot/grub/grubenv.bak-agentos-*). Linux = manual fallback:
+proof/nc110-agentos-default.md:7:  hold Shift through POST, GRUB menu (30 s), "Alpine NC110, with Linux lts". Nothing on Slot A rewrites saved_entry
+proof/nc110-agentos-default.md:13:| one-shot agent-OS boot from Linux | bmctl up, inherited TCO TMR=100 (GRUB-armed), key module verified |
+proof/nc110-agentos-default.md:14:| broken entry (kernel missing), default already agent OS | Linux for one boot, grubenv `nc110_fallback=fallbck0` (fallback proven) |
+proof/nc110-agentos-default.md:15:| plain reboot from Linux | **agent OS by default** in 20 s |
+proof/nc110-nolinux-demo.log:3:== 1. kick (the only Linux touch: one-shot next_entry, no file written)
+proof/nc110-nolinux-demo.log:6:== 2. build nolinux-demo-1-105727 (34968740e4a370f7), never written to /boot; load over the network
+proof/nc110-nolinux-demo.log:12:build: nolinux-demo-1-105727
+proof/nc110-nolinux-demo.log:16:== 3. build nolinux-demo-2-105757 (da3f040792859c71), never written to /boot; load over the network
+proof/nc110-nolinux-demo.log:22:build: nolinux-demo-2-105757
+proof/nc110-nolinux-demo.log:26:== 4. back to Linux over the network
+proof/nc110-nolinux-demo.log:30:== grubenv: saved_entry=0 next_entry= 
+tools/test-nic-regs.sh:2:# Host unit test: src/nic_regs.rs vs pinned Linux v6.12 r8169_main.c / 8139cp.c (third_party/linux-v6.12).
+tools/test-nic-regs.sh:5:(cd "$D/../third_party/linux-v6.12" && shasum -a 256 -c SHA256SUMS)
+grub-test/m1-nc110-entry.cfg:4:# names (spec rule 3) and boot each ONLY via next_entry from Slot A (rule 2). Run the steps in order; stop on any surprise.
+grub-test/m1-nc110-entry.cfg:9:#   entries refuse as written. The lock_mode line in nc110_tco_consts stays commented out until the Linux-side
+grub-test/m1-nc110-entry.cfg:13:# by itself and grubenv next_entry is empty afterwards.
+grub-test/m1-nc110-entry.cfg:43:# on screen, reset within ~150 s, Slot A back unaided, then (Linux) TCO2_STS at 0x1066 reads SECOND_TO_STS|BOOT_STS
+grub-test/m1-nc110-entry.cfg:73:    linux16 /baremetal/ipxe.lkrn
+tools/nc110-demo-nolinux.sh:2:# Demo for ask A179-1018-5: provisioning without going into Linux. One kick (next_entry only), then two brand-new
+tools/nc110-demo-nolinux.sh:4:# after to show the session wrote nothing to /boot. Log: proof/nc110-nolinux-demo.log
+tools/nc110-demo-nolinux.sh:7:LOG=proof/nc110-nolinux-demo.log; : > "$LOG"; exec > >(tee -a "$LOG") 2>&1
+tools/nc110-demo-nolinux.sh:12:echo "== 1. kick (the only Linux touch: one-shot next_entry, no file written)"; tools/nc110-kick.sh || exit 1
+tools/nc110-demo-nolinux.sh:14:  BID="nolinux-demo-$n-$(date +%H%M%S)"
+tools/nc110-demo-nolinux.sh:21:echo "== 4. back to Linux over the network"; $B reboot
+grub-test/build-keymod-iso.sh:8:docker run --rm --platform linux/amd64 -v "$PWD/grub-test:/w" debian:bookworm-slim sh -c '
+tools/nic_regs_test.rs:1://! Host-side check of src/nic_regs.rs against the pinned Linux v6.12 sources in third_party/linux-v6.12/.
+tools/nic_regs_test.rs:10:    let p = format!("{}/../third_party/linux-v6.12/{}", env!("NIC_TEST_DIR"), file);
+tools/nic_regs_test.rs:120:        println!("{} {:<20} ours={:#010x} linux={:#010x}  {}:{} {}", if ok { "ok  " } else { "FAIL" }, field, ours, theirs, file, line, ident);
+tools/nic_regs_test.rs:125:    assert_eq!(bad, 0, "{bad} register values differ from the cited Linux line");
+grub-test/iso/boot/grub/tco-arm.cfg:11:#            Linux iTCO_wdt does the same on v2 by default (turn_SMI_watchdog_clear_off=1 < version 2).
+tools/nc110-install-agentos.sh:2:# Install a kernel as an agent-OS version on the NC110 (run while Slot A Linux is up). Adds ONE new entry
+tools/nc110-install-agentos.sh:7:# GRUB-side failure (arming refused, kernel or module missing) sets next_entry=0 and reboots: one boot of Slot A
+tools/nc110-install-agentos.sh:8:# Linux instead of a loop, and leaves the breadcrumb nc110_fallback=<sha8> in grubenv (read it from Linux). Manual fallback any time: hold Shift through POST -> GRUB menu -> "Alpine NC110 ...".
+tools/nc110-install-agentos.sh:36:    echo \"nc110-agentos: one boot of Slot A Linux instead (next_entry=0)\"
+tools/nc110-install-agentos.sh:37:    set next_entry=0
+tools/nc110-install-agentos.sh:39:    save_env next_entry nc110_fallback
+tools/nc110-install-agentos.sh:53:  S "cp -p /boot/grub/grubenv /boot/grub/grubenv.bak-agentos-$T && grub-editenv /boot/grub/grubenv set saved_entry='$E' && sync && grub-editenv /boot/grub/grubenv list"
+tools/nc110-install-agentos.sh:72:echo "installed $E (default unchanged). Test once: next_entry=$E; make default: $0 --set-default $H"
+tools/nc110-kick.sh:2:# Start a bare-metal session on the NC110 with the ONE remaining Linux touch: one-shot next_entry to the stable
+tools/nc110-kick.sh:6:#   tools/.venv/bin/python tools/bmctl.py ping|logall|peek ...|reboot      # reboot = back to Slot A Linux
+tools/nc110-kick.sh:7:# Safety: saved_entry stays 0 (checked before and after); any hang -> TCO reset -> GRUB default -> Slot A.
+tools/nc110-kick.sh:16:grep -qx nc110 <<<"$st" && grep -qx /dev/sda2 <<<"$st" && grep -qx saved_entry=0 <<<"$st" && ! grep -q 'next_entry=.' <<<"$st" \
+tools/nc110-kick.sh:18:S "grub-editenv /boot/grub/grubenv set next_entry='$E' && grub-editenv /boot/grub/grubenv list | grep -qx 'next_entry=$E' && sync && (sleep 1; reboot) >/dev/null 2>&1 &" \
+tools/nc110-kick.sh:19:  || { echo "could not arm next_entry: STOP"; exit 2; }
+grub-test/build-iso.sh:8:docker run --rm --platform linux/amd64 -v "$PWD/grub-test:/w" debian:bookworm-slim sh -c '
+grub-test/tco-arm.cfg:11:#            Linux iTCO_wdt does the same on v2 by default (turn_SMI_watchdog_clear_off=1 < version 2).
+grub-test/nc110-attended-entries.cfg:1:# Appended to the NC110 /boot/grub/grub.cfg on 2026-10-17 (evnchn at the machine). Booted ONLY via next_entry.
+tools/wdt-mutants.sh:18:  docker run --rm --platform linux/amd64 -v "$W/g:/w" debian:bookworm-slim sh -c '
+tools/nc110-boot.sh:9:# prefix verified byte-identical, live grub-script-check, one-shot via next_entry only, saved_entry stays 0.
+tools/nc110-boot.sh:21:clear_next() {  # unset next_entry and PROVE it is gone; exit 5 if that cannot be shown
+tools/nc110-boot.sh:22:  S "grub-editenv /boot/grub/grubenv unset next_entry; sync; grub-editenv /boot/grub/grubenv list" | grep -q 'next_entry=.' \
+tools/nc110-boot.sh:23:    && { echo "next_entry STILL SET after unset: the experiment stays scheduled, needs a human"; exit 5; }
+tools/nc110-boot.sh:31:grep -qx nc110 <<<"$st" && grep -qx /dev/sda2 <<<"$st" && grep -qx saved_entry=0 <<<"$st" && ! grep -q 'next_entry=.' <<<"$st" \
+tools/nc110-boot.sh:84:S "grub-editenv /boot/grub/grubenv set next_entry='$E' && grub-editenv /boot/grub/grubenv list | grep -qx 'next_entry=$E' && sync" \
+tools/nc110-boot.sh:85:  || { echo "could not set next_entry: STOP"; clear_next; exit 2; }
+tools/nc110-boot.sh:91:    echo "reboot did not happen: clearing next_entry, STOP"; clear_next; exit 2
+tools/nc110-boot.sh:94:      grep -qx saved_entry=0 <<<"$r" && ! grep -q 'next_entry=.' <<<"$r" || { echo "BACK BUT grubenv not default: STOP"; echo "$r"; exit 4; }
+tools/nc110-boot.sh:99:echo "NOT BACK (next_entry may still be set if the reboot never happened) within $(( ${WAIT_N:-66} * 5 / 60 + 1 )) min of $(date -d @$T0 +%T 2>/dev/null || echo reboot): STOP, do not retry, needs a power cycle"
+tools/step1-linux-wdt.sh:4:# Run ONLY after evnchn typed "go 1" in the NC110 pane, with `hw claim nc110:host` held. Slot A, Linux only.
+tools/step1-linux-wdt.sh:63:for want in nc110 /dev/sda2 saved_entry=0 have_pidof have_setsid have_dd have_od pid_watchdog= fdlist=ok \
+tools/step1-linux-wdt.sh:67:grep -q 'next_entry=.' <<<"$pf" && { log "preflight: next_entry set: STOP"; exit 2; }
+
+web search: 
+web search: site.gnu.org grub manual environment block save_env plain disk checksumming filesystem keystatus shift
+codex
+The main gap is that a reset now returns to the same agent OS. That recovers transient hangs, but persistent key, NIC, or DHCP failures can loop without reaching Linux. I’m checking whether any separate remote escape exists, and whether the idle timer actually measures a working provisioning channel.
+exec
+/bin/zsh -lc "rg -n 'keystatus|timeout_style|save_env next_entry|set default|boot.*Linux|linux.*boot|Linux.*remote|linux.*loader' . --glob '"'!Cargo.lock'"' --glob '"'!proof/*.log'"' --glob '"'!proof/*.txt'"'" in ~/nc110-baremetal
+ succeeded in 0ms:
+./proof/nc110-agentos-default.md:6:- grubenv: saved_entry=nc110-bm-agentos-t2-d4275899 (backup /boot/grub/grubenv.bak-agentos-*). Linux = manual fallback:
+./proof/nc110-agentos-default.md:13:| one-shot agent-OS boot from Linux | bmctl up, inherited TCO TMR=100 (GRUB-armed), key module verified |
+./proof/nc110-agentos-default.md:15:| plain reboot from Linux | **agent OS by default** in 20 s |
+./tools/nc110-kick.sh:6:#   tools/.venv/bin/python tools/bmctl.py ping|logall|peek ...|reboot      # reboot = back to Slot A Linux
+./tools/nc110-install-agentos.sh:36:    echo \"nc110-agentos: one boot of Slot A Linux instead (next_entry=0)\"
+./tools/nc110-install-agentos.sh:39:    save_env next_entry nc110_fallback
+
+exec
+/bin/zsh -lc "sed -n '155,215p' src/wdt.rs; sed -n '1,120p' src/mb.rs; cat src/time.rs; cat tools/nc110-soak.sh; tail -15 proof/nc110-soak.log; rg --files | rg 'linux|grub|recover'" in ~/nc110-baremetal
+ succeeded in 0ms:
+        outw(b + 6, 0x0002); // TCO2_STS.SECOND_TO_STS
+        outw(b + 6, 0x0004); // TCO2_STS.BOOT_STS
+        outw(b + 0x12, (inw(b + 0x12) & !0x3FF) | 50);
+        outw(b, 1);
+        outw(b + 8, inw(b + 8) & !0x0800); // un-halt; bit 12 (lock) written back as read
+        let (g1, cnt, tmr, c0) = (read_volatile(gcs_p), inw(b + 8), inw(b + 0x12) & 0x3FF, inw(b) & 0x3FF);
+        delay_ms(1300);
+        let c1 = inw(b) & 0x3FF;
+        let ok = g1 & 0x20 == 0 && cnt & 0x0800 == 0 && tmr == 50 && c1 != c0;
+        kprintln!("wdt: probe arm: GCS {:#x} -> {:#x} TCO1_CNT={:#06x} TMR={} RLD {}->{} SMI_EN={:#x} => {}",
+            g0, g1, cnt, tmr, c0, c1, inl(pmbase() + 0x30), if ok { "ARMED" } else { "NOT ARMED" });
+        ok
+    }
+}
+
+pub fn pet() {
+    unsafe { outw(base(), 1) };
+}
+
+/// ACPI PM timer (PMBASE+0x08, 3.579545 MHz, 24-bit) based delay; same block on ICH9 and NM10.
+fn pm_timer() -> u32 {
+    unsafe { inl(pmbase() + 8) & 0x00FF_FFFF }
+}
+
+pub fn delay_ms(ms: u32) {
+    let need = ms as u64 * 3_579_545 / 1000;
+    let mut last = pm_timer();
+    let mut acc = 0u64;
+    while acc < need {
+        let now = pm_timer();
+        acc += (now.wrapping_sub(last) & 0x00FF_FFFF) as u64;
+        last = now;
+    }
+}
+
+/// `wdt=pet:N` pets every 500 ms for N s, then stops and hangs. `wdt=hang` hangs at once.
+pub fn rehearse(cmdline: &str) -> bool {
+    let Some(i) = cmdline.find("wdt=") else { return false };
+    let arg = cmdline[i + 4..].split(' ').next().unwrap_or("");
+    if arg == "probe" {
+        return false; // attended net, handled in main (k5 hung here before the NIC: result 5 counts as armed)
+    }
+    if !armed() {
+        kprintln!("wdt: mode {} requested but watchdog not armed", arg);
+        return false;
+    }
+    let secs: u32 = arg.strip_prefix("pet:").and_then(|n| n.parse().ok()).unwrap_or(0);
+    for s in 0..secs {
+        for _ in 0..2 {
+            pet();
+            delay_ms(500);
+        }
+        kprintln!("wdt: alive t={}s (petting every 500 ms)", s + 1);
+    }
+    kprintln!("wdt: HANG now: cli; hlt with the timer running, nobody pets");
+    loop {
+        unsafe { core::arch::asm!("cli; hlt") };
+    }
+}
+//! Multiboot v1 info: cmdline, memory map, and the client-key module (M2.5).
+//!
+//! The SSH client key is NOT compiled into the ELF. GRUB loads it with `module /baremetal/<file>` (QEMU:
+//! `-initrd <file>`), so the key lives on /boot and can be rotated without a rebuild.
+//! Module format (72 bytes): b"NC110K1\n" | ed25519 seed (32) | ed25519 public key (32).
+//! The kernel derives the public key from the seed and refuses on mismatch (truncation / corruption / wrong
+//! file), copies the seed into a static, then zeroes the module bytes in RAM.
+use crate::kprintln;
+use core::ptr::{read_volatile, write_volatile};
+
+pub const MAGIC: &[u8; 8] = b"NC110K1\n";
+const KEYMOD_LEN: u64 = 72;
+
+static mut RAM: [(u64, u64); 32] = [(0, 0); 32];
+static mut NRAM: usize = 0;
+static mut HAVE_MAP: bool = false;
+
+unsafe fn rd32(a: u64) -> u32 {
+    read_volatile(a as *const u32)
+}
+
+/// Record available-RAM ranges (mmap type 1, or mem_lower/mem_upper as a fallback).
+pub fn parse_memory(info: u64) {
+    unsafe {
+        if info == 0 {
+            return;
+        }
+        let flags = rd32(info);
+        if flags & (1 << 6) != 0 {
+            let len = rd32(info + 44) as u64;
+            let mut p = rd32(info + 48) as u64;
+            let end = p + len;
+            while p + 24 <= end && NRAM < 32 {
+                let size = rd32(p) as u64;
+                let base = read_volatile((p + 4) as *const u64);
+                let l = read_volatile((p + 12) as *const u64);
+                let ty = rd32(p + 20);
+                if ty == 1 && l > 0 {
+                    RAM[NRAM] = (base, l);
+                    NRAM += 1;
+                }
+                p += size + 4;
+            }
+            HAVE_MAP = true;
+        } else if flags & 1 != 0 {
+            RAM[0] = (0, rd32(info + 4) as u64 * 1024);
+            RAM[1] = (0x10_0000, rd32(info + 8) as u64 * 1024);
+            NRAM = 2;
+            HAVE_MAP = true;
+        }
+    }
+}
+
+/// True if [base, base+len) touches available RAM, or if no memory map was given (fail closed).
+pub fn ram_overlaps(base: u64, len: u64) -> bool {
+    unsafe {
+        if !HAVE_MAP {
+            return true;
+        }
+        let ram = &*core::ptr::addr_of!(RAM);
+        ram[..NRAM].iter().any(|&(b, l)| base < b + l && b < base + len)
+    }
+}
+
+/// True only if [base, base+len) lies entirely inside ONE available-RAM range of the multiboot map.
+pub fn ram_contains(base: u64, len: u64) -> bool {
+    let Some(end) = base.checked_add(len) else { return false };
+    unsafe {
+        let ram = &*core::ptr::addr_of!(RAM);
+        HAVE_MAP && ram[..NRAM].iter().any(|&(b, l)| base >= b && end <= b.saturating_add(l))
+    }
+}
+
+pub fn cmdline(info: u64) -> &'static str {
+    unsafe {
+        if info == 0 || rd32(info) & 4 == 0 {
+            return "";
+        }
+        let p = rd32(info + 16) as *const u8;
+        let mut n = 0;
+        while n < 256 && *p.add(n) != 0 {
+            n += 1;
+        }
+        core::str::from_utf8(core::slice::from_raw_parts(p, n)).unwrap_or("")
+    }
+}
+
+/// Find the key module, validate it, copy the seed out, wipe the module. None (with a log line) if absent/bad.
+pub fn take_client_key(info: u64) -> Option<[u8; 32]> {
+    unsafe {
+        if info == 0 || rd32(info) & (1 << 3) == 0 || rd32(info + 20) == 0 {
+            kprintln!("keymod: no multiboot module");
+            return None;
+        }
+        let count = rd32(info + 20).min(16) as u64;
+        let mods = rd32(info + 24) as u64;
+        for i in 0..count {
+            let e = mods + 16 * i;
+            let (start, end) = (rd32(e) as u64, rd32(e + 4) as u64);
+            if end <= start || end - start != KEYMOD_LEN {
+                continue;
+            }
+            let m = core::slice::from_raw_parts(start as *const u8, KEYMOD_LEN as usize);
+            if &m[..8] != MAGIC {
+                continue;
+            }
+            let mut seed = [0u8; 32];
+            let mut publ = [0u8; 32];
+            seed.copy_from_slice(&m[8..40]);
+            publ.copy_from_slice(&m[40..72]);
+            for j in 0..KEYMOD_LEN {
+                write_volatile((start + j) as *mut u8, 0);
+            }
+            let derived = sunset::ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+            if derived != publ {
+                kprintln!("keymod: module {} public key does not match its seed -> ignored (wiped)", i);
+                return None;
+            }
+            kprintln!("keymod: client key from module {} at {:#x} (72 B), public key verified, module wiped", i, start);
+            return Some(seed);
+//! Monotonic milliseconds from the TSC, calibrated once against PIT channel 2 (gate via port 0x61).
+use crate::port::{inb, outb, rdtsc};
+
+static mut TSC_PER_MS: u64 = 1_000_000; // fallback guess (1 GHz) if calibration fails
+static mut T0: u64 = 0;
+
+pub fn init() -> u64 {
+    unsafe {
+        // PIT ch2, mode 0, lobyte/hibyte, count for 10 ms at 1.193182 MHz.
+        const COUNT: u16 = 11932;
+        let g = inb(0x61);
+        outb(0x61, (g & 0xFD) | 0x01); // gate on, speaker off
+        outb(0x43, 0b1011_0000);
+        outb(0x42, COUNT as u8);
+        outb(0x42, (COUNT >> 8) as u8);
+        // Re-trigger: toggle gate low->high so mode 0 starts counting now.
+        let g = inb(0x61);
+        outb(0x61, g & 0xFE);
+        outb(0x61, g | 0x01);
+        let a = rdtsc();
+        let mut spins: u64 = 0;
+        while inb(0x61) & 0x20 == 0 && spins < 200_000_000 {
+            spins += 1;
+        }
+        let b = rdtsc();
+        if spins < 200_000_000 && b > a {
+            TSC_PER_MS = ((b - a) / 10).max(1);
+        }
+        T0 = rdtsc();
+        TSC_PER_MS
+    }
+}
+
+pub fn now_ms() -> i64 {
+    unsafe { ((rdtsc() - T0) / TSC_PER_MS) as i64 }
+}
+
+/// Busy-wait at least `us` microseconds (TSC, after init()).
+pub fn delay_us(us: u64) {
+    unsafe {
+        let t = rdtsc();
+        let n = us * TSC_PER_MS / 1000 + 1;
+        while rdtsc().wrapping_sub(t) < n {
+            core::hint::spin_loop();
+        }
+    }
+}
+#!/usr/bin/env bash
+# Soak the NC110 agent OS: every 3 min an authenticated ping + stats over bmctl (also keeps the 10-min idle reset
+# away, so any reboot seen here is a real event). Log: proof/nc110-soak.log. Stdout = events only (for a Monitor):
+# START, REBOOT (boot id changed: unexpected unless we asked), LOST (n consecutive failures), HOURLY summary.
+cd "$(dirname "$0")/.."
+LOG=proof/nc110-soak.log; B="tools/.venv/bin/python tools/bmctl.py"
+t0=$(date +%s); last_boot=""; fails=0; reboots=0; oks=0; next_hour=$((t0 + 3600))
+echo "$(date '+%F %T') START soak" | tee -a "$LOG"
+while true; do
+  now=$(date +%s)
+  if r=$($B stats 2>/dev/null) && p=$($B ping 2>/dev/null); then
+    bid=$($B logall 2>/dev/null | grep -o 'boot id [0-9a-f]*' | head -1 | cut -d' ' -f3)
+    up=$(sed -n 's/.*uptime_ms=\([0-9]*\).*/\1/p' <<<"$p")
+    echo "$(date '+%F %T') ok uptime_ms=$up boot=$bid $r" >> "$LOG"
+    [ $fails -ge 2 ] && echo "$(date '+%F %T') RECOVERED after $fails failed checks, uptime_ms=$up" | tee -a "$LOG"
+    if [ -n "$last_boot" ] && [ "$bid" != "$last_boot" ]; then
+      reboots=$((reboots + 1)); echo "$(date '+%F %T') REBOOT boot id $last_boot -> $bid (uptime_ms=$up)" | tee -a "$LOG"
+    fi
+    last_boot=$bid; fails=0; oks=$((oks + 1))
+  else
+    fails=$((fails + 1)); echo "$(date '+%F %T') fail #$fails" >> "$LOG"
+    [ $fails = 2 ] && echo "$(date '+%F %T') LOST 2 consecutive checks failed" | tee -a "$LOG"
+    [ $fails = 10 ] && echo "$(date '+%F %T') LOST 30 min: may need evnchn (power cycle)" | tee -a "$LOG"
+  fi
+  if [ "$now" -ge "$next_hour" ]; then
+    echo "$(date '+%F %T') HOURLY $(( (now - t0) / 3600 )) h: ok=$oks reboots=$reboots current_boot=$last_boot" | tee -a "$LOG"
+    next_hour=$((next_hour + 3600))
+  fi
+  sleep 180
+done
+2026-10-18 23:00:28 START soak
+2026-10-18 23:00:28 ok uptime_ms=33917 boot=9851dd839a19613fc85d465a77e05819 ok=5 bad=0 replay=0 retx=0 sessions_issued=3 log_bytes=1711
+third_party/linux-v6.12/SHA256SUMS
+third_party/linux-v6.12/r8169_main.c
+third_party/linux-v6.12/README
+third_party/linux-v6.12/8139cp.c
+tools/nc110-demo-nolinux.sh
+tools/step1-linux-wdt.sh
+proof/nc110-nolinux-demo.log
+proof/wdt-grub-badrcba.log
+proof/wdt-grub-locked-accept.trace.txt
+proof/m25-grub-keymod-serial.log
+proof/attended-q35-grub-serial.log
+proof/wdt-grub-locked-accept.log
+proof/wdt-grub.log
+proof/wdt-grub-locked-refuse.log
+grub-test/nc110-attended-k3-entry.cfg
+grub-test/wdt-locked-accept.iso
+grub-test/nc110-attended-k5-entry.cfg
+grub-test/nc110-grubarm-func.cfg
+grub-test/nc110-attended-k2-entry.cfg
+grub-test/wdt-locked-refuse.iso
+grub-test/m1-nc110-entry.cfg
+grub-test/nc110-attended-k4-entry.cfg
+grub-test/build-keymod-iso.sh
+grub-test/keymod-iso/boot/grub/grub.cfg
+grub-test/iso/boot/grub/grub.cfg
+grub-test/iso/boot/grub/mode.cfg
+grub-test/iso/boot/grub/tco-arm.cfg
+grub-test/iso/boot/k.elf
+grub-test/build-iso.sh
+grub-test/tco-arm.cfg
+grub-test/nc110-attended-entries.cfg
+
+web search: 
+web search: https://www.gnu.org/software/grub/manual/grub/html_node/keystatus.html
+codex
+**The watchdog recovers execution, but it does not guarantee recovery of provisioning.** Making the agent OS the persistent default removed the previous escape to Linux after a failed kernel boot.
+
+I reviewed the requested history (two commits exist), generated the entry for `d4275899`, and traced the kernel paths. No edits or live fault injection. The checked-in proof supports successful resets and a missing-kernel fallback; it does not establish recovery from persistent failures.
+
+**MUST-FIX**
+
+1. **Persistent agent-OS failures reboot into themselves indefinitely.**  
+   [main.rs:94](~/nc110-baremetal/src/main.rs:94), [installer:53](~/nc110-baremetal/tools/nc110-install-agentos.sh:53)
+
+   | Failure | Current outcome |
+   |---|---|
+   | GRUB arm returns failure | Attempts to save a one-shot Linux boot, then reboots |
+   | Kernel or key file cannot be loaded | Same Linux fallback attempt |
+   | Key file loads but its contents are corrupt | Kernel rejects key; resets into the same bad installation |
+   | Valid key differs from the operator’s key | bmctl runs but operator cannot authenticate; idle-reset loop |
+   | NIC probe/init fails | Waits 60 seconds, resets into the same kernel |
+   | DHCP fails | bmctl gives up after 15 seconds; subsequent reset retries the same kernel |
+   | bmctl starts but never receives valid commands | Idle reset retries the same kernel |
+   | Kernel hangs before its own arming | GRUB’s already-armed watchdog covers it, provided GRUB arming completed |
+   | Kernel hangs after arming | Watchdog resets; persistent hang repeats |
+
+   Transient failures can heal. A reproducible kernel/driver/key failure cannot be repaired remotely through the broken channel.
+
+   **Needed:** a bounded boot-failure policy that reaches a known-good recovery environment automatically. Success must mean authenticated provisioning works, not merely that execution reached a petting loop. Preserve a recovery key/image independently of the shared agent key.
+
+2. **A network-loaded kernel can pet forever without provisioning; nothing outside it enforces recovery.**  
+   [loader.rs:201](~/nc110-baremetal/src/loader.rs:201)
+
+   The loader checks image integrity, addresses and handoff safety. It cannot establish that the successor implements bmctl or honours the idle deadline. After jumping, the old supervisor is gone. A successor that pets indefinitely while networking is broken defeats the watchdog indefinitely.
+
+   This is a concrete failure mode of privileged experimental kernels, not a hypothetical attacker requirement. **An independently enforced recovery deadline/reset path is needed** for the stated guarantee; another timer implemented inside the replacement kernel remains cooperative.
+
+3. **There is no implemented remote route to Linux for routine persistent repairs.**  
+   [bmctl.rs:436](~/nc110-baremetal/src/bmctl.rs:436), [loader.rs:1](~/nc110-baremetal/src/loader.rs:1)
+
+   `reboot` returns to the agent OS. The loader changes RAM only and implements a constrained Multiboot handoff, not a demonstrated Linux boot path. Updating the `/boot` netloader, GRUB configuration, or on-disk key still requires Linux through the supplied installer.
+
+   Shift is explicitly a hands-required route. Even with healthy bmctl, persistent maintenance lacks a supported remote transition. **Add and prove a remote recovery-boot operation**, plus an automatic escape when bmctl itself is unavailable.
+
+4. **The GRUB error fallback depends on an unchecked write succeeding.**  
+   [installer:36](~/nc110-baremetal/tools/nc110-install-agentos.sh:36)
+
+   `save_env next_entry nc110_fallback` is followed unconditionally by `sleep` and `reboot`. If saving fails while the old environment remains readable, the next boot selects the failing agent entry again.
+
+   Ext2 is not inherently a problem: GRUB supports its preallocated environment block on plain disks with non-checksumming filesystems through supported firmware disk access. But filesystem type alone does not guarantee writes succeed. The recorded missing-kernel test proves the happy write path only. [GNU GRUB environment-block documentation](https://www.gnu.org/software/grub/manual/grub/html_node/Environment-block.html)
+
+   **Needed:** check persistence failure and provide a same-boot Linux fallback that does not require that write. Separately verify the deployed header’s `next_entry` consumption/clearing behaviour; that header is absent from the reviewed artifacts.
+
+**SHOULD-FIX**
+
+5. **The idle reset is useful, but weaker than “10-minute NIC self-heal.”**  
+   [bmctl.rs:262](~/nc110-baremetal/src/bmctl.rs:262), [bmctl.rs:352](~/nc110-baremetal/src/bmctl.rs:352)
+
+   Bounded receive polling and rejecting unauthenticated/replayed traffic as keepalives are good. A nonresponsive NIC normally causes the deadline to expire; a poll that hangs without further pets lets the hardware watchdog fire.
+
+   However:
+   - Expiry **returns** to `main`, which logs and pets for another 60 seconds before resetting. Normal recovery is roughly **11 minutes plus boot**, not ten.
+   - Fresh authenticated requests refresh `last_ok` before successful reply delivery. A transmit-only failure can remain hidden if an existing client keeps sending fresh authenticated requests.
+   - Reset recovery of an actual wedged NIC is not established by the provided proof. The soak log contains only its initial successful sample.
+
+   Test receive-only/transmit-only failures and actual NIC reset recovery. Use an acknowledged round trip if the deadline is intended to represent channel health.
+
+6. **Shift and pre-menu recovery remain unproven boundaries.**  
+   [nc110-grubarm-func.cfg:1](~/nc110-baremetal/grub-test/nc110-grubarm-func.cfg:1), [proof:6](~/nc110-baremetal/proof/nc110-agentos-default.md:6)
+
+   Arming occurs inside the selected entry. A cold-boot hang before that point has no protection established by these files. Conversely, if a running TCO survives a reboot, firmware must stop/reload it or reach recovery before expiry. A reset before GRUB reaches its keyboard check cannot be escaped by that check.
+
+   I would **not claim such a loop currently exists**: the recorded successful watchdog reboot argues against it on the tested path. But the full deployed menu/header, Shift behaviour during repeated resets, and Linux’s takeover of an inherited watchdog need verification. Shift alone never satisfies remote recoverability.
+
+**NIT**
+
+- Comments still promise “Slot A on any reset” in `main.rs`, `loader.rs`, and older tooling. Those promises are now false and can mislead an operator during recovery.
+- Reset loops are not automatically flash-wear loops: TCO register writes do not write `/boot`. GRUB fallback attempts do repeatedly write the environment block; Linux boots may write logs, and repeated resets impose hardware cycling. Quantitative wear cannot be inferred here. The immediate demonstrated risk is indefinite loss of provisioning.
+
+**Score: 3/10 for “provisioning channel cannot break without needing hands.”**
+tokens used
+63,043
+**The watchdog recovers execution, but it does not guarantee recovery of provisioning.** Making the agent OS the persistent default removed the previous escape to Linux after a failed kernel boot.
+
+I reviewed the requested history (two commits exist), generated the entry for `d4275899`, and traced the kernel paths. No edits or live fault injection. The checked-in proof supports successful resets and a missing-kernel fallback; it does not establish recovery from persistent failures.
+
+**MUST-FIX**
+
+1. **Persistent agent-OS failures reboot into themselves indefinitely.**  
+   [main.rs:94](~/nc110-baremetal/src/main.rs:94), [installer:53](~/nc110-baremetal/tools/nc110-install-agentos.sh:53)
+
+   | Failure | Current outcome |
+   |---|---|
+   | GRUB arm returns failure | Attempts to save a one-shot Linux boot, then reboots |
+   | Kernel or key file cannot be loaded | Same Linux fallback attempt |
+   | Key file loads but its contents are corrupt | Kernel rejects key; resets into the same bad installation |
+   | Valid key differs from the operator’s key | bmctl runs but operator cannot authenticate; idle-reset loop |
+   | NIC probe/init fails | Waits 60 seconds, resets into the same kernel |
+   | DHCP fails | bmctl gives up after 15 seconds; subsequent reset retries the same kernel |
+   | bmctl starts but never receives valid commands | Idle reset retries the same kernel |
+   | Kernel hangs before its own arming | GRUB’s already-armed watchdog covers it, provided GRUB arming completed |
+   | Kernel hangs after arming | Watchdog resets; persistent hang repeats |
+
+   Transient failures can heal. A reproducible kernel/driver/key failure cannot be repaired remotely through the broken channel.
+
+   **Needed:** a bounded boot-failure policy that reaches a known-good recovery environment automatically. Success must mean authenticated provisioning works, not merely that execution reached a petting loop. Preserve a recovery key/image independently of the shared agent key.
+
+2. **A network-loaded kernel can pet forever without provisioning; nothing outside it enforces recovery.**  
+   [loader.rs:201](~/nc110-baremetal/src/loader.rs:201)
+
+   The loader checks image integrity, addresses and handoff safety. It cannot establish that the successor implements bmctl or honours the idle deadline. After jumping, the old supervisor is gone. A successor that pets indefinitely while networking is broken defeats the watchdog indefinitely.
+
+   This is a concrete failure mode of privileged experimental kernels, not a hypothetical attacker requirement. **An independently enforced recovery deadline/reset path is needed** for the stated guarantee; another timer implemented inside the replacement kernel remains cooperative.
+
+3. **There is no implemented remote route to Linux for routine persistent repairs.**  
+   [bmctl.rs:436](~/nc110-baremetal/src/bmctl.rs:436), [loader.rs:1](~/nc110-baremetal/src/loader.rs:1)
+
+   `reboot` returns to the agent OS. The loader changes RAM only and implements a constrained Multiboot handoff, not a demonstrated Linux boot path. Updating the `/boot` netloader, GRUB configuration, or on-disk key still requires Linux through the supplied installer.
+
+   Shift is explicitly a hands-required route. Even with healthy bmctl, persistent maintenance lacks a supported remote transition. **Add and prove a remote recovery-boot operation**, plus an automatic escape when bmctl itself is unavailable.
+
+4. **The GRUB error fallback depends on an unchecked write succeeding.**  
+   [installer:36](~/nc110-baremetal/tools/nc110-install-agentos.sh:36)
+
+   `save_env next_entry nc110_fallback` is followed unconditionally by `sleep` and `reboot`. If saving fails while the old environment remains readable, the next boot selects the failing agent entry again.
+
+   Ext2 is not inherently a problem: GRUB supports its preallocated environment block on plain disks with non-checksumming filesystems through supported firmware disk access. But filesystem type alone does not guarantee writes succeed. The recorded missing-kernel test proves the happy write path only. [GNU GRUB environment-block documentation](https://www.gnu.org/software/grub/manual/grub/html_node/Environment-block.html)
+
+   **Needed:** check persistence failure and provide a same-boot Linux fallback that does not require that write. Separately verify the deployed header’s `next_entry` consumption/clearing behaviour; that header is absent from the reviewed artifacts.
+
+**SHOULD-FIX**
+
+5. **The idle reset is useful, but weaker than “10-minute NIC self-heal.”**  
+   [bmctl.rs:262](~/nc110-baremetal/src/bmctl.rs:262), [bmctl.rs:352](~/nc110-baremetal/src/bmctl.rs:352)
+
+   Bounded receive polling and rejecting unauthenticated/replayed traffic as keepalives are good. A nonresponsive NIC normally causes the deadline to expire; a poll that hangs without further pets lets the hardware watchdog fire.
+
+   However:
+   - Expiry **returns** to `main`, which logs and pets for another 60 seconds before resetting. Normal recovery is roughly **11 minutes plus boot**, not ten.
+   - Fresh authenticated requests refresh `last_ok` before successful reply delivery. A transmit-only failure can remain hidden if an existing client keeps sending fresh authenticated requests.
+   - Reset recovery of an actual wedged NIC is not established by the provided proof. The soak log contains only its initial successful sample.
+
+   Test receive-only/transmit-only failures and actual NIC reset recovery. Use an acknowledged round trip if the deadline is intended to represent channel health.
+
+6. **Shift and pre-menu recovery remain unproven boundaries.**  
+   [nc110-grubarm-func.cfg:1](~/nc110-baremetal/grub-test/nc110-grubarm-func.cfg:1), [proof:6](~/nc110-baremetal/proof/nc110-agentos-default.md:6)
+
+   Arming occurs inside the selected entry. A cold-boot hang before that point has no protection established by these files. Conversely, if a running TCO survives a reboot, firmware must stop/reload it or reach recovery before expiry. A reset before GRUB reaches its keyboard check cannot be escaped by that check.
+
+   I would **not claim such a loop currently exists**: the recorded successful watchdog reboot argues against it on the tested path. But the full deployed menu/header, Shift behaviour during repeated resets, and Linux’s takeover of an inherited watchdog need verification. Shift alone never satisfies remote recoverability.
+
+**NIT**
+
+- Comments still promise “Slot A on any reset” in `main.rs`, `loader.rs`, and older tooling. Those promises are now false and can mislead an operator during recovery.
+- Reset loops are not automatically flash-wear loops: TCO register writes do not write `/boot`. GRUB fallback attempts do repeatedly write the environment block; Linux boots may write logs, and repeated resets impose hardware cycling. Quantitative wear cannot be inferred here. The immediate demonstrated risk is indefinite loss of provisioning.
+
+**Score: 3/10 for “provisioning channel cannot break without needing hands.”**

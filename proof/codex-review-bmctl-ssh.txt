@@ -1,0 +1,2031 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a151ea-d903-7560-9274-65e26db6e315
+--------
+user
+You are a calibrated skeptic reviewing commit 271fdf4 (git show 271fdf4) in this bare-metal Rust x86_64 kernel for a Samsung NC110 netbook. Context: bmctl (src/bmctl.rs) is an authenticated UDP control channel; the operator's hard rule is that the agent provisioning channel must never break: if the board becomes un-reachable over bmctl it must reset itself (TCO watchdog + bmctl idle reset) back to the default boot. This commit refactors bmctl's loop body into Ctl::step and runs it inside the SSH client loop (src/ssh.rs) for cmdline 'bmctl ssh', REMOVING the 180 s wall-clock hard_end for that mode in favour of bmctl's idle bound (600 s without a valid authenticated command -> return -> main resets). After the SSH session ends, bmctl::serve keeps serving. Assume it is broken and try to refute: (1) is behaviour of plain 'bmctl' mode exactly preserved by the refactor (diff semantics: continue->return None, field moves, idle/jump/reboot ordering, rx budget)? (2) can the SSH-mode loop ever run (petting the watchdog) while bmctl step is not being called or while idle can never fire -- e.g. inner runner loops, blocking paths, the DHCP phase, connection failure paths, the 'finished' path, panics? (3) does any SSH path pet the watchdog forever without bmctl reachable? (4) seed/key handling regressions. Tiered findings: MUST-FIX (with concrete failure scenario), SHOULD, NIT. 'Most is sound' is a valid answer. End with a 0-10 score.
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll compare the refactor with its parent, then trace SSH control flow and watchdog servicing for paths that could leave bmctl unreachable without a reset.
+exec
+/bin/zsh -lc "git show --stat 271fdf4; git status --short; rg --files -g AGENTS.md -g '*ssh*' -g '*bmctl*' -g '*watchdog*' -g '*main*'" in ~/nc110-baremetal
+ succeeded in 0ms:
+commit 271fdf4e77ff7f22c4c920ba1ebbcac2722b0394
+Author: evnchn <user1@example.invalid>
+Date:   Mon Oct 19 10:08:14 2026 +0800
+
+    bmctl ssh: SSH terminal with bmctl served on the same interface, bounded by bmctl idle instead of 180 s
+    
+    bmctl's loop body is now Ctl::step; bmctl::serve and the SSH loop both call it. With cmdline 'bmctl ssh'
+    the session has no wall-clock cap: no valid bmctl command for idle_ms ends it (reset). After the session
+    closes, the VGA log returns and bmctl keeps serving. q35: tools/ssh-bmctl-q35-test.sh PASS; mutant with
+    the in-loop step disabled fails the during-session ping. bmctl-q35 and loader-q35 tests PASS.
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+ src/bmctl.rs                       | 231 ++++++++++++++++++++++++-------------
+ src/console.rs                     |  12 ++
+ src/main.rs                        |   8 +-
+ src/ssh.rs                         |  41 ++++++-
+ tools/docker-sshd/sshd_config.hold |  16 +++
+ tools/ssh-bmctl-q35-test.sh        |  42 +++++++
+ 6 files changed, 260 insertions(+), 90 deletions(-)
+ M proof/nc110-soak.log
+?? proof/codex-review-agentos-followup.txt
+?? proof/codex-review-agentos-followup2.txt
+?? proof/codex-review-agentos-followup3.txt
+?? proof/codex-review-agentos-followup4.txt
+?? proof/codex-review-agentos.txt
+?? proof/codex-review-bmctl-ssh.txt
+src/main.rs
+src/ssh.rs
+src/bmctl.rs
+third_party/linux-v6.12/r8169_main.c
+tools/sshd_config.m4
+tools/sshd_config.m3
+tools/bmctl.py
+tools/docker-sshd/sshd_config.hold
+tools/docker-sshd/sshd_config.load
+tools/docker-sshd/sshd_config
+tools/ssh-bmctl-q35-test.sh
+tools/bmctl-q35-test.sh
+tools/sshd_config.m45
+proof/nc110-hw-k7-sshd.log
+proof/sshd.log
+proof/attended-ssh-q35-serial.log
+proof/m3-peerkill-nofix-sshd.log
+proof/codex-review-bmctl-followup2.txt
+proof/m3-cad-sshd.log
+proof/m3-sshd.log
+proof/codex-review-bmctl-ssh.txt
+proof/m3-sshd-hostcheck.log
+proof/codex-review-bmctl.txt
+proof/m45-sshd.log
+proof/nc110-hw-k7-ssh-udplog.txt
+proof/m3-peerkill-sshd.log
+proof/m25-sshd.log
+proof/nc110-hw-k12-sshd.log
+proof/m4-sshd.log
+proof/codex-review-bmctl-followup.txt
+
+exec
+/bin/zsh -lc 'git show 271fdf4 -- src/bmctl.rs src/ssh.rs' in ~/nc110-baremetal
+ succeeded in 0ms:
+commit 271fdf4e77ff7f22c4c920ba1ebbcac2722b0394
+Author: evnchn <user1@example.invalid>
+Date:   Mon Oct 19 10:08:14 2026 +0800
+
+    bmctl ssh: SSH terminal with bmctl served on the same interface, bounded by bmctl idle instead of 180 s
+    
+    bmctl's loop body is now Ctl::step; bmctl::serve and the SSH loop both call it. With cmdline 'bmctl ssh'
+    the session has no wall-clock cap: no valid bmctl command for idle_ms ends it (reset). After the session
+    closes, the VGA log returns and bmctl keeps serving. q35: tools/ssh-bmctl-q35-test.sh PASS; mutant with
+    the in-loop step disabled fails the during-session ping. bmctl-q35 and loader-q35 tests PASS.
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/src/bmctl.rs b/src/bmctl.rs
+index 50f8026..7e7eb48 100644
+--- a/src/bmctl.rs
++++ b/src/bmctl.rs
+@@ -24,7 +24,7 @@ use chacha20::ChaCha20;
+ use poly1305::universal_hash::{KeyInit, UniversalHash};
+ use poly1305::Poly1305;
+ use sha2::{Digest, Sha256};
+-use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
++use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
+ use smoltcp::socket::{dhcpv4, udp};
+ use smoltcp::time::Instant;
+ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
+@@ -194,26 +194,53 @@ fn peek(w: &mut Writer, nic_mmio: Option<u64>, what: &str, a: &str, b: &str) ->
+     Ok(())
+ }
+ 
++/// What the caller must do after `Ctl::step`; the caller owns the NIC, so it does the hop/reset itself.
++pub enum Act {
++    Idle,
++    Reboot,
++    Jump(crate::loader::Plan),
++}
++
++/// bmctl's per-boot state, so the same command handler runs in its own loop (`serve`) or inside the SSH loop.
++pub struct Ctl {
++    seed: [u8; 32],
++    key: [u8; 32],
++    boot_id: [u8; 16],
++    bid: heapless::String<64>,
++    ip: Ipv4Address,
++    idle_ms: i64,
++    nic_mmio: Option<u64>,
++    last_ok: i64,
++    last_hello: i64,
++    ok: u32,
++    bad: u32,
++    replay: u32,
++    retx: u32,
++    next_sess: u32,
++    who_window: i64,
++    who_count: u32,
++    reboot_at: Option<i64>,
++    stage: Option<crate::loader::Stage>,
++    jump_at: Option<(i64, crate::loader::Plan)>,
++}
++
++/// The UDP socket bmctl serves on (static buffers: create it once per boot).
++pub fn socket() -> udp::Socket<'static> {
++    udp::Socket::new(
++        udp::PacketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(RX_META) }[..].as_mut(), unsafe { &mut *core::ptr::addr_of_mut!(RX_BUF) }[..].as_mut()),
++        udp::PacketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(TX_META) }[..].as_mut(), unsafe { &mut *core::ptr::addr_of_mut!(TX_BUF) }[..].as_mut()),
++    )
++}
++
+ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+-    let idle_ms = crate::mb::cmdline(info).split(' ').find_map(|w| w.strip_prefix("idle=")).and_then(|v| v.parse::<i64>().ok())
+-        .filter(|v| (5..=3600).contains(v)).map_or(IDLE_MS, |v| v * 1000);
+-    crate::loader::snapshot_boot_info(info);
+-    let nic_mmio = match nic.bus {
+-        Bus::Mmio(b) => Some(b),
+-        Bus::Pio(_) => None,
+-    };
+     if rng::init(false).is_err() {
+         return;
+     }
+-    let key = derive_key(&seed);
+-    let mut boot_id = [0u8; 16];
+     let mut rs = [0u8; 8];
+-    if rng::fill(&mut boot_id).is_err() || rng::fill(&mut rs).is_err() {
++    if rng::fill(&mut rs).is_err() {
+         kprintln!("bmctl: entropy failed -> not starting");
+         return;
+     }
+-    let mut bid = heapless::String::<64>::new();
+-    hex(&boot_id, &mut bid);
+     let mac = nic.mac;
+     let mut dev = Nic(nic);
+     let mut cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+@@ -221,10 +248,7 @@ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+     let mut iface = Interface::new(cfg, &mut dev, now());
+     let mut sockets = SocketSet::new(unsafe { &mut *core::ptr::addr_of_mut!(SOCKS) }[..].as_mut());
+     let dhcp_h = sockets.add(dhcpv4::Socket::new());
+-    let udp_h = sockets.add(udp::Socket::new(
+-        udp::PacketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(RX_META) }[..].as_mut(), unsafe { &mut *core::ptr::addr_of_mut!(RX_BUF) }[..].as_mut()),
+-        udp::PacketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(TX_META) }[..].as_mut(), unsafe { &mut *core::ptr::addr_of_mut!(TX_BUF) }[..].as_mut()),
+-    ));
++    let udp_h = sockets.add(socket());
+     let t0 = time::now_ms();
+     let mut ip = None;
+     while ip.is_none() && time::now_ms() - t0 < 15_000 {
+@@ -239,81 +263,121 @@ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+             if let Some(gw) = c.router {
+                 let _ = iface.routes_mut().add_default_ipv4_route(gw);
+             }
+-            ip = Some(c.address);
++            ip = Some(c.address.address());
+         }
+     }
+     let Some(ip) = ip else {
+         kprintln!("bmctl: no DHCP lease in 15 s -> not starting");
+         return;
+     };
+-    sockets.get_mut::<udp::Socket>(udp_h).bind(PORT).expect("bind");
+-    kprintln!("bmctl: listening on {}:{} boot id {} (idle reset after {} s)", ip.address(), PORT, bid, idle_ms / 1000);
+-    crate::udplog::dump(5);
++    let Some(mut ctl) = Ctl::new(&dev.0, seed, info, ip, sockets.get_mut::<udp::Socket>(udp_h)) else { return };
++    serve(&mut ctl, &mut iface, &mut dev, &mut sockets, udp_h);
++}
+ 
+-    let (mut last_ok, mut last_hello) = (time::now_ms(), 0i64);
+-    let (mut ok, mut bad, mut replay, mut retx) = (0u32, 0u32, 0u32, 0u32);
+-    let (mut next_sess, mut who_window, mut who_count) = (1u32, 0i64, 0u32);
+-    let sess = unsafe { &mut *core::ptr::addr_of_mut!(SESS) };
+-    let pend = unsafe { &mut *core::ptr::addr_of_mut!(PEND) };
+-    let mut reboot_at: Option<i64> = None;
+-    let mut stage: Option<crate::loader::Stage> = None;
+-    let mut jump_at: Option<(i64, crate::loader::Plan)> = None;
++/// bmctl-only loop. Returns only on the idle timeout (the caller resets); reboot and chain-load never return.
++pub fn serve(ctl: &mut Ctl, iface: &mut Interface, dev: &mut Nic, sockets: &mut SocketSet, udp_h: SocketHandle) {
+     loop {
+         wdt::pet();
+         crate::net::rx_budget(Some(32)); // bounded ingress per poll so the deadline checks below always run
+-        iface.poll(now(), &mut dev, &mut sockets);
++        iface.poll(now(), dev, sockets);
++        if let Some(a) = ctl.step(sockets.get_mut::<udp::Socket>(udp_h), time::now_ms()) {
++            if !ctl.act(a, dev) {
++                return;
++            }
++        }
++    }
++}
++
++impl Ctl {
++    /// Binds `sock` to the bmctl port. Needs `rng::init` done; None = entropy failure (printed).
++    pub fn new(nic: &Rtl, seed: [u8; 32], info: u64, ip: Ipv4Address, sock: &mut udp::Socket) -> Option<Ctl> {
++        let idle_ms = crate::mb::cmdline(info).split(' ').find_map(|w| w.strip_prefix("idle=")).and_then(|v| v.parse::<i64>().ok())
++            .filter(|v| (5..=3600).contains(v)).map_or(IDLE_MS, |v| v * 1000);
++        crate::loader::snapshot_boot_info(info);
++        let nic_mmio = match nic.bus {
++            Bus::Mmio(b) => Some(b),
++            Bus::Pio(_) => None,
++        };
++        let mut boot_id = [0u8; 16];
++        if rng::fill(&mut boot_id).is_err() {
++            kprintln!("bmctl: entropy failed -> not starting");
++            return None;
++        }
++        let mut bid = heapless::String::<64>::new();
++        hex(&boot_id, &mut bid);
++        sock.bind(PORT).expect("bind");
++        kprintln!("bmctl: listening on {}:{} boot id {} (idle reset after {} s)", ip, PORT, bid, idle_ms / 1000);
++        crate::udplog::dump(5);
+         let t = time::now_ms();
+-        if t - last_ok > idle_ms {
+-            kprintln!("bmctl: idle {} s -> reset", idle_ms / 1000);
+-            return;
++        Some(Ctl {
++            seed, key: derive_key(&seed), boot_id, bid, ip, idle_ms, nic_mmio, last_ok: t, last_hello: 0,
++            ok: 0, bad: 0, replay: 0, retx: 0, next_sess: 1, who_window: 0, who_count: 0, reboot_at: None, stage: None, jump_at: None,
++        })
++    }
++
++    /// Carries out an `Act`: reboot and chain-load never return; false = idle timeout, the caller must reset.
++    pub fn act(&mut self, a: Act, dev: &Nic) -> bool {
++        match a {
++            Act::Idle => false,
++            Act::Reboot => wdt::hard_reset(),
++            Act::Jump(p) => crate::loader::jump(&p, &dev.0),
++        }
++    }
++
++    /// Deadlines first, then at most one datagram. Only an authenticated command counts as activity (`last_ok`).
++    pub fn step(&mut self, sock: &mut udp::Socket, t: i64) -> Option<Act> {
++        if t - self.last_ok > self.idle_ms {
++            kprintln!("bmctl: idle {} s -> reset", self.idle_ms / 1000);
++            return Some(Act::Idle);
+         }
+-        if jump_at.as_ref().is_some_and(|(j, _)| t > *j) {
+-            let (_, p) = jump_at.take().unwrap();
++        if self.jump_at.as_ref().is_some_and(|(j, _)| t > *j) {
++            let (_, p) = self.jump_at.take().unwrap();
+             kprintln!("bmctl: chain-loading the staged kernel");
+             crate::udplog::dump(7);
+-            crate::loader::jump(&p, &dev.0);
++            return Some(Act::Jump(p));
+         }
+-        if reboot_at.is_some_and(|r| t > r) {
++        if self.reboot_at.is_some_and(|r| t > r) {
+             kprintln!("bmctl: reboot requested");
+-            wdt::hard_reset();
++            return Some(Act::Reboot);
+         }
+-        let sock = sockets.get_mut::<udp::Socket>(udp_h);
+-        if t - last_hello > 2000 {
+-            last_hello = t;
++        if t - self.last_hello > 2000 {
++            self.last_hello = t;
+             let mut h = heapless::String::<128>::new();
+-            let _ = core::fmt::write(&mut h, format_args!("nc110 hello bmctl {}:{} boot {}", ip.address(), PORT, bid));
++            let _ = core::fmt::write(&mut h, format_args!("nc110 hello bmctl {}:{} boot {}", self.ip, PORT, self.bid));
+             let _ = sock.send_slice(h.as_bytes(), IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::BROADCAST), 5514));
+         }
++        let sess = unsafe { &mut *core::ptr::addr_of_mut!(SESS) };
++        let pend = unsafe { &mut *core::ptr::addr_of_mut!(PEND) };
+         let mut buf = [0u8; 1500];
+-        let Ok((n, meta)) = sock.recv_slice(&mut buf) else { continue };
++        let Ok((n, meta)) = sock.recv_slice(&mut buf) else { return None };
+         let from = meta.endpoint;
+         if n == 3 + 16 && &buf[..3] == b"who" {
+-            if t - who_window > 1000 {
+-                (who_window, who_count) = (t, 0);
++            if t - self.who_window > 1000 {
++                (self.who_window, self.who_count) = (t, 0);
+             }
+-            who_count += 1;
+-            if who_count > 10 {
+-                continue; // global cap: at most 10 clear-text replies per second (reflection)
++            self.who_count += 1;
++            if self.who_count > 10 {
++                return None; // global cap: at most 10 clear-text replies per second (reflection)
+             }
+             // Unauthenticated `who` only ever writes the pending table (round-robin), never an authenticated session.
+-            let slot = Some((next_sess as usize) % pend.len());
+-            let (Some(slot), Some(next)) = (slot, next_sess.checked_add(1)) else { continue };
+-            let id = next_sess;
+-            next_sess = next;
++            let slot = Some((self.next_sess as usize) % pend.len());
++            let (Some(slot), Some(next)) = (slot, self.next_sess.checked_add(1)) else { return None };
++            let id = self.next_sess;
++            self.next_sess = next;
+             let mut nc = [0u8; 16];
+             nc.copy_from_slice(&buf[3..19]);
+-            pend[slot] = Some(Sess { id, key: session_key(&key, &boot_id, id, &nc), last_seq: 0, peer: Some(from), last_t: t, retx: 0, reply: [0; 8 + 1300 + 16], reply_len: 0 });
++            pend[slot] = Some(Sess { id, key: session_key(&self.key, &self.boot_id, id, &nc), last_seq: 0, peer: Some(from), last_t: t, retx: 0, reply: [0; 8 + 1300 + 16], reply_len: 0 });
+             let mut chk = heapless::String::<64>::new();
+-            hex(&who_check(&key, &nc, &boot_id, id)[..16], &mut chk);
++            hex(&who_check(&self.key, &nc, &self.boot_id, id)[..16], &mut chk);
+             let mut h = heapless::String::<160>::new();
+-            let _ = core::fmt::write(&mut h, format_args!("nc110 boot {} session {} check {}", bid, id, chk));
++            let _ = core::fmt::write(&mut h, format_args!("nc110 boot {} session {} check {}", self.bid, id, chk));
+             let _ = sock.send_slice(h.as_bytes(), from);
+-            continue;
++            return None;
+         }
+         // Frame: [session u32 LE][seq u64 LE][ct][tag]
+         if n < 4 + 8 + 16 {
+-            bad += 1;
+-            continue;
++            self.bad += 1;
++            return None;
+         }
+         let sid = u32::from_le_bytes(buf[..4].try_into().unwrap());
+         // Authenticated session, or a pending one from the endpoint that asked `who` (promoted below once the frame
+@@ -324,33 +388,33 @@ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+             (Some(i), _) => sess[i].as_mut().unwrap(),
+             (None, Some(i)) => pend[i].as_mut().unwrap(),
+             _ => {
+-                bad += 1;
+-                continue;
++                self.bad += 1;
++                return None;
+             }
+         };
+         let seq = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+         let (body, tg) = buf[12..n].split_at_mut(n - 12 - 16);
+-        if !open(&se.key, &nonce(b"C2K\0", seq), &boot_id, body, tg) {
+-            bad += 1;
+-            continue;
++        if !open(&se.key, &nonce(b"C2K\0", seq), &self.boot_id, body, tg) {
++            self.bad += 1;
++            return None;
+         }
+         if seq == se.last_seq && se.reply_len > 0 {
+             if se.retx >= 5 {
+-                continue; // cap resends of one reply
++                return None; // cap resends of one reply
+             }
+             se.retx += 1;
+-            retx += 1; // retry of the last request: same bytes again (to the bound peer), nothing re-executed
++            self.retx += 1; // retry of the last request: same bytes again (to the bound peer), nothing re-executed
+             let _ = sock.send_slice(&se.reply[..se.reply_len], from);
+-            continue;
++            return None;
+         }
+         if seq <= se.last_seq {
+-            replay += 1;
+-            continue;
++            self.replay += 1;
++            return None;
+         }
+         se.last_seq = seq;
+         se.last_t = t;
+         se.retx = 0;
+-        last_ok = t;
++        self.last_ok = t;
+         let se = if let (None, Some(i)) = (in_sess, in_pend) {
+             let dst = (0..sess.len()).find(|&j| sess[j].is_none())
+                 .unwrap_or_else(|| (0..sess.len()).min_by_key(|&j| sess[j].as_ref().map_or(i64::MIN, |x| x.last_t)).unwrap());
+@@ -359,18 +423,18 @@ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+         } else {
+             se
+         };
+-        ok += 1;
++        self.ok += 1;
+         let mut out = [0u8; 1300];
+         let len = {
+             let mut w = Writer { b: &mut out, n: 0 };
+             let loading = |c: &[u8]| c.starts_with(b"ldat") || c.starts_with(b"lbeg") || c.starts_with(b"lcom"); // incl. lcomlinux
+-            if jump_at.is_some() && loading(body) {
++            if self.jump_at.is_some() && loading(body) {
+                 // committed: the staged image is frozen until the hop (Codex loader MUST-FIX 2)
+                 let _ = core::fmt::write(&mut w, format_args!("err committed, jump pending"));
+             } else if body.len() >= 8 && &body[..4] == b"ldat" {
+                 // binary chunk: "ldat" ++ u32 LE offset ++ bytes (checked before the text parser)
+                 let off = u32::from_le_bytes(body[4..8].try_into().unwrap()) as u64;
+-                let r = match stage.as_mut() {
++                let r = match self.stage.as_mut() {
+                     Some(st) => crate::loader::data(st, off, &body[8..]),
+                     None => Err("no lbeg"),
+                 };
+@@ -387,7 +451,7 @@ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+                     let size: u64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                     match crate::loader::begin(size, it.next().unwrap_or("")) {
+                         Ok(st) => {
+-                            stage = Some(st);
++                            self.stage = Some(st);
+                             let _ = core::fmt::write(&mut w, format_args!("ok staging {} B at {:#x}", size, crate::loader::STAGE));
+                         }
+                         Err(e) => { let _ = core::fmt::write(&mut w, format_args!("err {}", e)); }
+@@ -395,37 +459,37 @@ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+                 }
+                 "lcomlinux" => {
+                     let rest = cmd.splitn(2, ' ').nth(1).unwrap_or("");
+-                    let r = match stage.as_ref() {
++                    let r = match self.stage.as_ref() {
+                         Some(st) => crate::loader::prepare_linux(st, rest),
+                         None => Err("no lbeg"),
+                     };
+                     match r {
+                         Ok(p) => {
+                             let _ = core::fmt::write(&mut w, format_args!("ok booting Linux in 300 ms"));
+-                            jump_at = Some((t + 300, p));
++                            self.jump_at = Some((t + 300, p));
+                         }
+                         Err(e) => { let _ = core::fmt::write(&mut w, format_args!("err {}", e)); }
+                     }
+                 }
+                 "lcom" => {
+                     let rest = cmd.splitn(2, ' ').nth(1).unwrap_or("");
+-                    let r = match stage.as_ref() {
+-                        Some(st) => crate::loader::prepare(st, rest, &seed),
++                    let r = match self.stage.as_ref() {
++                        Some(st) => crate::loader::prepare(st, rest, &self.seed),
+                         None => Err("no lbeg"),
+                     };
+                     match r {
+                         Ok(p) => {
+                             let _ = core::fmt::write(&mut w, format_args!("ok jumping in 300 ms"));
+-                            jump_at = Some((t + 300, p)); // the reply leaves first, then the hop
++                            self.jump_at = Some((t + 300, p)); // the reply leaves first, then the hop
+                         }
+                         Err(e) => { let _ = core::fmt::write(&mut w, format_args!("err {}", e)); }
+                     }
+                 }
+                 "ping" => {
+-                    let _ = core::fmt::write(&mut w, format_args!("pong uptime_ms={} ip={}", t, ip.address()));
++                    let _ = core::fmt::write(&mut w, format_args!("pong uptime_ms={} ip={}", t, self.ip));
+                 }
+                 "stats" => {
+-                    let _ = core::fmt::write(&mut w, format_args!("ok={} bad={} replay={} retx={} sessions_issued={} log_bytes={}", ok, bad, replay, retx, next_sess - 1, console::captured().len()));
++                    let _ = core::fmt::write(&mut w, format_args!("ok={} bad={} replay={} retx={} sessions_issued={} log_bytes={}", self.ok, self.bad, self.replay, self.retx, self.next_sess - 1, console::captured().len()));
+                 }
+                 "log" => {
+                     let off: usize = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+@@ -436,7 +500,7 @@ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+                 }
+                 "peek" => {
+                     let (what, x, y) = (it.next().unwrap_or(""), it.next().unwrap_or(""), it.next().unwrap_or(""));
+-                    if let Err(e) = peek(&mut w, nic_mmio, what, x, y) {
++                    if let Err(e) = peek(&mut w, self.nic_mmio, what, x, y) {
+                         w.n = 0;
+                         let _ = core::fmt::write(&mut w, format_args!("err {}", e));
+                     }
+@@ -449,7 +513,7 @@ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+                 }
+                 "reboot" => {
+                     let _ = core::fmt::write(&mut w, format_args!("rebooting in 500 ms"));
+-                    reboot_at = Some(t + 500);
++                    self.reboot_at = Some(t + 500);
+                 }
+                 _ => {
+                     let _ = core::fmt::write(&mut w, format_args!("err unknown command (ping|stats|log <off>|peek ...|rng <n>|lbeg|ldat|lcom|lcomlinux|reboot)"));
+@@ -460,10 +524,11 @@ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+         let pkt = &mut se.reply;
+         pkt[..8].copy_from_slice(&seq.to_le_bytes());
+         pkt[8..8 + len].copy_from_slice(&out[..len]);
+-        let tg = seal(&se.key, &nonce(b"K2C\0", seq), &boot_id, &mut pkt[8..8 + len]);
++        let tg = seal(&se.key, &nonce(b"K2C\0", seq), &self.boot_id, &mut pkt[8..8 + len]);
+         pkt[8 + len..8 + len + 16].copy_from_slice(&tg);
+         se.reply_len = 8 + len + 16;
+         let _ = sock.send_slice(&se.reply[..se.reply_len], from);
++        None
+     }
+ }
+ 
+diff --git a/src/ssh.rs b/src/ssh.rs
+index cd35015..f0897ca 100644
+--- a/src/ssh.rs
++++ b/src/ssh.rs
+@@ -7,10 +7,10 @@
+ //! channel's output is drawn by the VGA terminal (`term`), and mirrored to COM1 with ESC shown as `^[`.
+ use crate::net::Nic;
+ use crate::nic::Rtl;
+-use crate::{console, kbd, kprintln, rng, term, time, wdt};
++use crate::{bmctl, console, kbd, kprintln, rng, term, time, wdt};
+ use sha2::{Digest, Sha256};
+ use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+-use smoltcp::socket::{dhcpv4, tcp};
++use smoltcp::socket::{dhcpv4, tcp, udp};
+ use smoltcp::time::Instant;
+ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+ use sunset::{ChanData, ChanHandle, CliEvent, Event, Pty, PubKey, Runner, SignKey};
+@@ -81,7 +81,10 @@ fn fp_str(key: &[u8; 32]) -> [u8; 43] {
+ }
+ 
+ /// `client_seed`: the ed25519 seed loaded from the multiboot key module (never compiled in, M2.5).
+-pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
++/// `bm = Some(info)`: serve bmctl on the same interface for the whole session and after it (attended `bmctl ssh`).
++/// The control channel then bounds the session instead of a wall clock: no valid bmctl command for the idle time
++/// (default 600 s) ends it and returns, so the caller resets.
++pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool, bm: Option<u64>) {
+     let Some(mut client_seed) = client_seed else {
+         kprintln!("ssh: no client key module (GRUB `module` / QEMU -initrd) -> refusing to run SSH");
+         return;
+@@ -103,6 +106,7 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+ 
+     let mut sockets = SocketSet::new(unsafe { &mut *core::ptr::addr_of_mut!(SOCK_STORE) }[..].as_mut());
+     let dhcp_h = sockets.add(dhcpv4::Socket::new());
++    let udp_h = sockets.add(bmctl::socket());
+     let tcp_h = sockets.add(tcp::Socket::new(
+         tcp::SocketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(TCP_RX) }[..].as_mut()),
+         tcp::SocketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(TCP_TX) }[..].as_mut()),
+@@ -134,6 +138,18 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+         let _ = iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2));
+     }
+ 
++    let mut ctl = match bm {
++        Some(info) => {
++            let ip = iface.ipv4_addr().unwrap_or(Ipv4Address::new(10, 0, 2, 15));
++            match bmctl::Ctl::new(&dev.0, client_seed, info, ip, sockets.get_mut::<udp::Socket>(udp_h)) {
++                Some(c) => Some(c),
++                None => return,
++            }
++        }
++        None => None,
++    };
++    let mut bm_idle = false;
++
+     // ---- TCP connect ----
+     let lport = 49152 + (u16::from_le_bytes([seed[0], seed[1]]) % 16000);
+     sockets
+@@ -175,12 +191,23 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+     // output cannot keep this loop petting the watchdog forever (Codex night review MUST-FIX 2).
+     let hard_end = time::now_ms() + 180_000;
+ 
+-    'outer: while (got_output || time::now_ms() < deadline) && (!cfg!(feature = "attended") || time::now_ms() < hard_end) {
++    'outer: while (got_output || time::now_ms() < deadline) && (!cfg!(feature = "attended") || ctl.is_some() || time::now_ms() < hard_end) {
+         if wdt::armed() && time::now_ms() - last_pet >= 1000 {
+             wdt::pet(); // the main loop is the liveness signal: a hang anywhere in it stops the petting
+             last_pet = time::now_ms();
+         }
++        if ctl.is_some() {
++            crate::net::rx_budget(Some(64)); // bmctl's deadlines run every pass even under a flood
++        }
+         iface.poll(now(), &mut dev, &mut sockets);
++        if let Some(c) = ctl.as_mut() {
++            if let Some(a) = c.step(sockets.get_mut::<udp::Socket>(udp_h), time::now_ms()) {
++                if !c.act(a, &dev) {
++                    bm_idle = true;
++                    break 'outer;
++                }
++            }
++        }
+         let sock = sockets.get_mut::<tcp::Socket>(tcp_h);
+         if !connected {
+             if sock.may_send() {
+@@ -452,4 +479,10 @@ pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool) {
+     } else {
+         kprintln!("ssh: stopped before (d)");
+     }
++    if let (Some(c), false) = (ctl.as_mut(), bm_idle) {
++        sockets.get_mut::<tcp::Socket>(tcp_h).abort();
++        console::vga_log_on();
++        kprintln!("ssh: session over; bmctl keeps serving (reboot / load to start another)");
++        bmctl::serve(c, &mut iface, &mut dev, &mut sockets, udp_h);
++    }
+ }
+
+exec
+/bin/zsh -lc 'git show 271fdf4 -- src/main.rs src/console.rs tools/ssh-bmctl-q35-test.sh; cat src/ssh.rs' in ~/nc110-baremetal
+ succeeded in 0ms:
+commit 271fdf4e77ff7f22c4c920ba1ebbcac2722b0394
+Author: evnchn <user1@example.invalid>
+Date:   Mon Oct 19 10:08:14 2026 +0800
+
+    bmctl ssh: SSH terminal with bmctl served on the same interface, bounded by bmctl idle instead of 180 s
+    
+    bmctl's loop body is now Ctl::step; bmctl::serve and the SSH loop both call it. With cmdline 'bmctl ssh'
+    the session has no wall-clock cap: no valid bmctl command for idle_ms ends it (reset). After the session
+    closes, the VGA log returns and bmctl keeps serving. q35: tools/ssh-bmctl-q35-test.sh PASS; mutant with
+    the in-loop step disabled fails the during-session ping. bmctl-q35 and loader-q35 tests PASS.
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/src/console.rs b/src/console.rs
+index d30c91d..1f64c0e 100644
+--- a/src/console.rs
++++ b/src/console.rs
+@@ -17,6 +17,18 @@ pub fn vga_log_off() {
+     unsafe { VGA_LOG = false };
+ }
+ 
++/// Back from the SSH terminal: blank the screen and log to it again.
++pub fn vga_log_on() {
++    unsafe {
++        for i in 0..W * H {
++            VGA.add(i).write_volatile(ATTR | b' ' as u16);
++        }
++        ROW = 0;
++        COL = 0;
++        VGA_LOG = true;
++    }
++}
++
+ /// Raw byte to COM1 (used to mirror the remote shell's output into the serial log).
+ pub fn serial_raw(b: u8) {
+     serial_putc(b);
+diff --git a/src/main.rs b/src/main.rs
+index 0616d60..d267a3d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -91,15 +91,17 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
+                             unsafe { asm!("cli; hlt") };
+                         }
+                     }
+-                    if let (Some(seed), true) = (client_seed, cmdline.contains("bmctl")) {
++                    if let (Some(_), true, true) = (client_seed, cmdline.contains("bmctl"), cmdline.split(' ').any(|w| w == "ssh")) {
++                        ssh::run(n, client_seed, cmdline.contains("rng=dump"), Some(info));
++                    } else if let (Some(seed), true) = (client_seed, cmdline.contains("bmctl")) {
+                         bmctl::run(n, seed, info);
+                     } else if client_seed.is_some() {
+-                        ssh::run(n, client_seed, cmdline.contains("rng=dump"));
++                        ssh::run(n, client_seed, cmdline.contains("rng=dump"), None);
+                     }
+                     kprintln!("attended: final log round, then reset");
+                     udplog::dump(4);
+                 }
+-                Ok(()) => ssh::run(n, client_seed, cmdline.contains("rng=dump")),
++                Ok(()) => ssh::run(n, client_seed, cmdline.contains("rng=dump"), None),
+                 Err(e) => kprintln!("nic: init failed: {} (bus mastering left off)", e),
+             }
+         }
+diff --git a/tools/ssh-bmctl-q35-test.sh b/tools/ssh-bmctl-q35-test.sh
+new file mode 100755
+index 0000000..fb0cf63
+--- /dev/null
++++ b/tools/ssh-bmctl-q35-test.sh
+@@ -0,0 +1,42 @@
++#!/bin/sh
++# q35 check of `bmctl ssh` (attended): bmctl answers WHILE the SSH shell is open, keeps serving after it closes, and
++# its idle bound ends an open session (the control channel, not a wall clock, bounds it). Needs the throwaway sshd:
++# tools/docker-sshd/run.sh sshd_config.hold   (shell held 40 s, then exits). Exit 1 on any failure.
++export NC110_KEY=test-keys/client.key
++K=target/attended/x86_64-unknown-none/release/nc110-kernel; P=tools/.venv/bin/python; fail=0; L=/tmp/sshbm-q35.log
++B="$P tools/bmctl.py --host 127.0.0.1 --port 15515"
++boot() {  # $1 extra cmdline
++  rm -f $L
++  qemu-system-x86_64 -machine q35 -m 128 -display none -no-reboot -global ICH9-LPC.noreboot=false -serial file:$L \
++    -kernel $K -initrd test-keys/client.key -append "bmctl ssh nic=mmio $1" -netdev user,id=n0,hostfwd=udp:127.0.0.1:15515-:5515 \
++    -device rtl8139,netdev=n0 &
++  Q=$!
++}
++waitfor() {  # $1 pattern $2 seconds
++  for i in $(seq $(($2 * 2))); do grep -q "$1" $L 2>/dev/null && return 0; sleep 0.5; done; echo "FAIL timeout waiting for: $1"; fail=1; return 1
++}
++ok() { echo "ok   $1"; }
++bad() { echo "FAIL $1"; fail=1; }
++trap 'kill $Q 2>/dev/null' EXIT
++
++echo "== run 1: ping during and after the session"
++boot ""
++waitfor 'term: VGA now belongs' 60
++r=$($B ping 2>&1); case "$r" in pong*) ok "bmctl ping while the shell is open: $r";; *) bad "ping during session: $r";; esac
++grep -q 'nc110-ssh-hold' $L && ok "shell output reached the terminal" || bad "no shell output in the log"
++grep -q 'session over' $L && bad "session already over at the first ping (test did not overlap)"
++waitfor 'ssh: session over; bmctl keeps serving' 60
++r=$($B ping 2>&1); case "$r" in pong*) ok "bmctl ping after the session closed: $r";; *) bad "ping after session: $r";; esac
++r=$($B logall 2>&1 | grep -c 'session over'); [ "$r" -ge 1 ] && ok "bmctl log carries the session end" || bad "log lacks session end"
++$B reboot >/dev/null 2>&1; sleep 2
++kill -0 $Q 2>/dev/null && bad "qemu still running after bmctl reboot" || ok "bmctl reboot -> reset"
++
++echo "== run 2: idle=15, no bmctl traffic: the open session must end via the bmctl idle bound"
++boot "idle=15"
++waitfor 'term: VGA now belongs' 60
++waitfor 'bmctl: idle 15 s -> reset' 30 && ok "idle bound fired during the open session"
++grep -q 'session over' $L && bad "serve loop entered after idle (should reset)" || ok "no serve after idle"
++waitfor 'hard reset via 0xCF9' 20 && ok "reset path taken"
++for i in $(seq 70); do kill -0 $Q 2>/dev/null || break; sleep 1; done
++kill -0 $Q 2>/dev/null && bad "qemu still running 70 s after idle" || ok "qemu reset after idle"
++echo "RESULT: $([ $fail = 0 ] && echo PASS || echo FAIL)"; exit $fail
+//! M2/M3: DHCP + TCP (smoltcp) + SSH client (Sunset) against a throwaway sshd on the host.
+//!
+//! Milestones are printed one per line so the furthest one reached is unambiguous:
+//!   (a) TCP connect + server banner   (b) key exchange done, host key matched the pin
+//!   (c) publickey auth OK             (d) channel output
+//! M3: the session asks for a pty (xterm 80x25) and a shell; PS/2 keystrokes go to the channel and the
+//! channel's output is drawn by the VGA terminal (`term`), and mirrored to COM1 with ESC shown as `^[`.
+use crate::net::Nic;
+use crate::nic::Rtl;
+use crate::{bmctl, console, kbd, kprintln, rng, term, time, wdt};
+use sha2::{Digest, Sha256};
+use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+use smoltcp::socket::{dhcpv4, tcp, udp};
+use smoltcp::time::Instant;
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+use sunset::{ChanData, ChanHandle, CliEvent, Event, Pty, PubKey, Runner, SignKey};
+
+// QEMU slirp's host alias; the attended NC110 build talks to the throwaway Docker sshd on .179 instead.
+const SERVER: (Ipv4Address, u16) = if cfg!(feature = "attended") {
+    (Ipv4Address::new(192, 168, 50, 95), 2223)
+} else {
+    (Ipv4Address::new(10, 0, 2, 2), 2223)
+};
+const USER: &str = "evnchn";
+
+/// The ONE host key we accept: raw ed25519 public key of the throwaway sshd's host key.
+#[cfg(not(feature = "badpin"))]
+const HOST_PIN: [u8; 32] = *include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/test-keys/host_pub.bin"));
+/// Negative control: same pin with one bit flipped, must be rejected.
+#[cfg(feature = "badpin")]
+const HOST_PIN: [u8; 32] = {
+    let mut k = *include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/test-keys/host_pub.bin"));
+    k[0] ^= 0x01;
+    k
+};
+
+static mut SOCK_STORE: [SocketStorage<'static>; 3] = [SocketStorage::EMPTY; 3];
+static mut TCP_RX: [u8; 16384] = [0; 16384];
+static mut TCP_TX: [u8; 16384] = [0; 16384];
+static mut SSH_IN: [u8; 36000] = [0; 36000];
+static mut SSH_OUT: [u8; 36000] = [0; 36000];
+
+fn now() -> Instant {
+    Instant::from_millis(time::now_ms())
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// OpenSSH-style "SHA256:<base64, no padding>" of the ssh-ed25519 public key blob.
+fn fingerprint(key: &[u8; 32], out: &mut [u8; 43]) {
+    let mut h = Sha256::new();
+    h.update(11u32.to_be_bytes());
+    h.update(b"ssh-ed25519");
+    h.update(32u32.to_be_bytes());
+    h.update(key);
+    let d = h.finalize();
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bits: u32 = 0;
+    let mut n = 0;
+    let mut o = 0;
+    for &b in d.iter() {
+        bits = (bits << 8) | b as u32;
+        n += 8;
+        while n >= 6 {
+            n -= 6;
+            out[o] = A[((bits >> n) & 63) as usize];
+            o += 1;
+        }
+    }
+    if n > 0 {
+        out[o] = A[((bits << (6 - n)) & 63) as usize];
+    }
+}
+
+fn fp_str(key: &[u8; 32]) -> [u8; 43] {
+    let mut f = [0u8; 43];
+    fingerprint(key, &mut f);
+    f
+}
+
+/// `client_seed`: the ed25519 seed loaded from the multiboot key module (never compiled in, M2.5).
+/// `bm = Some(info)`: serve bmctl on the same interface for the whole session and after it (attended `bmctl ssh`).
+/// The control channel then bounds the session instead of a wall clock: no valid bmctl command for the idle time
+/// (default 600 s) ends it and returns, so the caller resets.
+pub fn run(nic: Rtl, client_seed: Option<[u8; 32]>, rng_dump: bool, bm: Option<u64>) {
+    let Some(mut client_seed) = client_seed else {
+        kprintln!("ssh: no client key module (GRUB `module` / QEMU -initrd) -> refusing to run SSH");
+        return;
+    };
+    if rng::init(rng_dump).is_err() {
+        return; // rng::init already printed why
+    }
+
+    let mac = nic.mac;
+    let mut dev = Nic(nic);
+    let mut cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    let mut seed = [0u8; 8];
+    if rng::fill(&mut seed).is_err() {
+        kprintln!("rng: entropy pool failed for the network seed -> refusing to run SSH");
+        return;
+    }
+    cfg.random_seed = u64::from_le_bytes(seed);
+    let mut iface = Interface::new(cfg, &mut dev, now());
+
+    let mut sockets = SocketSet::new(unsafe { &mut *core::ptr::addr_of_mut!(SOCK_STORE) }[..].as_mut());
+    let dhcp_h = sockets.add(dhcpv4::Socket::new());
+    let udp_h = sockets.add(bmctl::socket());
+    let tcp_h = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(TCP_RX) }[..].as_mut()),
+        tcp::SocketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(TCP_TX) }[..].as_mut()),
+    ));
+
+    // ---- DHCP (smoltcp) ----
+    let t0 = time::now_ms();
+    let mut have_ip = false;
+    while time::now_ms() - t0 < 10_000 {
+        iface.poll(now(), &mut dev, &mut sockets);
+        if let Some(dhcpv4::Event::Configured(c)) = sockets.get_mut::<dhcpv4::Socket>(dhcp_h).poll() {
+            iface.update_ip_addrs(|a| {
+                a.clear();
+                let _ = a.push(IpCidr::Ipv4(c.address));
+            });
+            if let Some(gw) = c.router {
+                let _ = iface.routes_mut().add_default_ipv4_route(gw);
+            }
+            kprintln!("dhcp: smoltcp lease {} router {:?}", c.address, c.router);
+            have_ip = true;
+            break;
+        }
+    }
+    if !have_ip {
+        kprintln!("dhcp: no lease in 10 s -> static slirp fallback 10.0.2.15/24 gw 10.0.2.2");
+        iface.update_ip_addrs(|a| {
+            let _ = a.push(IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24)));
+        });
+        let _ = iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2));
+    }
+
+    let mut ctl = match bm {
+        Some(info) => {
+            let ip = iface.ipv4_addr().unwrap_or(Ipv4Address::new(10, 0, 2, 15));
+            match bmctl::Ctl::new(&dev.0, client_seed, info, ip, sockets.get_mut::<udp::Socket>(udp_h)) {
+                Some(c) => Some(c),
+                None => return,
+            }
+        }
+        None => None,
+    };
+    let mut bm_idle = false;
+
+    // ---- TCP connect ----
+    let lport = 49152 + (u16::from_le_bytes([seed[0], seed[1]]) % 16000);
+    sockets
+        .get_mut::<tcp::Socket>(tcp_h)
+        .connect(iface.context(), (IpAddress::Ipv4(SERVER.0), SERVER.1), lport)
+        .expect("tcp connect");
+    // Peer liveness: keepalive every 15 s; unacknowledged data or keepalives abort the socket after 60 s.
+    sockets.get_mut::<tcp::Socket>(tcp_h).set_keep_alive(Some(smoltcp::time::Duration::from_secs(15)));
+    sockets.get_mut::<tcp::Socket>(tcp_h).set_timeout(Some(smoltcp::time::Duration::from_secs(60)));
+    kprintln!("tcp: connecting {}:{} from :{}", SERVER.0, SERVER.1, lport);
+
+    let signkey = SignKey::Ed25519(sunset::ed25519_dalek::SigningKey::from_bytes(&client_seed));
+    for b in client_seed.iter_mut() {
+        unsafe { core::ptr::write_volatile(b, 0) }; // our copy; the SigningKey keeps its own
+    }
+    let mut runner = Runner::new_client(unsafe { &mut *core::ptr::addr_of_mut!(SSH_IN) }, unsafe {
+        &mut *core::ptr::addr_of_mut!(SSH_OUT)
+    });
+
+    let mut connected = false;
+    let mut banner_shown = false;
+    let mut banner = [0u8; 128];
+    let mut banner_len = 0usize;
+    let mut pubkey_tries = 0;
+    let mut chan: Option<ChanHandle> = None;
+    let mut kex_done = false;
+    let mut got_output = false;
+    let (mut out_bytes, mut out_t0) = (0u64, 0i64);
+    let mut finished = false;
+    let mut shell_open = false;
+    let mut winch = false; // window-change (80x25) still to send, once the session is up
+    let mut keys = [0u8; 64];
+    let mut nkeys = 0usize;
+    let mut last_pet = time::now_ms();
+    // 60 s to get as far as the shell's first output (pty/shell requests are sent want_reply=false, so output is
+    // the first sign the shell really started); after that the session lasts until it closes or the peer dies.
+    let deadline = time::now_ms() + 60_000;
+    // Attended (unattended overnight) runs: an absolute bound, so a remote shell that hangs after its first
+    // output cannot keep this loop petting the watchdog forever (Codex night review MUST-FIX 2).
+    let hard_end = time::now_ms() + 180_000;
+
+    'outer: while (got_output || time::now_ms() < deadline) && (!cfg!(feature = "attended") || ctl.is_some() || time::now_ms() < hard_end) {
+        if wdt::armed() && time::now_ms() - last_pet >= 1000 {
+            wdt::pet(); // the main loop is the liveness signal: a hang anywhere in it stops the petting
+            last_pet = time::now_ms();
+        }
+        if ctl.is_some() {
+            crate::net::rx_budget(Some(64)); // bmctl's deadlines run every pass even under a flood
+        }
+        iface.poll(now(), &mut dev, &mut sockets);
+        if let Some(c) = ctl.as_mut() {
+            if let Some(a) = c.step(sockets.get_mut::<udp::Socket>(udp_h), time::now_ms()) {
+                if !c.act(a, &dev) {
+                    bm_idle = true;
+                    break 'outer;
+                }
+            }
+        }
+        let sock = sockets.get_mut::<tcp::Socket>(tcp_h);
+        if !connected {
+            if sock.may_send() {
+                connected = true;
+                kprintln!("tcp: connected to {}:{}", SERVER.0, SERVER.1);
+            } else if !sock.is_open() {
+                kprintln!("tcp: connection failed");
+                break;
+            }
+        }
+
+        // network -> runner
+        if sock.can_recv() && runner.is_input_ready() {
+            let r = sock.recv(|buf| {
+                if !banner_shown {
+                    for &b in buf.iter() {
+                        if b == b'\n' {
+                            banner_shown = true;
+                            break;
+                        }
+                        if b != b'\r' && banner_len < banner.len() {
+                            banner[banner_len] = b;
+                            banner_len += 1;
+                        }
+                    }
+                }
+                match runner.input(buf) {
+                    Ok(n) => (n, Ok(())),
+                    Err(e) => (0, Err(e)),
+                }
+            });
+            if banner_shown && banner_len > 0 {
+                kprintln!("ssh(a): server banner: {}", core::str::from_utf8(&banner[..banner_len]).unwrap_or("?"));
+                banner_len = 0;
+            }
+            if let Ok(Err(e)) = r {
+                kprintln!("ssh: input error {:?}", e);
+                break;
+            }
+        }
+        // Peer sent FIN (CloseWait) or the socket died (reset/timeout): no more input once the buffer is drained.
+        if connected && !sock.may_recv() && !sock.can_recv() {
+            runner.close_input();
+            if !sock.is_open() {
+                kprintln!("\r\nssh: TCP connection gone ({:?}), ending session", sock.state());
+                break 'outer;
+            }
+        }
+
+        // runner events
+        loop {
+            let mut open_session = false;
+            let mut stop_all = false;
+            let mut idle = false;
+            {
+            let ev = match runner.progress() {
+                Ok(ev) => ev,
+                Err(e) => {
+                    kprintln!("ssh: error {:?}", e);
+                    break 'outer;
+                }
+            };
+            match ev {
+                Event::Cli(CliEvent::Hostkey(h)) => {
+                    let pk = match h.hostkey() {
+                        Ok(PubKey::Ed25519(k)) => Some(k.key.0),
+                        _ => None,
+                    };
+                    match pk {
+                        Some(k) if ct_eq(&k, &HOST_PIN) => {
+                            let f = fp_str(&k);
+                            kprintln!(
+                                "ssh: host key ssh-ed25519 SHA256:{} matches pin",
+                                core::str::from_utf8(&f).unwrap_or("?")
+                            );
+                            if let Err(e) = h.accept() {
+                                kprintln!("ssh: host key accept failed (exchange signature?) {:?}", e);
+                                stop_all = true;
+                            }
+                        }
+                        Some(k) => {
+                            let f = fp_str(&k);
+                            let p = fp_str(&HOST_PIN);
+                            kprintln!(
+                                "ssh: hostkey MISMATCH: got SHA256:{} pinned SHA256:{} -> rejecting",
+                                core::str::from_utf8(&f).unwrap_or("?"),
+                                core::str::from_utf8(&p).unwrap_or("?")
+                            );
+                            let _ = h.reject();
+                            stop_all = true;
+                        }
+                        None => {
+                            kprintln!("ssh: hostkey MISMATCH: not ssh-ed25519 -> rejecting");
+                            let _ = h.reject();
+                            stop_all = true;
+                        }
+                    }
+                }
+                Event::Cli(CliEvent::Banner(b)) => {
+                    kprintln!("ssh: userauth banner: {}", b.banner().unwrap_or("?"));
+                }
+                Event::Cli(CliEvent::Username(u)) => {
+                    if !kex_done {
+                        kex_done = true;
+                        kprintln!("ssh(b): key exchange done (curve25519-sha256, host sig verified, chacha20-poly1305)");
+                    }
+                    let _ = u.username(USER);
+                }
+                Event::Cli(CliEvent::Password(p)) => {
+                    let _ = p.skip();
+                }
+                Event::Cli(CliEvent::Pubkey(p)) => {
+                    if pubkey_tries == 0 {
+                        pubkey_tries += 1;
+                        kprintln!("ssh: offering publickey ssh-ed25519 (throwaway test key)");
+                        let _ = p.pubkey(signkey.clone());
+                    } else {
+                        let _ = p.skip();
+                    }
+                }
+                Event::Cli(CliEvent::AgentSign(s)) => {
+                    let _ = s.skip();
+                }
+                Event::Cli(CliEvent::Authenticated) => {
+                    kprintln!("ssh(c): publickey auth OK as {}", USER);
+                    open_session = true;
+                }
+                Event::Cli(CliEvent::SessionOpened(mut o)) => {
+                    let mut tn = heapless::String::new();
+                    let _ = tn.push_str("xterm"); // xterm: its terminfo advertises the subset term.rs implements (vt100 has no colour, il/dl, ich/dch or alt screen)
+                    let pty = Pty { term: tn, cols: 80, rows: 25, width: 0, height: 0, modes: heapless::Vec::new() };
+                    let rp = o.pty(pty);
+                    let rs = o.shell();
+                    kprintln!("ssh: session channel open, pty-req xterm 80x25 ({:?}), shell ({:?})", rp.is_ok(), rs.is_ok());
+                    if rp.is_err() || rs.is_err() {
+                        stop_all = true;
+                    } else {
+                        shell_open = true;
+                        winch = true;
+                        kbd::init();
+                        console::vga_log_off();
+                        term::init();
+                        kprintln!("term: VGA now belongs to the remote shell; keyboard is live");
+                    }
+                }
+                Event::Cli(CliEvent::SessionExit(x)) => {
+                    kprintln!("ssh: remote exit {:?}", x);
+                }
+                Event::Cli(CliEvent::Defunct) => {
+                    kprintln!("ssh: connection closed");
+                    finished = true;
+                    idle = true;
+                }
+                Event::Cli(CliEvent::PollAgain) | Event::Progressed => {}
+                Event::None => idle = true,
+                _ => {}
+            }
+            }
+            if stop_all {
+                break 'outer;
+            }
+            if idle && !open_session {
+                break;
+            }
+            if open_session {
+                match runner.open_client_session() {
+                    Ok(c) => chan = Some(c),
+                    Err(e) => {
+                        kprintln!("ssh: open session failed {:?}", e);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        // channel data -> VGA terminal (+ serial mirror)
+        if let Some(c) = &chan {
+            if winch {
+                winch = false;
+                let w = sunset::packets::WinChange { cols: 80, rows: 25, width: 0, height: 0 };
+                kprintln!("ssh: window-change 80x25 ({:?})", runner.term_window_change(c, &w).is_ok());
+            }
+            let mut drew = false;
+            while let Some((_num, dt, _len)) = runner.read_channel_ready() {
+                let mut buf = [0u8; 512];
+                match runner.read_channel(c, dt, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if !got_output {
+                            kprintln!("ssh(d): first shell output ({} bytes)", n);
+                            got_output = true;
+                            out_t0 = time::now_ms();
+                        }
+                        out_bytes += n as u64;
+                        for &b in &buf[..n] {
+                            term::feed(b);
+                            if b == 0x1B {
+                                console::serial_raw(b'^');
+                                console::serial_raw(b'[');
+                            } else {
+                                console::serial_raw(b);
+                            }
+                        }
+                        drew = true;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if drew {
+                term::flush();
+            }
+            // terminal replies (DSR/DA) go out ahead of keys typed later; they share the keyboard queue
+            nkeys += term::take_reply(&mut keys[nkeys..]);
+
+            // keyboard -> channel (whatever does not fit now stays queued; the i8042 holds the rest)
+            if shell_open && !finished {
+                if kbd::poll(&mut keys, &mut nkeys) {
+                    kprintln!("\r\nkbd: Ctrl-Alt-Del -> hard reset");
+                    wdt::hard_reset();
+                }
+                if nkeys > 0 {
+                    match runner.write_channel(c, ChanData::Normal, &keys[..nkeys]) {
+                        Ok(n) => {
+                            keys.copy_within(n..nkeys, 0);
+                            nkeys -= n;
+                        }
+                        Err(_) => nkeys = 0, // channel gone; the close check below ends the session
+                    }
+                }
+            }
+
+            if runner.is_channel_eof(c) || runner.is_channel_closed(c) {
+                if !finished {
+                    finished = true;
+                    kprintln!("\r\nssh: shell channel closed, disconnecting ({} shell bytes in {} ms)", out_bytes, time::now_ms() - out_t0);
+                    runner.close_output();
+                }
+            }
+        }
+
+        // runner -> network
+        let sock = sockets.get_mut::<tcp::Socket>(tcp_h);
+        while sock.can_send() {
+            let out = runner.output_buf();
+            if out.is_empty() {
+                break;
+            }
+            match sock.send_slice(out) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => runner.consume_output(n),
+            }
+        }
+        if finished {
+            sock.close();
+            for _ in 0..50 {
+                iface.poll(now(), &mut dev, &mut sockets);
+            }
+            break;
+        }
+    }
+    kprintln!("ssh: session loop ended: {} shell bytes in {} ms, finished={}", out_bytes, if got_output { time::now_ms() - out_t0 } else { 0 }, finished);
+    let (calls, reseeds, samples, failed) = rng::stats();
+    kprintln!("kbd: {} keys dropped while the channel was not taking input", kbd::dropped());
+    let rc = term::reply_counts();
+    kprintln!("term: replies sent: DSR 6n x{}, DSR 5n x{}, DA1 x{}, DA2 x{}; {} dropped (reply buffer full)", rc[0], rc[1], rc[2], rc[3], rc[4]);
+    kprintln!("rng: {} requests served, {} reseeds, {} raw samples health-tested, failure latched: {}", calls, reseeds, samples, failed);
+    if got_output {
+        kprintln!("ssh: M3 reached: interactive shell over SSH, drawn on VGA, typed on PS/2");
+    } else {
+        kprintln!("ssh: stopped before (d)");
+    }
+    if let (Some(c), false) = (ctl.as_mut(), bm_idle) {
+        sockets.get_mut::<tcp::Socket>(tcp_h).abort();
+        console::vga_log_on();
+        kprintln!("ssh: session over; bmctl keeps serving (reboot / load to start another)");
+        bmctl::serve(c, &mut iface, &mut dev, &mut sockets, udp_h);
+    }
+}
+
+exec
+/bin/zsh -lc "cat src/wdt.rs src/time.rs src/net.rs; rg -n 'panic|ssh::run|bmctl::run|wdt::|loop|while' src/main.rs src/rng.rs src/kbd.rs src/term.rs src/console.rs src/loader.rs; cat Cargo.toml" in ~/nc110-baremetal
+ succeeded in 0ms:
+//! TCO watchdog (ICH9 in QEMU q35, NM10 on the NC110; both iTCO v2). boot.s arms it before any
+//! Rust runs; this module reports what boot.s did, pets it, and runs the M0.5 rehearsal modes.
+use crate::port::{inl, inw, outb, outw};
+use crate::{kprintln, pci};
+use core::ptr::{addr_of, read_volatile};
+
+#[cfg(all(feature = "neg-control", feature = "grub-armed"))]
+compile_error!("neg-control is QEMU-only and must never be combined with grub-armed (the hardware artifact)");
+
+/// Negative control (`--features neg-control`, QEMU q35 only; boot.s never self-arms on NM10): boot.s SETS GCS.NO_REBOOT instead of clearing it
+/// (QEMU's GCS powers up 0 with noreboot=false, so merely skipping the clear would prove nothing).
+#[no_mangle]
+static TCO_NEG_CONTROL: u8 = cfg!(feature = "neg-control") as u8;
+
+/// `--features grub-armed`: boot.s does NOT arm; used to test the GRUB iorw/memrw arming sequence.
+#[no_mangle]
+static TCO_GRUB_ARMED: u8 = cfg!(feature = "grub-armed") as u8;
+
+extern "C" {
+    static tco_result: u32;
+    static tco_gcs_pre: u32;
+    static tco_gcs: u32;
+    static tco_base: u32;
+    static tco_sts1_pre: u16;
+    static tco_sts2_pre: u16;
+    static tco_cnt: u16;
+}
+
+fn rd<T: Copy>(p: *const T) -> T {
+    unsafe { read_volatile(p) }
+}
+
+pub fn armed() -> bool {
+    matches!(rd(addr_of!(tco_result)), 0 | 4 | 5)
+}
+
+pub fn pmbase() -> u16 {
+    (pci::read32(pci::b0(31, 0), 0x40) & 0xFF80) as u16
+}
+
+pub fn base() -> u16 {
+    pmbase() + 0x60
+}
+
+pub fn report() {
+    let r = rd(addr_of!(tco_result));
+    let what = match r {
+        0 => "armed by boot.s",
+        1 => "skipped (LPC 00:1f.0 is not ICH9 8086:2918 / NM10 8086:27bc)",
+        2 => "NOT armed: PMBASE unset",
+        3 => "NOT armed: RCBA disabled",
+        4 => "left to GRUB (grub-armed build); live registers follow",
+        5 => "NM10: boot.s does not arm (attended Rust arms it; else GRUB must); live registers follow",
+        _ => "NOT armed: unknown",
+    };
+    kprintln!("wdt: {} (result={})", what, r);
+    if r == 4 || r == 5 {
+        let b = base();
+        let gcs = unsafe { read_volatile(((pci::read32(pci::b0(31, 0), 0xF0) & 0xFFFF_C000) + 0x3410) as *const u32) };
+        let (s1, s2, cnt, tmr) = unsafe { (inw(b + 4), inw(b + 6), inw(b + 8), inw(b + 0x12)) };
+        kprintln!(
+            "wdt: live TCOBASE={:#x} GCS={:#010x} NO_REBOOT={} TCO1_CNT={:#06x} HLT={} TCO1_STS={:#06x} TCO2_STS={:#06x} TCO_TMR={}",
+            b, gcs, (gcs >> 5) & 1, cnt, (cnt >> 11) & 1, s1, s2, tmr & 0x3FF
+        );
+        return;
+    }
+    if r != 0 {
+        return;
+    }
+    let (b, gcs, s1, s2, cnt) = {
+        (rd(addr_of!(tco_base)) as u16, rd(addr_of!(tco_gcs)), rd(addr_of!(tco_sts1_pre)), rd(addr_of!(tco_sts2_pre)), rd(addr_of!(tco_cnt)))
+    };
+    kprintln!(
+        "wdt: TCOBASE={:#x} GCS {:#010x} -> {:#010x} NO_REBOOT={} TCO1_CNT={:#06x} HLT={} LOCK={}",
+        b, rd(addr_of!(tco_gcs_pre)), gcs, (gcs >> 5) & 1, cnt, (cnt >> 11) & 1, (cnt >> 12) & 1
+    );
+    kprintln!(
+        "wdt: before-clear TCO1_STS={:#06x} TCO2_STS={:#06x} SECOND_TO_STS={} BOOT_STS={}",
+        s1, s2, (s2 >> 1) & 1, (s2 >> 2) & 1
+    );
+    let tmr = unsafe { inw(b + 0x12) } & 0x3FF;
+    kprintln!("wdt: TCO_TMR={} ticks x 0.6 s, reset expected after 2nd expiry (~{} ms)", tmr, tmr as u32 * 1200);
+}
+
+/// Live check of the reset path, whoever armed it: NO_REBOOT=0, HLT=0, TMR>=4, and the counter
+/// (TCO_RLD reads back the current value on v2) decrements across ~1.3 ticks.
+pub fn verify_live() -> bool {
+    if !armed() {
+        return false;
+    }
+    let b = base();
+    let rcba = pci::read32(pci::b0(31, 0), 0xF0);
+    if rcba & 1 == 0 {
+        return false;
+    }
+    let gcs = unsafe { read_volatile(((rcba & 0xFFFF_C000) + 0x3410) as *const u32) };
+    let (cnt, tmr) = unsafe { (inw(b + 8), inw(b + 0x12) & 0x3FF) };
+    let c0 = unsafe { inw(b) } & 0x3FF;
+    delay_ms(800);
+    let c1 = unsafe { inw(b) } & 0x3FF;
+    let ok = gcs & 0x20 == 0 && cnt & 0x0800 == 0 && tmr >= 4 && c1 != c0;
+    kprintln!(
+        "wdt: verify NO_REBOOT={} HLT={} TMR={} count {}->{} => {}",
+        (gcs >> 5) & 1, (cnt >> 11) & 1, tmr, c0, c1, if ok { "VERIFIED" } else { "NOT VERIFIED" }
+    );
+    ok
+}
+
+/// QEMU `-machine pc` (PIIX3 8086:7000 at 00:01.0) has no TCO; the M0 NIC demo may run unprotected there.
+pub fn is_qemu_pc() -> bool {
+    pci::read32(pci::b0(1, 0), 0) == 0x7000_8086 && rd(addr_of!(tco_result)) == 1
+}
+
+/// The negative control must reach its hang unverified (that is the point); only on q35, never NM10.
+pub fn neg_control_on_q35() -> bool {
+    let on = cfg!(feature = "neg-control") && rd(addr_of!(tco_result)) == 0;
+    if on {
+        kprintln!("wdt: neg-control build on q35: proceeding unverified on purpose");
+    }
+    on
+}
+
+/// Hard reset via the reset control register (spec M2 `reboot`): back to the firmware / Slot A.
+pub fn hard_reset() -> ! {
+    kprintln!("wdt: hard reset via 0xCF9");
+    unsafe {
+        outb(0xCF9, 0x02);
+        outb(0xCF9, 0x06);
+    }
+    loop {
+        unsafe { core::arch::asm!("cli; hlt") };
+    }
+}
+
+/// Attended `wdt=probe`: arm the NM10 TCO ourselves without touching locked bits (SMI_EN.TCO_EN stays as the
+/// BIOS left it): clear GCS.NO_REBOOT (the BIOS leaves it SET on the NC110), clear stale status, TMR=50 ticks
+/// (30 s per stage, reset ~60 s after the last pet), reload, un-halt. Returns true if the readback says armed.
+pub fn arm_probe() -> bool {
+    let lpc = pci::read32(pci::b0(31, 0), 0);
+    let rcba_raw = pci::read32(pci::b0(31, 0), 0xF0);
+    if !(lpc == 0x27BC_8086 || lpc == 0x2918_8086) || pmbase() == 0 || rcba_raw & 1 == 0 {
+        kprintln!("wdt: probe arm: prerequisites fail (LPC {:#010x}, PMBASE {:#x}, RCBA {:#x})", lpc, pmbase(), rcba_raw);
+        return false;
+    }
+    let b = base();
+    let rcba = rcba_raw & 0xFFFF_C000;
+    let gcs_p = (rcba + 0x3410) as *mut u32;
+    unsafe {
+        let g0 = read_volatile(gcs_p);
+        let (cnt0, tmr0, rld0) = (inw(b + 8), inw(b + 0x12) & 0x3FF, inw(b) & 0x3FF);
+        kprintln!("wdt: inherited: GCS {:#x} NO_REBOOT={} TCO1_CNT={:#06x} HLT={} TMR={} RLD={} ({})", g0, (g0 >> 5) & 1, cnt0,
+            (cnt0 >> 11) & 1, tmr0, rld0, if g0 & 0x20 == 0 && cnt0 & 0x800 == 0 { "inherited enabled: NO_REBOOT clear, timer running" } else { "inherited not enabled" });
+        core::ptr::write_volatile(gcs_p, g0 & !0x20);
+        outw(b + 4, 0x0008); // TCO1_STS.TIMEOUT (RW1C)
+        outw(b + 6, 0x0002); // TCO2_STS.SECOND_TO_STS
+        outw(b + 6, 0x0004); // TCO2_STS.BOOT_STS
+        outw(b + 0x12, (inw(b + 0x12) & !0x3FF) | 50);
+        outw(b, 1);
+        outw(b + 8, inw(b + 8) & !0x0800); // un-halt; bit 12 (lock) written back as read
+        let (g1, cnt, tmr, c0) = (read_volatile(gcs_p), inw(b + 8), inw(b + 0x12) & 0x3FF, inw(b) & 0x3FF);
+        delay_ms(1300);
+        let c1 = inw(b) & 0x3FF;
+        let ok = g1 & 0x20 == 0 && cnt & 0x0800 == 0 && tmr == 50 && c1 != c0;
+        kprintln!("wdt: probe arm: GCS {:#x} -> {:#x} TCO1_CNT={:#06x} TMR={} RLD {}->{} SMI_EN={:#x} => {}",
+            g0, g1, cnt, tmr, c0, c1, inl(pmbase() + 0x30), if ok { "ARMED" } else { "NOT ARMED" });
+        ok
+    }
+}
+
+pub fn pet() {
+    unsafe { outw(base(), 1) };
+}
+
+/// ACPI PM timer (PMBASE+0x08, 3.579545 MHz, 24-bit) based delay; same block on ICH9 and NM10.
+fn pm_timer() -> u32 {
+    unsafe { inl(pmbase() + 8) & 0x00FF_FFFF }
+}
+
+pub fn delay_ms(ms: u32) {
+    let need = ms as u64 * 3_579_545 / 1000;
+    let mut last = pm_timer();
+    let mut acc = 0u64;
+    while acc < need {
+        let now = pm_timer();
+        acc += (now.wrapping_sub(last) & 0x00FF_FFFF) as u64;
+        last = now;
+    }
+}
+
+/// `wdt=pet:N` pets every 500 ms for N s, then stops and hangs. `wdt=hang` hangs at once.
+pub fn rehearse(cmdline: &str) -> bool {
+    let Some(i) = cmdline.find("wdt=") else { return false };
+    let arg = cmdline[i + 4..].split(' ').next().unwrap_or("");
+    if arg == "probe" {
+        return false; // attended net, handled in main (k5 hung here before the NIC: result 5 counts as armed)
+    }
+    if !armed() {
+        kprintln!("wdt: mode {} requested but watchdog not armed", arg);
+        return false;
+    }
+    let secs: u32 = arg.strip_prefix("pet:").and_then(|n| n.parse().ok()).unwrap_or(0);
+    for s in 0..secs {
+        for _ in 0..2 {
+            pet();
+            delay_ms(500);
+        }
+        kprintln!("wdt: alive t={}s (petting every 500 ms)", s + 1);
+    }
+    kprintln!("wdt: HANG now: cli; hlt with the timer running, nobody pets");
+    loop {
+        unsafe { core::arch::asm!("cli; hlt") };
+    }
+}
+//! Monotonic milliseconds from the TSC, calibrated once against PIT channel 2 (gate via port 0x61).
+use crate::port::{inb, outb, rdtsc};
+
+static mut TSC_PER_MS: u64 = 1_000_000; // fallback guess (1 GHz) if calibration fails
+static mut T0: u64 = 0;
+
+pub fn init() -> u64 {
+    unsafe {
+        // PIT ch2, mode 0, lobyte/hibyte, count for 10 ms at 1.193182 MHz.
+        const COUNT: u16 = 11932;
+        let g = inb(0x61);
+        outb(0x61, (g & 0xFD) | 0x01); // gate on, speaker off
+        outb(0x43, 0b1011_0000);
+        outb(0x42, COUNT as u8);
+        outb(0x42, (COUNT >> 8) as u8);
+        // Re-trigger: toggle gate low->high so mode 0 starts counting now.
+        let g = inb(0x61);
+        outb(0x61, g & 0xFE);
+        outb(0x61, g | 0x01);
+        let a = rdtsc();
+        let mut spins: u64 = 0;
+        while inb(0x61) & 0x20 == 0 && spins < 200_000_000 {
+            spins += 1;
+        }
+        let b = rdtsc();
+        if spins < 200_000_000 && b > a {
+            TSC_PER_MS = ((b - a) / 10).max(1);
+        }
+        T0 = rdtsc();
+        TSC_PER_MS
+    }
+}
+
+pub fn now_ms() -> i64 {
+    unsafe { ((rdtsc() - T0) / TSC_PER_MS) as i64 }
+}
+
+/// Busy-wait at least `us` microseconds (TSC, after init()).
+pub fn delay_us(us: u64) {
+    unsafe {
+        let t = rdtsc();
+        let n = us * TSC_PER_MS / 1000 + 1;
+        while rdtsc().wrapping_sub(t) < n {
+            core::hint::spin_loop();
+        }
+    }
+}
+//! smoltcp `phy::Device` over the Realtek C+ driver (rtl8139 C+ or RTL8101E) (polled, one TX descriptor, NRX RX descriptors).
+use crate::nic::{self, Bus, Rtl};
+use crate::nic_regs::Regs;
+use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::time::Instant;
+
+pub struct Nic(pub Rtl);
+
+/// Frames `receive` may hand out before the next `rx_budget` call. None = unlimited (SSH never sets it);
+/// bmctl sets Some(32) before every poll so a flood cannot starve its deadline checks.
+static mut RX_BUDGET: Option<u32> = None;
+
+pub fn rx_budget(n: Option<u32>) {
+    unsafe { RX_BUDGET = n };
+}
+
+pub struct Rx {
+    idx: usize,
+    len: usize,
+    regs: &'static Regs,
+}
+pub struct Tx {
+    bus: Bus,
+    regs: &'static Regs,
+}
+
+impl Drop for Rx {
+    fn drop(&mut self) {
+        nic::rx_release(self.regs, self.idx);
+    }
+}
+
+impl RxToken for Rx {
+    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+        f(nic::rx_buf(self.idx, self.len)) // descriptor goes back to the NIC when `self` drops
+    }
+}
+
+impl TxToken for Tx {
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+        nic::tx_with(self.bus, self.regs, len, f)
+    }
+}
+
+impl Device for Nic {
+    type RxToken<'a> = Rx;
+    type TxToken<'a> = Tx;
+
+    fn receive(&mut self, _t: Instant) -> Option<(Rx, Tx)> {
+        unsafe {
+            match RX_BUDGET {
+                Some(0) => return None,
+                Some(n) => RX_BUDGET = Some(n - 1),
+                None => {}
+            }
+        }
+        let (idx, len) = self.0.rx_poll()?;
+        Some((Rx { idx, len, regs: self.0.regs }, Tx { bus: self.0.bus, regs: self.0.regs }))
+    }
+
+    fn transmit(&mut self, _t: Instant) -> Option<Tx> {
+        Some(Tx { bus: self.0.bus, regs: self.0.regs })
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut c = DeviceCapabilities::default();
+        c.medium = Medium::Ethernet;
+        c.max_transmission_unit = 1514;
+        c.max_burst_size = Some(1);
+        c
+    }
+}
+src/loader.rs:281:        while p < ORIG_MMAP_LEN {
+src/loader.rs:302:/// instead of jumping (GRUB default, the agent OS, then the crash-loop escape).
+src/loader.rs:306:        crate::wdt::hard_reset();
+src/loader.rs:312:        crate::wdt::pet();
+src/term.rs:48:    other: [u16; N], // the inactive screen (main while the alternate one is shown)
+src/term.rs:276:        while i < np {
+src/kbd.rs:34:    while i < 12 {
+src/kbd.rs:43:    while i < 12 {
+src/kbd.rs:51:    while i < 12 {
+src/kbd.rs:59:    while i < 10 {
+src/kbd.rs:71:        while inb(STATUS) & 1 != 0 && n < 64 {
+src/rng.rs:4://! walk steps (2 MiB buffer) completed while the TSC advances by a fixed window (see `raw_delta`).
+src/rng.rs:117:/// One raw sample = how many walk steps (strided over 2 MiB) complete while the TSC advances by WINDOW
+src/rng.rs:128:    while start == t0 {
+src/rng.rs:137:    while tsc().wrapping_sub(start) < w && n < 1 << 20 {
+src/rng.rs:238:    while k < 60.0 {
+src/rng.rs:363:        kprintln!("rng: jitter health test FAILED while seeding ({}) -> refusing to run SSH", e);
+src/main.rs:6:use core::panic::PanicInfo;
+src/main.rs:47:    if cfg!(feature = "attended") && !wdt::arm_probe() {
+src/main.rs:49:        wdt::hard_reset();
+src/main.rs:56:    wdt::report();
+src/main.rs:58:        kprintln!("wdt: ATTENDED build: TCO armed by us with NO_REBOOT cleared (any reset -> GRUB default = the agent OS; crash loop -> Slot A)");
+src/main.rs:59:    } else if !wdt::is_qemu_pc() && !wdt::verify_live() && !wdt::neg_control_on_q35() {
+src/main.rs:61:        wdt::hard_reset();
+src/main.rs:68:    wdt::rehearse(cmdline);
+src/main.rs:87:                        wdt::pet();
+src/main.rs:90:                        loop {
+src/main.rs:95:                        ssh::run(n, client_seed, cmdline.contains("rng=dump"), Some(info));
+src/main.rs:97:                        bmctl::run(n, seed, info);
+src/main.rs:99:                        ssh::run(n, client_seed, cmdline.contains("rng=dump"), None);
+src/main.rs:104:                Ok(()) => ssh::run(n, client_seed, cmdline.contains("rng=dump"), None),
+src/main.rs:114:            wdt::pet();
+src/main.rs:115:            wdt::delay_ms(1000);
+src/main.rs:117:        wdt::hard_reset();
+src/main.rs:119:    loop {
+src/main.rs:128:#[panic_handler]
+src/main.rs:129:fn panic(info: &PanicInfo) -> ! {
+src/main.rs:131:    loop {
+[package]
+name = "nc110-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+neg-control = []
+grub-armed = []
+attended = []  # NC110 with evnchn at the machine: no watchdog gate (the TCO hangs this board instead of resetting it), 0xCF9 reset after 60 s
+badpin = []  # negative control: flip one bit of the pinned host key
+badjitter = []  # negative control: constant TSC in the jitter source, startup health test must refuse SSH
+
+[dependencies]
+# M2: pinned exact versions (Cargo.lock is committed too).
+sunset = { version = "=0.6.0", default-features = false }
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-tcp", "socket-dhcpv4", "socket-udp"] }
+getrandom = { version = "0.4", default-features = false }
+log = "0.4"
+heapless = { version = "=0.9.3", default-features = false }  # M3: sunset::Pty.term is a heapless::String
+sha2 = { version = "=0.11.1", default-features = false }
+chacha20 = { version = "=0.9.1", default-features = false }  # bmctl AEAD (RFC 8439), same versions sunset already pulls in
+poly1305 = { version = "=0.9.1", default-features = false }
+
+[[bin]]
+name = "nc110-kernel"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+exec
+/bin/zsh -lc "nl -ba src/ssh.rs | sed -n '265,495p'; nl -ba src/main.rs | sed -n '38,145p'; rg -n 'wdt::pet|fn tx_with|while|loop' src/nic.rs src/udplog.rs src/console.rs; git rev-parse HEAD; rg --files ~/.cargo/registry/src -g runner.rs -g iface.rs -g interface.rs" in ~/nc110-baremetal
+ succeeded in 54ms:
+~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs
+
+codex
+The outer SSH loop calls bmctl before processing SSH, and the inner SSH loops don’t pet the watchdog. I haven’t found a new path that can keep petting indefinitely while skipping bmctl. I’m checking the remaining reset/logging paths and the seed copy; the idle timeout also leads to an existing 60-second delay before the explicit reset.
+exec
+/bin/zsh -lc "cat src/udplog.rs; sed -n '20,90p' src/console.rs; sed -n '300,330p' src/loader.rs; sed -n '510,560p' src/nic.rs; rg -n 'pub fn progress|pub fn read_channel|pub fn input|loop|while' ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sunset-0.6.0/src/runner.rs; nl -ba src/bmctl.rs | sed -n '228,355p'; rg -n 'derive_key|last_ok|send_slice' src/bmctl.rs" in ~/nc110-baremetal
+ succeeded in 0ms:
+//! Attended build: broadcast the captured console log as UDP (192.168.50.118:5514 -> 255.255.255.255:5514).
+//! Broadcast needs no ARP and no DHCP lease. Static source IP = the netbook's Slot A address.
+use crate::nic::{self, Bus, Rtl};
+use crate::nic_regs::Regs;
+use crate::{console, dhcp, kprintln, wdt};
+
+const SRC_IP: [u8; 4] = [192, 168, 50, 118];
+const PORT: u16 = 5514;
+
+/// Copy of the NIC handles so the log can still be sent after ssh::run took the Rtl. Single-threaded and
+/// tx_with is synchronous (waits for the descriptor), so interleaving with smoltcp between polls is safe.
+static mut LOGNIC: Option<(Bus, &'static Regs, [u8; 6])> = None;
+
+pub fn set_nic(n: &Rtl) {
+    unsafe { LOGNIC = Some((n.bus, n.regs, n.mac)) };
+}
+
+fn send(data: &[u8]) {
+    let Some((bus, regs, mac)) = (unsafe { *core::ptr::addr_of!(LOGNIC) }) else { return };
+    let len = 42 + data.len();
+    nic::tx_with(bus, regs, len, |f| {
+        f[0..6].copy_from_slice(&[0xff; 6]);
+        f[6..12].copy_from_slice(&mac);
+        f[12..14].copy_from_slice(&[0x08, 0x00]);
+        let ip = &mut f[14..34];
+        ip.copy_from_slice(&[0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, 17, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255]);
+        ip[2..4].copy_from_slice(&((20 + 8 + data.len()) as u16).to_be_bytes());
+        ip[12..16].copy_from_slice(&SRC_IP);
+        let c = dhcp::csum(ip);
+        ip[10..12].copy_from_slice(&c.to_be_bytes());
+        f[34..36].copy_from_slice(&PORT.to_be_bytes());
+        f[36..38].copy_from_slice(&PORT.to_be_bytes());
+        f[38..40].copy_from_slice(&((8 + data.len()) as u16).to_be_bytes());
+        f[40..42].copy_from_slice(&[0, 0]); // UDP checksum 0 = none (IPv4)
+        f[42..].copy_from_slice(data);
+    });
+}
+
+/// Send the whole captured log, 1000-byte chunks, each prefixed "nc110 <round> <i>/<n> ".
+pub fn dump(round: u8) {
+    let log = console::captured();
+    let total = log.len().div_ceil(1000).max(1);
+    for (i, c) in log.chunks(1000).enumerate() {
+        let mut b = [0u8; 1024];
+        let h = [b'n', b'c', b'1', b'1', b'0', b' ', b'0' + round, b' ', b'0' + (i / 10) as u8, b'0' + (i % 10) as u8,
+                 b'/', b'0' + (total / 10) as u8, b'0' + (total % 10) as u8, b' '];
+        b[..h.len()].copy_from_slice(&h);
+        b[h.len()..h.len() + c.len()].copy_from_slice(c);
+        for _ in 0..2 { // chunks after the first went missing on the real LAN (k9, k11); the listener dedups
+            send(&b[..h.len() + c.len()]);
+            wdt::pet();
+            wdt::delay_ms(50);
+        }
+    }
+}
+
+/// One raw DHCPDISCOVER, then poll RX for 4 s for an OFFER (proves RX DMA on the real NIC).
+pub fn dhcp_probe(n: &mut Rtl) {
+    let xid = 0x4e433131; // "NC11"
+    nic::tx_with(n.bus, n.regs, 342, |f| dhcp::build_discover(f, n.mac, xid));
+    kprintln!("dhcp: DISCOVER sent, waiting 4 s for an OFFER");
+    let (mut frames, mut t) = (0u32, 0u32);
+    while t < 4000 {
+        while let Some((i, len)) = n.rx_poll() {
+            frames += 1;
+            let off = dhcp::parse_offer(nic::rx_buf(i, len), xid);
+            nic::rx_release(n.regs, i);
+            if let Some((ip, srv)) = off {
+                kprintln!("dhcp: OFFER {} from {} after {} ms ({} frames seen)", dhcp::Ip(ip), dhcp::Ip(srv), t, frames);
+                return;
+            }
+        }
+        wdt::pet();
+        wdt::delay_ms(10);
+        t += 10;
+    }
+    kprintln!("dhcp: no OFFER in 4 s ({} frames received)", frames);
+}
+/// Back from the SSH terminal: blank the screen and log to it again.
+pub fn vga_log_on() {
+    unsafe {
+        for i in 0..W * H {
+            VGA.add(i).write_volatile(ATTR | b' ' as u16);
+        }
+        ROW = 0;
+        COL = 0;
+        VGA_LOG = true;
+    }
+}
+
+/// Raw byte to COM1 (used to mirror the remote shell's output into the serial log).
+pub fn serial_raw(b: u8) {
+    serial_putc(b);
+}
+
+pub fn init() {
+    unsafe {
+        outb(COM1 + 1, 0x00); // no interrupts
+        outb(COM1 + 3, 0x80); // DLAB
+        outb(COM1 + 0, 0x01); // divisor 1 = 115200
+        outb(COM1 + 1, 0x00);
+        outb(COM1 + 3, 0x03); // 8N1
+        outb(COM1 + 2, 0xC7); // FIFO
+        outb(COM1 + 4, 0x03);
+        for i in 0..W * H {
+            VGA.add(i).write_volatile(ATTR | b' ' as u16);
+        }
+        ROW = 0;
+        COL = 0;
+    }
+}
+
+fn serial_putc(b: u8) {
+    unsafe {
+        // Bounded: a wedged or absent UART must never keep a failure path from reaching its 0xCF9 reset.
+        for _ in 0..100_000 {
+            if inb(COM1 + 5) & 0x20 != 0 {
+                outb(COM1, b);
+                return;
+            }
+        }
+    }
+}
+
+fn vga_putc(b: u8) {
+    unsafe {
+        if b == b'\n' {
+            COL = 0;
+            ROW += 1;
+        } else {
+            VGA.add(ROW * W + COL).write_volatile(ATTR | b as u16);
+            COL += 1;
+            if COL == W {
+                COL = 0;
+                ROW += 1;
+            }
+        }
+        if ROW == H {
+            for i in 0..W * (H - 1) {
+                VGA.add(i).write_volatile(VGA.add(i + W).read_volatile());
+            }
+            for i in 0..W {
+                VGA.add((H - 1) * W + i).write_volatile(ATTR | b' ' as u16);
+            }
+            ROW = H - 1;
+        }
+    }
+}
+
+/// Point of no return: NIC quiesced (reset completed), trampoline entered. The TCO stays armed across the hop.
+/// If the NIC reset does not complete, its DMA may still target memory the new image would overwrite: hard reset
+/// instead of jumping (GRUB default, the agent OS, then the crash-loop escape).
+pub fn jump(p: &Plan, nic: &Rtl) -> ! {
+    if let Err(e) = nic.quiesce() {
+        kprintln!("loader: NIC quiesce failed ({}): NOT jumping, hard reset", e);
+        crate::wdt::hard_reset();
+    }
+    unsafe {
+        for (i, v) in p.params.iter().enumerate() {
+            core::ptr::write_volatile((PARAMS + 8 * i as u64) as *mut u64, *v);
+        }
+        crate::wdt::pet();
+        let f: extern "sysv64" fn(u64) -> ! = core::mem::transmute(TRAMP as usize);
+        f(PARAMS)
+    }
+}
+/// Set once a TX descriptor fails to come back (OWN still set after the deadline). From then on the
+/// TX DMA buffer and descriptor are treated as owned by the NIC forever: nothing is written to them.
+static mut TX_WEDGED: bool = false;
+static mut TX_SCRATCH: [u8; BUFSZ] = [0; BUFSZ];
+
+/// Let `fill` build a `len`-byte frame directly in the DMA buffer, then send it.
+/// Never touches the buffer/descriptor unless the NIC has cleared OWN (Codex M2 MUST-FIX).
+pub fn tx_with<R2>(bus: Bus, r: &Regs, len: usize, fill: impl FnOnce(&mut [u8]) -> R2) -> R2 {
+    let len = len.min(BUFSZ);
+    unsafe {
+        let d = addr_of_mut!(TX_DESC.0[0]);
+        if TX_WEDGED || read_volatile(addr_of!((*d).opts1)) & r.desc_own != 0 {
+            TX_WEDGED = true;
+            // Frame is built into scratch and dropped: the NIC may still be DMAing the real buffer.
+            let scratch = &mut *core::ptr::addr_of_mut!(TX_SCRATCH);
+            return fill(&mut scratch[..len]);
+        }
+        let buf = core::slice::from_raw_parts_mut(addr_of_mut!(TX_BUF.0[0]) as *mut u8, BUFSZ);
+        let res = fill(&mut buf[..len]);
+        let wire = len.max(60);
+        for b in &mut buf[len..wire] {
+            *b = 0;
+        }
+        write_volatile(
+            d,
+            Desc {
+                opts1: r.desc_own | r.ring_end | r.first_frag | r.last_frag | wire as u32,
+                opts2: 0,
+                addr: buf.as_ptr() as u64,
+            },
+        );
+        fence(Ordering::SeqCst);
+        bus.w8(r.tx_poll, r.npq);
+        let t0 = rdtsc();
+        while read_volatile(addr_of!((*d).opts1)) & r.desc_own != 0 {
+            if rdtsc() - t0 > 2_000_000_000 {
+                TX_WEDGED = true;
+                kprintln!("nic: TX descriptor not returned by NIC, TX disabled");
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        fence(Ordering::SeqCst);
+        let st = bus.r16(r.intr_status);
+        bus.w16(r.intr_status, st);
+        res
+    }
+}
+302:    pub fn progress(&mut self) -> Result<Event<'_, 'a>> {
+417:    pub fn input(&mut self, buf: &[u8]) -> Result<usize, Error> {
+546:    pub fn read_channel(
+570:    pub fn read_channel_either(
+610:    pub fn read_channel_ready(&self) -> Option<(ChanNum, ChanData, usize)> {
+   228	pub fn socket() -> udp::Socket<'static> {
+   229	    udp::Socket::new(
+   230	        udp::PacketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(RX_META) }[..].as_mut(), unsafe { &mut *core::ptr::addr_of_mut!(RX_BUF) }[..].as_mut()),
+   231	        udp::PacketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(TX_META) }[..].as_mut(), unsafe { &mut *core::ptr::addr_of_mut!(TX_BUF) }[..].as_mut()),
+   232	    )
+   233	}
+   234	
+   235	pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+   236	    if rng::init(false).is_err() {
+   237	        return;
+   238	    }
+   239	    let mut rs = [0u8; 8];
+   240	    if rng::fill(&mut rs).is_err() {
+   241	        kprintln!("bmctl: entropy failed -> not starting");
+   242	        return;
+   243	    }
+   244	    let mac = nic.mac;
+   245	    let mut dev = Nic(nic);
+   246	    let mut cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+   247	    cfg.random_seed = u64::from_le_bytes(rs);
+   248	    let mut iface = Interface::new(cfg, &mut dev, now());
+   249	    let mut sockets = SocketSet::new(unsafe { &mut *core::ptr::addr_of_mut!(SOCKS) }[..].as_mut());
+   250	    let dhcp_h = sockets.add(dhcpv4::Socket::new());
+   251	    let udp_h = sockets.add(socket());
+   252	    let t0 = time::now_ms();
+   253	    let mut ip = None;
+   254	    while ip.is_none() && time::now_ms() - t0 < 15_000 {
+   255	        wdt::pet();
+   256	        crate::net::rx_budget(Some(32));
+   257	        iface.poll(now(), &mut dev, &mut sockets);
+   258	        if let Some(dhcpv4::Event::Configured(c)) = sockets.get_mut::<dhcpv4::Socket>(dhcp_h).poll() {
+   259	            iface.update_ip_addrs(|a| {
+   260	                a.clear();
+   261	                let _ = a.push(IpCidr::Ipv4(c.address));
+   262	            });
+   263	            if let Some(gw) = c.router {
+   264	                let _ = iface.routes_mut().add_default_ipv4_route(gw);
+   265	            }
+   266	            ip = Some(c.address.address());
+   267	        }
+   268	    }
+   269	    let Some(ip) = ip else {
+   270	        kprintln!("bmctl: no DHCP lease in 15 s -> not starting");
+   271	        return;
+   272	    };
+   273	    let Some(mut ctl) = Ctl::new(&dev.0, seed, info, ip, sockets.get_mut::<udp::Socket>(udp_h)) else { return };
+   274	    serve(&mut ctl, &mut iface, &mut dev, &mut sockets, udp_h);
+   275	}
+   276	
+   277	/// bmctl-only loop. Returns only on the idle timeout (the caller resets); reboot and chain-load never return.
+   278	pub fn serve(ctl: &mut Ctl, iface: &mut Interface, dev: &mut Nic, sockets: &mut SocketSet, udp_h: SocketHandle) {
+   279	    loop {
+   280	        wdt::pet();
+   281	        crate::net::rx_budget(Some(32)); // bounded ingress per poll so the deadline checks below always run
+   282	        iface.poll(now(), dev, sockets);
+   283	        if let Some(a) = ctl.step(sockets.get_mut::<udp::Socket>(udp_h), time::now_ms()) {
+   284	            if !ctl.act(a, dev) {
+   285	                return;
+   286	            }
+   287	        }
+   288	    }
+   289	}
+   290	
+   291	impl Ctl {
+   292	    /// Binds `sock` to the bmctl port. Needs `rng::init` done; None = entropy failure (printed).
+   293	    pub fn new(nic: &Rtl, seed: [u8; 32], info: u64, ip: Ipv4Address, sock: &mut udp::Socket) -> Option<Ctl> {
+   294	        let idle_ms = crate::mb::cmdline(info).split(' ').find_map(|w| w.strip_prefix("idle=")).and_then(|v| v.parse::<i64>().ok())
+   295	            .filter(|v| (5..=3600).contains(v)).map_or(IDLE_MS, |v| v * 1000);
+   296	        crate::loader::snapshot_boot_info(info);
+   297	        let nic_mmio = match nic.bus {
+   298	            Bus::Mmio(b) => Some(b),
+   299	            Bus::Pio(_) => None,
+   300	        };
+   301	        let mut boot_id = [0u8; 16];
+   302	        if rng::fill(&mut boot_id).is_err() {
+   303	            kprintln!("bmctl: entropy failed -> not starting");
+   304	            return None;
+   305	        }
+   306	        let mut bid = heapless::String::<64>::new();
+   307	        hex(&boot_id, &mut bid);
+   308	        sock.bind(PORT).expect("bind");
+   309	        kprintln!("bmctl: listening on {}:{} boot id {} (idle reset after {} s)", ip, PORT, bid, idle_ms / 1000);
+   310	        crate::udplog::dump(5);
+   311	        let t = time::now_ms();
+   312	        Some(Ctl {
+   313	            seed, key: derive_key(&seed), boot_id, bid, ip, idle_ms, nic_mmio, last_ok: t, last_hello: 0,
+   314	            ok: 0, bad: 0, replay: 0, retx: 0, next_sess: 1, who_window: 0, who_count: 0, reboot_at: None, stage: None, jump_at: None,
+   315	        })
+   316	    }
+   317	
+   318	    /// Carries out an `Act`: reboot and chain-load never return; false = idle timeout, the caller must reset.
+   319	    pub fn act(&mut self, a: Act, dev: &Nic) -> bool {
+   320	        match a {
+   321	            Act::Idle => false,
+   322	            Act::Reboot => wdt::hard_reset(),
+   323	            Act::Jump(p) => crate::loader::jump(&p, &dev.0),
+   324	        }
+   325	    }
+   326	
+   327	    /// Deadlines first, then at most one datagram. Only an authenticated command counts as activity (`last_ok`).
+   328	    pub fn step(&mut self, sock: &mut udp::Socket, t: i64) -> Option<Act> {
+   329	        if t - self.last_ok > self.idle_ms {
+   330	            kprintln!("bmctl: idle {} s -> reset", self.idle_ms / 1000);
+   331	            return Some(Act::Idle);
+   332	        }
+   333	        if self.jump_at.as_ref().is_some_and(|(j, _)| t > *j) {
+   334	            let (_, p) = self.jump_at.take().unwrap();
+   335	            kprintln!("bmctl: chain-loading the staged kernel");
+   336	            crate::udplog::dump(7);
+   337	            return Some(Act::Jump(p));
+   338	        }
+   339	        if self.reboot_at.is_some_and(|r| t > r) {
+   340	            kprintln!("bmctl: reboot requested");
+   341	            return Some(Act::Reboot);
+   342	        }
+   343	        if t - self.last_hello > 2000 {
+   344	            self.last_hello = t;
+   345	            let mut h = heapless::String::<128>::new();
+   346	            let _ = core::fmt::write(&mut h, format_args!("nc110 hello bmctl {}:{} boot {}", self.ip, PORT, self.bid));
+   347	            let _ = sock.send_slice(h.as_bytes(), IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::BROADCAST), 5514));
+   348	        }
+   349	        let sess = unsafe { &mut *core::ptr::addr_of_mut!(SESS) };
+   350	        let pend = unsafe { &mut *core::ptr::addr_of_mut!(PEND) };
+   351	        let mut buf = [0u8; 1500];
+   352	        let Ok((n, meta)) = sock.recv_slice(&mut buf) else { return None };
+   353	        let from = meta.endpoint;
+   354	        if n == 3 + 16 && &buf[..3] == b"who" {
+   355	            if t - self.who_window > 1000 {
+126:pub fn derive_key(seed: &[u8; 32]) -> [u8; 32] {
+213:    last_ok: i64,
+313:            seed, key: derive_key(&seed), boot_id, bid, ip, idle_ms, nic_mmio, last_ok: t, last_hello: 0,
+327:    /// Deadlines first, then at most one datagram. Only an authenticated command counts as activity (`last_ok`).
+329:        if t - self.last_ok > self.idle_ms {
+347:            let _ = sock.send_slice(h.as_bytes(), IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::BROADCAST), 5514));
+374:            let _ = sock.send_slice(h.as_bytes(), from);
+407:            let _ = sock.send_slice(&se.reply[..se.reply_len], from);
+417:        self.last_ok = t;
+530:        let _ = sock.send_slice(&se.reply[..se.reply_len], from);
+
+codex
+Most is sound. **I found no commit-specific MUST-FIX under the stated “600 seconds without a fresh authenticated command” contract.** Removing `hard_end` is supported by the control flow. This was a source review; I did not rerun QEMU tests.
+
+**MUST-FIX: none found.**
+
+1. **Plain bmctl’s serving semantics are preserved.** Every replaced `continue` becomes `return None`, after which `serve` begins the next iteration with the same watchdog pet, RX budget of 32, and interface poll. It still processes at most one datagram per iteration. Fields retain their initial values and updates; deadline ordering remains **idle → jump → reboot → hello → receive/authenticate**. Retransmissions and rejected/replayed packets still do not refresh `last_ok`. See [bmctl.rs:278](~/nc110-baremetal/src/bmctl.rs:278).
+
+   “Exactly preserved” needs a startup qualification: network randomness is now drawn before the boot ID; boot-ID generation, boot-info snapshotting, and key derivation move until after DHCP. This changes RNG consumption order and entropy-failure timing, but I found no authentication or recovery regression.
+
+2. **The SSH outer loop cannot repeatedly pet while skipping bmctl.** With `ctl = Some`, each iteration sets RX budget 64, polls, then calls `step` before connection handling or SSH processing. `ctl` is never subsequently cleared. If polling or later processing wedges, it cannot return to the outer-loop pet. See [ssh.rs:194](~/nc110-baremetal/src/ssh.rs:194).
+
+   The runner event loop, channel drain, output drain, keyboard handling, crypto, and terminal rendering contain no watchdog pets. Even an infinite `PollAgain`/`Progressed` cycle therefore leaves recovery to TCO. SSH DHCP lacks an RX budget and could remain inside polling under a flood, but it also does **not** pet: that is a watchdog-reset case, not an indefinite survival case.
+
+3. **Exit paths preserve recovery.** Connection failure, protocol/authentication failure, startup deadline expiry, and ordinary closure all reach `serve` with the **existing** controller and `last_ok`. They do not restart the idle allowance. The `finished` path performs only 50 extra polls, without petting or replenishing the remaining RX budget, then reaches `serve`. Idle sets `bm_idle`, skips `serve`, and returns toward reset. Panics halt without petting. See [ssh.rs:463](~/nc110-baremetal/src/ssh.rs:463).
+
+4. **Seed/key handling is correct.** `Ctl::new` receives a value copy of the original seed before SSH wipes its local copy. The controller retains the correct seed for chain-loading and derives the same bmctl key. Boot-ID authentication, session derivation, sequence handling, and host-key verification remain intact. Retaining the seed is intentional and already necessary in plain bmctl.
+
+**SHOULD**
+
+- **Distinguish authenticated ingress from bidirectional reachability.** There is an inherited limitation in [bmctl.rs:417](~/nc110-baremetal/src/bmctl.rs:417): fresh authenticated requests refresh idle even if every response is lost. Concrete scenario: TX becomes permanently wedged while RX works; an established client keeps sending increasing-sequence authenticated commands. Replies disappear, but idle never expires and the loop keeps petting. Ordinary retries of the same sequence cannot do this. If the hard rule includes this asymmetric failure despite continuing authenticated ingress, this is a **system-level MUST-FIX**, shared with plain bmctl; the removed SSH wall-clock bound previously limited its duration in SSH mode.
+
+- **Expand recovery tests.** The new test covers overlap, post-session service, and idle during an open session. Add idle after early connection/authentication failure, invalid/replayed traffic under flood, and an injected inner-loop hang demonstrating TCO recovery. These directly exercise the replacement for the removed safety bound.
+
+**NIT**
+
+- Idle expiry does not mean immediate reset: the existing main epilogue logs, then pets for another 60 seconds before CF9 reset ([main.rs:111](~/nc110-baremetal/src/main.rs:111)).
+- Update `net.rs`’s “SSH never sets [RX budget]” comment and the unconditional wall-clock-bound comment in `ssh.rs`.
+
+**Score: 8/10.**
+tokens used
+39,155
+Most is sound. **I found no commit-specific MUST-FIX under the stated “600 seconds without a fresh authenticated command” contract.** Removing `hard_end` is supported by the control flow. This was a source review; I did not rerun QEMU tests.
+
+**MUST-FIX: none found.**
+
+1. **Plain bmctl’s serving semantics are preserved.** Every replaced `continue` becomes `return None`, after which `serve` begins the next iteration with the same watchdog pet, RX budget of 32, and interface poll. It still processes at most one datagram per iteration. Fields retain their initial values and updates; deadline ordering remains **idle → jump → reboot → hello → receive/authenticate**. Retransmissions and rejected/replayed packets still do not refresh `last_ok`. See [bmctl.rs:278](~/nc110-baremetal/src/bmctl.rs:278).
+
+   “Exactly preserved” needs a startup qualification: network randomness is now drawn before the boot ID; boot-ID generation, boot-info snapshotting, and key derivation move until after DHCP. This changes RNG consumption order and entropy-failure timing, but I found no authentication or recovery regression.
+
+2. **The SSH outer loop cannot repeatedly pet while skipping bmctl.** With `ctl = Some`, each iteration sets RX budget 64, polls, then calls `step` before connection handling or SSH processing. `ctl` is never subsequently cleared. If polling or later processing wedges, it cannot return to the outer-loop pet. See [ssh.rs:194](~/nc110-baremetal/src/ssh.rs:194).
+
+   The runner event loop, channel drain, output drain, keyboard handling, crypto, and terminal rendering contain no watchdog pets. Even an infinite `PollAgain`/`Progressed` cycle therefore leaves recovery to TCO. SSH DHCP lacks an RX budget and could remain inside polling under a flood, but it also does **not** pet: that is a watchdog-reset case, not an indefinite survival case.
+
+3. **Exit paths preserve recovery.** Connection failure, protocol/authentication failure, startup deadline expiry, and ordinary closure all reach `serve` with the **existing** controller and `last_ok`. They do not restart the idle allowance. The `finished` path performs only 50 extra polls, without petting or replenishing the remaining RX budget, then reaches `serve`. Idle sets `bm_idle`, skips `serve`, and returns toward reset. Panics halt without petting. See [ssh.rs:463](~/nc110-baremetal/src/ssh.rs:463).
+
+4. **Seed/key handling is correct.** `Ctl::new` receives a value copy of the original seed before SSH wipes its local copy. The controller retains the correct seed for chain-loading and derives the same bmctl key. Boot-ID authentication, session derivation, sequence handling, and host-key verification remain intact. Retaining the seed is intentional and already necessary in plain bmctl.
+
+**SHOULD**
+
+- **Distinguish authenticated ingress from bidirectional reachability.** There is an inherited limitation in [bmctl.rs:417](~/nc110-baremetal/src/bmctl.rs:417): fresh authenticated requests refresh idle even if every response is lost. Concrete scenario: TX becomes permanently wedged while RX works; an established client keeps sending increasing-sequence authenticated commands. Replies disappear, but idle never expires and the loop keeps petting. Ordinary retries of the same sequence cannot do this. If the hard rule includes this asymmetric failure despite continuing authenticated ingress, this is a **system-level MUST-FIX**, shared with plain bmctl; the removed SSH wall-clock bound previously limited its duration in SSH mode.
+
+- **Expand recovery tests.** The new test covers overlap, post-session service, and idle during an open session. Add idle after early connection/authentication failure, invalid/replayed traffic under flood, and an injected inner-loop hang demonstrating TCO recovery. These directly exercise the replacement for the removed safety bound.
+
+**NIT**
+
+- Idle expiry does not mean immediate reset: the existing main epilogue logs, then pets for another 60 seconds before CF9 reset ([main.rs:111](~/nc110-baremetal/src/main.rs:111)).
+- Update `net.rs`’s “SSH never sets [RX budget]” comment and the unconditional wall-clock-bound comment in `ssh.rs`.
+
+**Score: 8/10.**

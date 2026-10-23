@@ -1,0 +1,9 @@
+grub-test/keymod-iso/boot/k.elf
+grub-test/keymod-iso/boot/nc110-client.key
+grub-test/keymod.iso
+grub-test/wdt-badrcba.iso
+grub-test/wdt.iso
+target/
+test-keys/
+tools/.venv/
+fw/

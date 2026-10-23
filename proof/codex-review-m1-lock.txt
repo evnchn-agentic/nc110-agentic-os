@@ -1,0 +1,1251 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a149b1-0540-7cb1-bd90-944431eb5656
+--------
+user
+You are a calibrated adversarial reviewer for a GRUB 2 script that arms the Intel NM10 (ICH7-class, iTCO v2) TCO hardware watchdog before loading untrusted bare-metal code on a real netbook. Repo: current directory. Review commit 3bcac1a (git show 3bcac1a), focusing on grub-test/tco-arm.cfg, grub-test/m1-nc110-entry.cfg, grub-test/build-iso.sh, run-wdt.py.
+
+Context: the real board's BIOS sets TCO1_CNT.TCO_LOCK=1 with SMI_EN.TCO_EN=1 (see ~/party/nc110-m1/M1-RESULT.md). The original design refused to arm in that state. The change adds lock_mode (default refuse; accept only when a caller sets it). In accept mode the script must never write a locked bit: it does not write SMI_EN and skips the TCO_EN check; the first timeout goes to firmware SMI and the reset relies on the 2nd timeout. The NC110 entry keeps `set lock_mode=accept` commented out until a hardware test shows a reset. Linux iTCO_wdt v6.12 lines 124 and 524-531 leave TCO_EN set on v2 by default. QEMU q35 proofs: proof/wdt-grub*.log and proof/wdt-grub-locked-accept.trace.txt.
+
+Attack specifically:
+(a) Does accept mode ever write a locked bit or anything it should not (note TCO1_CNT masked RMW writes bit 12 back as 1)?
+(b) Is refuse still the default on every call path, including GRUB variable scoping (set inside functions, sourced files, order of source vs caller set, leftovers from a previous menuentry in the same GRUB session)?
+(c) Can any predicate pass while the watchdog is not actually armed?
+(d) Does the QEMU proof overclaim? What does it NOT prove about the real Phoenix firmware?
+
+Rules: signal over volume. Tier findings MUST-FIX / SHOULD-FIX / NIT. "Most is sound" is a valid verdict. Do not edit files. End with a 0-10 score (10 = ready to put on hardware once step 1 shows a reset).
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll inspect the commit, caller paths, and proof logs, focusing on GRUB variable persistence and what the locked-mode checks actually establish.
+exec
+/bin/zsh -lc 'git show 3bcac1a -- grub-test/tco-arm.cfg grub-test/m1-nc110-entry.cfg grub-test/build-iso.sh run-wdt.py' in ~/nc110-baremetal
+ succeeded in 0ms:
+commit 3bcac1a94754cbef8b441a6918dcc48749cfd463
+Author: evnchn <user1@example.invalid>
+Date:   Sat Oct 17 19:48:07 2026 +0800
+
+    M1 rework: opt-in lock_mode=accept in tco-arm.cfg for TCO_LOCK=1 firmware (NC110 BIOS); q35 rehearsal of locked-refuse/locked-accept (emulator only)
+    
+    Default stays refuse. accept never writes SMI_EN and skips the TCO_EN check; the NC110 entry keeps the
+    line commented out until the Linux-side TCO test shows a reset at ~2x heartbeat.
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/grub-test/build-iso.sh b/grub-test/build-iso.sh
+index 2b9117b..b4d26e1 100644
+--- a/grub-test/build-iso.sh
++++ b/grub-test/build-iso.sh
+@@ -1,6 +1,7 @@
+ #!/bin/sh
+ # Build the q35 GRUB rehearsal ISOs in a throwaway amd64 Debian container (GRUB 2.06, as Debian 12 ships).
+-# Run from the repo root: sh grub-test/build-iso.sh   -> grub-test/wdt.iso (good), grub-test/wdt-badrcba.iso (guard test)
++# Run from the repo root: sh grub-test/build-iso.sh   -> grub-test/wdt.iso (good), grub-test/wdt-badrcba.iso (guard test),
++#   grub-test/wdt-locked-{refuse,accept}.iso (TCO_LOCK=1 as on the NC110 BIOS)
+ set -e
+ cp grub-test/tco-arm.cfg grub-test/iso/boot/grub/tco-arm.cfg
+ cp target/grub/x86_64-unknown-none/release/nc110-kernel grub-test/iso/boot/k.elf
+@@ -13,4 +14,11 @@ docker run --rm --platform linux/amd64 -v "$PWD/grub-test:/w" debian:bookworm-sl
+   grub-mkrescue -o /w/wdt.iso /w/iso 2>&1 | tail -1
+   echo "set rcba_expect=fed1c000; echo \"grub: mode badrcba\"" > /w/iso/boot/grub/mode.cfg
+   grub-mkrescue -o /w/wdt-badrcba.iso /w/iso 2>&1 | tail -1
++  # TCO_LOCK rehearsals: emulate the NC110 BIOS (TCO_EN=1 then TCO_LOCK=1), probe whether QEMU enforces the lock,
++  # and put TCO_EN back if it did not, so tco_arm sees the NC110 state either way.
++  lock="outl 0x630 0x2000 0x2000; outw 0x668 0x1000 0x1000; outl 0x630 0 0x2000; inl -v p 0x630; echo \"q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=\$p\"; outl 0x630 0x2000 0x2000"
++  echo "$lock; echo \"grub: mode locked-refuse\"" > /w/iso/boot/grub/mode.cfg
++  grub-mkrescue -o /w/wdt-locked-refuse.iso /w/iso 2>&1 | tail -1
++  echo "$lock; set lock_mode=accept; echo \"grub: mode locked-accept\"" > /w/iso/boot/grub/mode.cfg
++  grub-mkrescue -o /w/wdt-locked-accept.iso /w/iso 2>&1 | tail -1
+   echo "echo \"grub: mode good\"" > /w/iso/boot/grub/mode.cfg'
+diff --git a/grub-test/m1-nc110-entry.cfg b/grub-test/m1-nc110-entry.cfg
+index c532c70..76d9811 100644
+--- a/grub-test/m1-nc110-entry.cfg
++++ b/grub-test/m1-nc110-entry.cfg
+@@ -5,6 +5,9 @@
+ # Before step 1, read in Slot A (read-only) and confirm the three guard strings:
+ #   sudo setpci -s 00:1f.0 0.l 40.l f0.l   -> expect 27bc8086 / 00001001 / fed1c001 (GRUB prints 1001, no padding)
+ #   and that TCO1_CNT (0x1068) has bit 12 TCO_LOCK = 0 (else the entry refuses, by design).
++#   2026-10-17: the NC110 BIOS 01VG.M013 sets TCO_LOCK=1 with TCO_EN=1 (~/party/nc110-m1/M1-RESULT.md), so these
++#   entries refuse as written. The lock_mode line in nc110_tco_consts stays commented out until the Linux-side
++#   test (pane brief step 1) shows a reset at ~2x the heartbeat. Rehearsed on q35: proof/wdt-grub-locked-*.log.
+ 
+ # Step 0: prove the one-shot itself. Arms nothing, runs none of our code, reboots. Pass = Slot A comes back
+ # by itself and grubenv next_entry is empty afterwards.
+@@ -32,6 +35,7 @@ function nc110_tco_consts {
+   set tco_tmr=0x1072
+   set tmr_val=0x64
+   set tmr_re='^([0-9a-f]*[048c])?64$'
++  # set lock_mode=accept   # ONLY after step 1 reset at ~2x heartbeat on THIS board (firmware SMI does not swallow)
+ }
+ 
+ # Step 1: the watchdog proof proper. Pinned grub-armed kernel (cargo --features grub-armed, record its sha256),
+diff --git a/grub-test/tco-arm.cfg b/grub-test/tco-arm.cfg
+index b94dd7f..d38758e 100644
+--- a/grub-test/tco-arm.cfg
++++ b/grub-test/tco-arm.cfg
+@@ -2,6 +2,13 @@
+ # rehearsal (grub-test/iso/boot/grub/grub.cfg) and the proposed NC110 entry (grub-test/m1-nc110-entry.cfg).
+ # Caller sets: lpc_expect pmbase_expect rcba_expect gcs_addr smi_en tco_rld tco1_sts tco2_sts tco1_cnt tco_tmr
+ #              tmr_val tmr_re. GRUB prints values as %x (lowercase, no 0x, no padding); bit tests are regexps.
++# Optional caller override: lock_mode (default refuse, set below). Callers source this file FIRST, then set it.
++#   refuse : TCO_LOCK set -> do not arm (the original M1 design: it needs SMI_EN.TCO_EN cleared).
++#   accept : TCO_LOCK set -> arm anyway, writing NO locked bit: SMI_EN is not written and not checked, so the
++#            first timeout raises an SMI to the firmware and the reset relies on the second timeout. Only valid
++#            once a hardware test showed this firmware's SMI handler does NOT swallow the timeout (NC110 step 1).
++#            Linux iTCO_wdt does the same on v2 by default (turn_SMI_watchdog_clear_off=1 < version 2).
++set lock_mode=refuse
+ # tco_arm sets wdt_ok=yes ONLY if every live predicate holds. The caller must boot only inside that branch.
+ 
+ # Bit predicates on %x strings:
+@@ -63,9 +70,15 @@ function tco_arm {
+   inw -v sts2pre $tco2_sts
+   read_dword -v gcspre $gcs_addr
+   echo "wdt: before: GCS=$gcspre TCO1_CNT=$cntpre TCO2_STS=$sts2pre (6 = last reset was the watchdog)"
+-  if regexp "$re_lock_clear" "$cntpre"; then true; else echo "wdt: TCO_LOCK set, NOT arming"; return 1; fi
++  if regexp "$re_lock_clear" "$cntpre"; then set tco_locked=no; else set tco_locked=yes; fi
++  if [ "$tco_locked" = "yes" ]; then
++    if [ "$lock_mode" != "accept" ]; then echo "wdt: TCO_LOCK set, NOT arming (lock_mode=$lock_mode)"; return 1; fi
++    echo "wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to firmware SMI, reset on 2nd"
++  fi
+   write_dword $gcs_addr 0 0x20       # GCS: clear NO_REBOOT (bit 5), masked RMW
+-  outl $smi_en 0 0x2000              # SMI_EN: clear TCO_EN (bit 13), masked RMW
++  if [ "$tco_locked" = "no" ]; then
++    outl $smi_en 0 0x2000            # SMI_EN: clear TCO_EN (bit 13), masked RMW; locked: never written
++  fi
+   outw $tco1_sts 0x0008              # TCO1_STS: clear TIMEOUT (RW1C)
+   outw $tco2_sts 0x0002              # TCO2_STS: clear SECOND_TO_STS first ...
+   outw $tco2_sts 0x0004              # ... then BOOT_STS (Intel order)
+@@ -80,10 +93,12 @@ function tco_arm {
+   inw -v c0 $tco_rld
+   sleep 1
+   inw -v c1 $tco_rld
+-  echo "wdt: after: GCS=$gcs TCO1_CNT=$cnt TCO_TMR=$tmr SMI_EN=$smien count $c0 -> $c1"
++  echo "wdt: after: GCS=$gcs TCO1_CNT=$cnt TCO_TMR=$tmr SMI_EN=$smien count $c0 -> $c1 locked=$tco_locked mode=$lock_mode"
+   if regexp "$re_noreboot_clear" "$gcs"; then true; else echo "wdt: NO_REBOOT still set"; return 1; fi
+   if regexp "$re_hlt_clear" "$cnt"; then true; else echo "wdt: timer still halted"; return 1; fi
+-  if regexp "$re_tcoen_clear" "$smien"; then true; else echo "wdt: SMI_EN.TCO_EN still set"; return 1; fi
++  if [ "$tco_locked" = "no" ]; then
++    if regexp "$re_tcoen_clear" "$smien"; then true; else echo "wdt: SMI_EN.TCO_EN still set"; return 1; fi
++  fi
+   if regexp "$tmr_re" "$tmr"; then true; else echo "wdt: TCO_TMR not $tmr_val"; return 1; fi
+   if [ "$c0" = "$c1" -o "$c0" = "unset" -o "$c1" = "unset" ]; then echo "wdt: counter not moving"; return 1; fi
+   set wdt_ok=yes
+diff --git a/run-wdt.py b/run-wdt.py
+index dc8e2f4..e47f5c4 100644
+--- a/run-wdt.py
++++ b/run-wdt.py
+@@ -2,7 +2,7 @@
+ """M0.5 watchdog rehearsal: boot the kernel on QEMU q35 (ICH9 LPC + TCO) WITHOUT -no-reboot and
+ record serial lines and QMP events (WATCHDOG, RESET) with host timestamps.
+ 
+-Usage: python3 run-wdt.py <name> <kernel-elf | grub.iso> <cmdline (ignored for .iso)> <banners-to-wait-for> <deadline-s> <expect: watchdog|none|refuse>
++Usage: python3 run-wdt.py <name> <kernel-elf | grub.iso> <cmdline (ignored for .iso)> <banners-to-wait-for> <deadline-s> <expect: watchdog|none|refuse> [locked]
+ Pass for `watchdog`: a HANG marker, then a QMP WATCHDOG(action=reset) at most 7.5 s after it and at least 4.5 s
+ after that boot started (TMR=5: 2 x 5 x 0.6 s = 6 s from the last reload, which may precede HANG), then the next
+ boot banner. Pass for `none`: a HANG marker, no WATCHDOG and no RESET event before the deadline.
+@@ -15,6 +15,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
+ PROOF = os.path.join(ROOT, "proof")
+ name, kernel, cmdline, want, deadline = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), float(sys.argv[5])
+ expect = sys.argv[6]
++locked = len(sys.argv) > 7 and sys.argv[7] == "locked"  # also require the 'after:' line to show TCO_EN and TCO_LOCK still set
+ assert expect in ("watchdog", "none", "refuse")
+ ev = []  # (t, kind)
+ SERIAL = os.path.join(PROOF, f".wdt-{name}.serial")
+@@ -29,7 +30,7 @@ cmd = [
+     "-global", "ICH9-LPC.noreboot=false",          # explicit: no NO_REBOOT pin strap
+     "-action", "watchdog=reset",                     # explicit: QEMU default, stated for the record
+     "-serial", f"file:{SERIAL}", "-qmp", f"unix:{QMP},server,wait=off",
+-] + (["-cdrom", kernel, "-boot", "d"] if kernel.endswith(".iso") else ["-kernel", kernel, "-append", cmdline])
++] + sum((["-trace", t] for t in os.environ.get("WDT_TRACE", "").split(",") if t), []) + (["-cdrom", kernel, "-boot", "d"] if kernel.endswith(".iso") else ["-kernel", kernel, "-append", cmdline])
+ log = []
+ t0 = time.time()
+ def rec(src, msg):
+@@ -100,6 +101,17 @@ nxt = next((t for t, m in ev if "NC110 bare-metal" in m and wd is not None and t
+ start = max((t for t, m in ev if hang is not None and t <= hang and ("grub: mode" in m or "NC110 bare-metal" in m)), default=None)
+ if expect == "watchdog":
+     ok = None not in (hang, wd, nxt, start) and wd - hang <= 7.5 and wd - start >= 4.5
++    if locked:  # GRUB %x: SMI_EN bit 13 and TCO1_CNT bit 12 = 4th hex digit from the right
++        import re
++        # Only the boot the WATCHDOG fired in: QEMU keeps TCO_LOCK across the watchdog reset while SMI_EN resets
++        # to 0x21, so on later boots the lock pins TCO_EN=0 and the emulated BIOS cannot set it again.
++        after = [re.search(r"TCO1_CNT=([0-9a-f]+) .*SMI_EN=([0-9a-f]+)", m) for t, m in ev
++                 if "wdt: after:" in m and hang is not None and t < hang
++                 and t > max((u for u, n in ev if "grub: mode" in n and u < hang), default=-1)]
++        bit = lambda h, b: (int(h, 16) >> b) & 1
++        lock_ok = bool(after) and all(a and bit(a[1], 12) and bit(a[2], 13) for a in after)
++        rec("host", f"locked check: {len(after)} 'after:' line(s) in the watchdog's boot, TCO_LOCK and TCO_EN still set in all: {lock_ok}")
++        ok = ok and lock_ok
+     verdict = (f"boot-start->WATCHDOG {wd - start:.2f}s, HANG->WATCHDOG {wd - hang:.2f}s, next banner {nxt - wd:.2f}s later"
+                if ok else f"start={start} hang={hang} wd={wd} next={nxt}")
+ elif expect == "refuse":
+
+exec
+/bin/zsh -lc "cat ~/party/nc110-m1/M1-RESULT.md; rg -n 'lock_mode|tco_arm|tco-arm|locked.accept|TCO_LOCK' grub-test run-wdt.py proof" in ~/nc110-baremetal
+ succeeded in 0ms:
+# NC110 M1 (hardware): STOPPED at the read-only gate, nothing written (2026-10-17 ~02:37 HKT)
+
+Run by a subagent of session f460ea31 (pane w2N:p1). hwlock `nc110:host` was pre-claimed by evnchn@Mac.
+
+## Verdict
+TCO_LOCK is SET on this firmware, so the M1 GRUB guard (`tco-arm.cfg`) would refuse to arm, by design.
+Per the run rules ("if ANY differs from what the GRUB guard expects, STOP before writing anything") no step was run:
+no grub.cfg backup/edit, no /boot/baremetal, no next_entry, no reboot. The netbook was never rebooted.
+
+## Read-backs (Slot A, read-only; files 00-04 here)
+| Check | Expected (guard) | Read | OK? |
+|---|---|---|---|
+| hostname / root | nc110 / /dev/sda2 | nc110 / /dev/sda2 (stock vmlinuz-lts, up 2 d 23 h) | yes |
+| grubenv | saved_entry=0, no next_entry | `saved_entry=0`, `next_entry=` (empty) | yes |
+| one-shot clear in LIVE grub.cfg | before the menu | lines 19-27 (`set next_entry=` + `save_env next_entry`); first menuentry at line 110 | yes |
+| LPC 00:1f.0 0x00 | 27bc8086 | 27bc8086 | yes |
+| PMBASE 0x40 | 1001 | 00001001 | yes |
+| RCBA 0xF0 | fed1c001 | fed1c001 | yes |
+| TCO1_CNT 0x1068 bit 12 TCO_LOCK | 0 | **0x1000, so TCO_LOCK=1** (8/8 byte-wise reads) | **NO** |
+| SMI_EN 0x1030 bit 13 TCO_EN | must be clearable | **0x00022033, so TCO_EN=1** (locked by TCO_LOCK) | **NO** |
+
+Other values read:
+- TMR_HLT (bit 11) = 0, so the timer is RUNNING.
+- TCO_TMR=0x32 (50 ticks = 30 s, which matches Linux iTCO_wdt heartbeat=30).
+- TCO_RLD counted down 0x2e to 0x21 over ~8 s (0.6 s/tick).
+- TCO1_STS=0, TCO2_STS=0.
+- sysfs watchdog0: state=inactive, bootstatus=0, nowayout=0.
+- GCS (0xfed1f410) not readable from Linux: /dev/mem says "Bad address".
+- BIOS: 01VG.M013.20110704.RHU.
+
+## What it means (datasheet reading; the SMI part is an inference, not tested)
+- TCO_LOCK cannot be cleared by software once it is set. The BIOS set it during POST, so expect GRUB to see it set on every boot. (Inferred from reading it set now; I did not confirm the exact reset domain in the datasheet.)
+- With TCO_LOCK set, SMI_EN.TCO_EN cannot be cleared, so the first TCO timeout ALWAYS raises an SMI to the firmware.
+- Whether the Phoenix SMI handler reloads the timer (swallowing every timeout, so no reset ever happens) is exactly the unknown.
+- The GRUB design assumed it could clear TCO_EN, and correctly refuses when it can't. Checked: `re_lock_clear` does not match `1000`, so `tco_arm` prints "TCO_LOCK set, NOT arming" and reboots.
+- NO_REBOOT IS clearable: this box's iTCO_wdt.ko.gz contains "unable to reset NO_REBOOT flag, device disabled by hardware/BIOS", the probe aborts on that path, and dmesg shows only "initialized". Only TCO_EN is locked.
+- The timer runs under Linux while sysfs says inactive. That suggests (inference) the kernel watchdog core is pinging a TCO the firmware left running.
+- If the firmware SMI handler swallows timeouts, a hang under the current design would need a power cycle. That is why we stopped.
+
+## Not done
+- Steps 0, 1 and 2 were not run.
+- No sha256 manifest: nothing was built or copied. The iPXE image was not built.
+- No syslog server was started.
+
+Final state (05-final-state.txt):
+- grub.cfg sha256 433c88ac… and grubenv 7bec425e…, unchanged from 01-live-grubcfg.txt.
+- No /boot/baremetal.
+- Uptime unbroken, no reboot.
+
+## Notes for the next run
+- **Step 0 is unaffected by this finding.** It is the pure one-shot probe and arms nothing, so it could be green-lit alone.
+- **The guard strings matched over a different read path.** netbook has no setpci/lspci, so I read sysfs config space and /dev/port. GRUB's own `setpci` echo of lpcid/pmbase/rcba has still never been seen on this box.
+
+## Proposed next step (operator's call, not taken)
+A Linux-side watchdog test. It carries no hang risk:
+- **Reset:** the TCO reset path works even with TCO_EN locked on.
+- **No reset:** the firmware swallows the timeouts. Linux keeps running, so no power cycle is needed.
+
+NM10 is iTCO v2: it resets on the 2nd expiry and Linux does not halve TMR (TMR=50 matches heartbeat=30).
+- With heartbeat N, expect the reset at about 2N.
+- Call it "firmware swallows" only if the box still answers after about 3N.
+
+Where to run it:
+- **Preferred: a one-shot "Slot B fastinit" boot**, so the unclean reset lands on the expendable slot.
+  1. Disarm the 75 s return timer (formula invariant 6).
+  2. SIGKILL fastinit's `watchdog` daemon. No magic close happens, so that kill is the test.
+  3. Either outcome returns to Slot A via saved_entry=0.
+- **Fallback: from Slot A.** Run `sync`, open /dev/watchdog, and never write to it. Cost: one unclean reset of a mounted Slot A (ext4 journal).
+
+If the test resets, tco-arm.cfg needs a reviewed change: accept TCO_LOCK=1 / TCO_EN=1 only on this evidence.
+run-wdt.py:18:locked = len(sys.argv) > 7 and sys.argv[7] == "locked"  # also require the 'after:' line to show TCO_EN and TCO_LOCK still set
+run-wdt.py:106:        # Only the boot the WATCHDOG fired in: QEMU keeps TCO_LOCK across the watchdog reset while SMI_EN resets
+run-wdt.py:113:        rec("host", f"locked check: {len(after)} 'after:' line(s) in the watchdog's boot, TCO_LOCK and TCO_EN still set in all: {lock_ok}")
+grub-test/iso/boot/grub/grub.cfg:1:# M0.5 q35 rehearsal of the M1 arming sequence (shared body: grub-test/tco-arm.cfg, copied here).
+grub-test/iso/boot/grub/grub.cfg:13:  source /boot/grub/tco-arm.cfg
+grub-test/iso/boot/grub/grub.cfg:32:  tco_arm
+grub-test/m1-nc110-entry.cfg:2:# The shared arm+verify body (tco-arm.cfg) is the one QEMU-tested on q35 (proof/wdt-grub.log); only the
+grub-test/m1-nc110-entry.cfg:3:# constants below differ. Copy tco-arm.cfg to /baremetal/tco-arm.cfg (paths are relative to the GRUB root; spec uses /baremetal/). Add these as NEW entries with NEW
+grub-test/m1-nc110-entry.cfg:7:#   and that TCO1_CNT (0x1068) has bit 12 TCO_LOCK = 0 (else the entry refuses, by design).
+grub-test/m1-nc110-entry.cfg:8:#   2026-10-17: the NC110 BIOS 01VG.M013 sets TCO_LOCK=1 with TCO_EN=1 (~/party/nc110-m1/M1-RESULT.md), so these
+grub-test/m1-nc110-entry.cfg:9:#   entries refuse as written. The lock_mode line in nc110_tco_consts stays commented out until the Linux-side
+grub-test/m1-nc110-entry.cfg:25:  source /baremetal/tco-arm.cfg
+grub-test/m1-nc110-entry.cfg:38:  # set lock_mode=accept   # ONLY after step 1 reset at ~2x heartbeat on THIS board (firmware SMI does not swallow)
+grub-test/m1-nc110-entry.cfg:49:  tco_arm
+grub-test/m1-nc110-entry.cfg:69:  tco_arm
+grub-test/m1-nc110-entry.cfg:91:#     tco_arm
+grub-test/iso/boot/grub/tco-arm.cfg:5:# Optional caller override: lock_mode (default refuse, set below). Callers source this file FIRST, then set it.
+grub-test/iso/boot/grub/tco-arm.cfg:6:#   refuse : TCO_LOCK set -> do not arm (the original M1 design: it needs SMI_EN.TCO_EN cleared).
+grub-test/iso/boot/grub/tco-arm.cfg:7:#   accept : TCO_LOCK set -> arm anyway, writing NO locked bit: SMI_EN is not written and not checked, so the
+grub-test/iso/boot/grub/tco-arm.cfg:11:set lock_mode=refuse
+grub-test/iso/boot/grub/tco-arm.cfg:12:# tco_arm sets wdt_ok=yes ONLY if every live predicate holds. The caller must boot only inside that branch.
+grub-test/iso/boot/grub/tco-arm.cfg:17:#   TCO1_CNT bit 12 (TCO_LOCK) clear : nibble 3 even
+grub-test/iso/boot/grub/tco-arm.cfg:56:function tco_arm {
+grub-test/iso/boot/grub/tco-arm.cfg:75:    if [ "$lock_mode" != "accept" ]; then echo "wdt: TCO_LOCK set, NOT arming (lock_mode=$lock_mode)"; return 1; fi
+grub-test/iso/boot/grub/tco-arm.cfg:76:    echo "wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to firmware SMI, reset on 2nd"
+grub-test/iso/boot/grub/tco-arm.cfg:96:  echo "wdt: after: GCS=$gcs TCO1_CNT=$cnt TCO_TMR=$tmr SMI_EN=$smien count $c0 -> $c1 locked=$tco_locked mode=$lock_mode"
+grub-test/build-iso.sh:4:#   grub-test/wdt-locked-{refuse,accept}.iso (TCO_LOCK=1 as on the NC110 BIOS)
+grub-test/build-iso.sh:6:cp grub-test/tco-arm.cfg grub-test/iso/boot/grub/tco-arm.cfg
+grub-test/build-iso.sh:12:  for f in /w/tco-arm.cfg /w/iso/boot/grub/grub.cfg /w/m1-nc110-entry.cfg; do grub-script-check "$f"; done
+grub-test/build-iso.sh:17:  # TCO_LOCK rehearsals: emulate the NC110 BIOS (TCO_EN=1 then TCO_LOCK=1), probe whether QEMU enforces the lock,
+grub-test/build-iso.sh:18:  # and put TCO_EN back if it did not, so tco_arm sees the NC110 state either way.
+grub-test/build-iso.sh:19:  lock="outl 0x630 0x2000 0x2000; outw 0x668 0x1000 0x1000; outl 0x630 0 0x2000; inl -v p 0x630; echo \"q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=\$p\"; outl 0x630 0x2000 0x2000"
+grub-test/build-iso.sh:22:  echo "$lock; set lock_mode=accept; echo \"grub: mode locked-accept\"" > /w/iso/boot/grub/mode.cfg
+grub-test/build-iso.sh:23:  grub-mkrescue -o /w/wdt-locked-accept.iso /w/iso 2>&1 | tail -1
+grub-test/tco-arm.cfg:5:# Optional caller override: lock_mode (default refuse, set below). Callers source this file FIRST, then set it.
+grub-test/tco-arm.cfg:6:#   refuse : TCO_LOCK set -> do not arm (the original M1 design: it needs SMI_EN.TCO_EN cleared).
+grub-test/tco-arm.cfg:7:#   accept : TCO_LOCK set -> arm anyway, writing NO locked bit: SMI_EN is not written and not checked, so the
+grub-test/tco-arm.cfg:11:set lock_mode=refuse
+grub-test/tco-arm.cfg:12:# tco_arm sets wdt_ok=yes ONLY if every live predicate holds. The caller must boot only inside that branch.
+grub-test/tco-arm.cfg:17:#   TCO1_CNT bit 12 (TCO_LOCK) clear : nibble 3 even
+grub-test/tco-arm.cfg:56:function tco_arm {
+grub-test/tco-arm.cfg:75:    if [ "$lock_mode" != "accept" ]; then echo "wdt: TCO_LOCK set, NOT arming (lock_mode=$lock_mode)"; return 1; fi
+grub-test/tco-arm.cfg:76:    echo "wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to firmware SMI, reset on 2nd"
+grub-test/tco-arm.cfg:96:  echo "wdt: after: GCS=$gcs TCO1_CNT=$cnt TCO_TMR=$tmr SMI_EN=$smien count $c0 -> $c1 locked=$tco_locked mode=$lock_mode"
+proof/wdt-grub-locked-accept.log:1:[  0.000s] host: qemu-system-x86_64 -machine q35 -m 128 -display none -vga std -global ICH9-LPC.noreboot=false -action watchdog=reset -serial file:~/nc110-baremetal/proof/.wdt-grub-locked-accept.serial -qmp unix:~/nc110-baremetal/proof/.qmp.sock,server,wait=off -cdrom grub-test/wdt-locked-accept.iso -boot d
+proof/wdt-grub-locked-accept.log:4:[  0.446s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=2021
+proof/wdt-grub-locked-accept.log:5:[  0.446s] serial: 
+grub: mode locked-accept
+proof/wdt-grub-locked-accept.log:9:[  0.446s] serial: 
+wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to
+proof/wdt-grub-locked-accept.log:28:[  7.040s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=21
+proof/wdt-grub-locked-accept.log:29:[  7.041s] serial: 
+grub: mode locked-accept
+proof/wdt-grub-locked-accept.log:33:[  7.041s] serial: 
+wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to
+proof/wdt-grub-locked-accept.log:48:[  9.830s] host: locked check: 1 'after:' line(s) in the watchdog's boot, TCO_LOCK and TCO_EN still set in all: True
+proof/codex-review-m0.5.txt:8:   On NM10, `TCO_LOCK` prevents changing `SMI_EN.TCO_EN`; it does **not** lock `TCO_TMR_HLT`. Preserving a pre-existing lock is not equivalent to establishing the intended SMI configuration. [Intel NM10 datasheet, §§13.8–13.9](https://www.mouser.com/pdfdocs/82NM10datasheet.pdf)
+proof/codex-review-m1-lock.txt:14:You are a calibrated adversarial reviewer for a GRUB 2 script that arms the Intel NM10 (ICH7-class, iTCO v2) TCO hardware watchdog before loading untrusted bare-metal code on a real netbook. Repo: current directory. Review commit 3bcac1a (git show 3bcac1a), focusing on grub-test/tco-arm.cfg, grub-test/m1-nc110-entry.cfg, grub-test/build-iso.sh, run-wdt.py.
+proof/codex-review-m1-lock.txt:16:Context: the real board's BIOS sets TCO1_CNT.TCO_LOCK=1 with SMI_EN.TCO_EN=1 (see ~/party/nc110-m1/M1-RESULT.md). The original design refused to arm in that state. The change adds lock_mode (default refuse; accept only when a caller sets it). In accept mode the script must never write a locked bit: it does not write SMI_EN and skips the TCO_EN check; the first timeout goes to firmware SMI and the reset relies on the 2nd timeout. The NC110 entry keeps `set lock_mode=accept` commented out until a hardware test shows a reset. Linux iTCO_wdt v6.12 lines 124 and 524-531 leave TCO_EN set on v2 by default. QEMU q35 proofs: proof/wdt-grub*.log and proof/wdt-grub-locked-accept.trace.txt.
+proof/codex-review-m1-lock.txt:30:/bin/zsh -lc 'git show 3bcac1a -- grub-test/tco-arm.cfg grub-test/m1-nc110-entry.cfg grub-test/build-iso.sh run-wdt.py' in ~/nc110-baremetal
+proof/codex-review-m1-lock.txt:36:    M1 rework: opt-in lock_mode=accept in tco-arm.cfg for TCO_LOCK=1 firmware (NC110 BIOS); q35 rehearsal of locked-refuse/locked-accept (emulator only)
+proof/codex-review-m1-lock.txt:52:+#   grub-test/wdt-locked-{refuse,accept}.iso (TCO_LOCK=1 as on the NC110 BIOS)
+proof/codex-review-m1-lock.txt:54: cp grub-test/tco-arm.cfg grub-test/iso/boot/grub/tco-arm.cfg
+proof/codex-review-m1-lock.txt:60:+  # TCO_LOCK rehearsals: emulate the NC110 BIOS (TCO_EN=1 then TCO_LOCK=1), probe whether QEMU enforces the lock,
+proof/codex-review-m1-lock.txt:61:+  # and put TCO_EN back if it did not, so tco_arm sees the NC110 state either way.
+proof/codex-review-m1-lock.txt:62:+  lock="outl 0x630 0x2000 0x2000; outw 0x668 0x1000 0x1000; outl 0x630 0 0x2000; inl -v p 0x630; echo \"q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=\$p\"; outl 0x630 0x2000 0x2000"
+proof/codex-review-m1-lock.txt:65:+  echo "$lock; set lock_mode=accept; echo \"grub: mode locked-accept\"" > /w/iso/boot/grub/mode.cfg
+proof/codex-review-m1-lock.txt:66:+  grub-mkrescue -o /w/wdt-locked-accept.iso /w/iso 2>&1 | tail -1
+proof/codex-review-m1-lock.txt:75: #   and that TCO1_CNT (0x1068) has bit 12 TCO_LOCK = 0 (else the entry refuses, by design).
+proof/codex-review-m1-lock.txt:76:+#   2026-10-17: the NC110 BIOS 01VG.M013 sets TCO_LOCK=1 with TCO_EN=1 (~/party/nc110-m1/M1-RESULT.md), so these
+proof/codex-review-m1-lock.txt:77:+#   entries refuse as written. The lock_mode line in nc110_tco_consts stays commented out until the Linux-side
+proof/codex-review-m1-lock.txt:86:+  # set lock_mode=accept   # ONLY after step 1 reset at ~2x heartbeat on THIS board (firmware SMI does not swallow)
+proof/codex-review-m1-lock.txt:90:diff --git a/grub-test/tco-arm.cfg b/grub-test/tco-arm.cfg
+proof/codex-review-m1-lock.txt:92:--- a/grub-test/tco-arm.cfg
+proof/codex-review-m1-lock.txt:93:+++ b/grub-test/tco-arm.cfg
+proof/codex-review-m1-lock.txt:98:+# Optional caller override: lock_mode (default refuse, set below). Callers source this file FIRST, then set it.
+proof/codex-review-m1-lock.txt:99:+#   refuse : TCO_LOCK set -> do not arm (the original M1 design: it needs SMI_EN.TCO_EN cleared).
+proof/codex-review-m1-lock.txt:100:+#   accept : TCO_LOCK set -> arm anyway, writing NO locked bit: SMI_EN is not written and not checked, so the
+proof/codex-review-m1-lock.txt:104:+set lock_mode=refuse
+proof/codex-review-m1-lock.txt:105: # tco_arm sets wdt_ok=yes ONLY if every live predicate holds. The caller must boot only inside that branch.
+proof/codex-review-m1-lock.txt:108:@@ -63,9 +70,15 @@ function tco_arm {
+proof/codex-review-m1-lock.txt:112:-  if regexp "$re_lock_clear" "$cntpre"; then true; else echo "wdt: TCO_LOCK set, NOT arming"; return 1; fi
+proof/codex-review-m1-lock.txt:115:+    if [ "$lock_mode" != "accept" ]; then echo "wdt: TCO_LOCK set, NOT arming (lock_mode=$lock_mode)"; return 1; fi
+proof/codex-review-m1-lock.txt:116:+    echo "wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to firmware SMI, reset on 2nd"
+proof/codex-review-m1-lock.txt:126:@@ -80,10 +93,12 @@ function tco_arm {
+proof/codex-review-m1-lock.txt:131:+  echo "wdt: after: GCS=$gcs TCO1_CNT=$cnt TCO_TMR=$tmr SMI_EN=$smien count $c0 -> $c1 locked=$tco_locked mode=$lock_mode"
+proof/codex-review-m1-lock.txt:158:+locked = len(sys.argv) > 7 and sys.argv[7] == "locked"  # also require the 'after:' line to show TCO_EN and TCO_LOCK still set
+proof/codex-review-m1-lock.txt:177:+        # Only the boot the WATCHDOG fired in: QEMU keeps TCO_LOCK across the watchdog reset while SMI_EN resets
+proof/codex-review-m1-lock.txt:184:+        rec("host", f"locked check: {len(after)} 'after:' line(s) in the watchdog's boot, TCO_LOCK and TCO_EN still set in all: {lock_ok}")
+proof/wdt-grub-locked-refuse.log:4:[  0.364s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=2021
+proof/wdt-grub-locked-refuse.log:9:[  0.477s] serial: 
+wdt: TCO_LOCK set, NOT arming (lock_mode=refuse)
+proof/wdt-grub-locked-refuse.log:14:[  3.941s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=21
+proof/wdt-grub-locked-refuse.log:19:[  4.057s] serial: 
+wdt: TCO_LOCK set, NOT arming (lock_mode=refuse)
+proof/wdt-grub-locked-refuse.log:24:[  7.486s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=21
+proof/wdt-grub-locked-refuse.log:29:[  7.601s] serial: 
+wdt: TCO_LOCK set, NOT arming (lock_mode=refuse)
+proof/wdt-grub-locked-refuse.log:34:[ 11.232s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=21
+proof/wdt-grub-locked-refuse.log:39:[ 11.232s] serial: 
+wdt: TCO_LOCK set, NOT arming (lock_mode=refuse)
+
+exec
+/bin/zsh -lc 'git show 3bcac1a:grub-test/tco-arm.cfg; git show 3bcac1a:grub-test/m1-nc110-entry.cfg; git show 3bcac1a:grub-test/iso/boot/grub/grub.cfg; git show 3bcac1a:run-wdt.py; cat proof/wdt-grub-locked-accept.trace.txt proof/wdt-grub-locked-accept.log' in ~/nc110-baremetal
+ succeeded in 0ms:
+# Shared iTCO v2 arm + verify for GRUB 2 (needs insmod iorw memrw setpci regexp). Used verbatim by the QEMU
+# rehearsal (grub-test/iso/boot/grub/grub.cfg) and the proposed NC110 entry (grub-test/m1-nc110-entry.cfg).
+# Caller sets: lpc_expect pmbase_expect rcba_expect gcs_addr smi_en tco_rld tco1_sts tco2_sts tco1_cnt tco_tmr
+#              tmr_val tmr_re. GRUB prints values as %x (lowercase, no 0x, no padding); bit tests are regexps.
+# Optional caller override: lock_mode (default refuse, set below). Callers source this file FIRST, then set it.
+#   refuse : TCO_LOCK set -> do not arm (the original M1 design: it needs SMI_EN.TCO_EN cleared).
+#   accept : TCO_LOCK set -> arm anyway, writing NO locked bit: SMI_EN is not written and not checked, so the
+#            first timeout raises an SMI to the firmware and the reset relies on the second timeout. Only valid
+#            once a hardware test showed this firmware's SMI handler does NOT swallow the timeout (NC110 step 1).
+#            Linux iTCO_wdt does the same on v2 by default (turn_SMI_watchdog_clear_off=1 < version 2).
+set lock_mode=refuse
+# tco_arm sets wdt_ok=yes ONLY if every live predicate holds. The caller must boot only inside that branch.
+
+# Bit predicates on %x strings:
+#   GCS bit 5 (NO_REBOOT) clear      : nibble 1 in {0,1,4,5,8,9,c,d}
+#   TCO1_CNT bit 11 (TMR_HLT) clear  : nibble 2 < 8
+#   TCO1_CNT bit 12 (TCO_LOCK) clear : nibble 3 even
+#   SMI_EN bit 13 (TCO_EN) clear     : nibble 3 in {0,1,4,5,8,9,c,d}
+set re_noreboot_clear='^([0-9a-f]|[0-9a-f]*[014589cd][0-9a-f])$'
+set re_hlt_clear='^([0-9a-f]{1,2}|[0-7][0-9a-f]{2}|[0-9a-f]*[0-9a-f][0-7][0-9a-f]{2})$'
+set re_lock_clear='^([0-9a-f]{1,3}|[0-9a-f]*[02468ace][0-9a-f]{3})$'
+set re_tcoen_clear='^([0-9a-f]{1,3}|[0-9a-f]*[014589cd][0-9a-f]{3})$'
+
+function tco_re_check {
+  # $1 = regexp, $2 = value, $3 = expected (yes/no). Sets re_bad=yes on a wrong answer.
+  if regexp "$1" "$2"; then set got=yes; else set got=no; fi
+  if [ "$got" != "$3" ]; then echo "wdt: selftest FAILED: $2 vs $1 gave $got"; set re_bad=yes; fi
+}
+
+function tco_selftest {
+  # Proves THIS GRUB's regexp/test behave as the predicates assume, before they guard anything.
+  set re_bad=no
+  tco_re_check "$re_noreboot_clear" "0" yes
+  tco_re_check "$re_noreboot_clear" "fed1f401" yes
+  tco_re_check "$re_noreboot_clear" "20" no
+  tco_re_check "$re_noreboot_clear" "fed1f421" no
+  tco_re_check "$re_hlt_clear" "0" yes
+  tco_re_check "$re_hlt_clear" "1200" yes
+  tco_re_check "$re_hlt_clear" "800" no
+  tco_re_check "$re_hlt_clear" "1a00" no
+  tco_re_check "$re_lock_clear" "800" yes
+  tco_re_check "$re_lock_clear" "2000" yes
+  tco_re_check "$re_lock_clear" "1000" no
+  tco_re_check "$re_lock_clear" "3800" no
+  tco_re_check "$re_tcoen_clear" "21" yes
+  tco_re_check "$re_tcoen_clear" "1021" yes
+  tco_re_check "$re_tcoen_clear" "2021" no
+  tco_re_check "$re_tcoen_clear" "f021" no
+  tco_re_check '^5$' "5" yes
+  tco_re_check '^5$' "4005" no
+  if [ "a" != "a" -o "b" != "c" ]; then set got=yes; else set got=no; fi
+  if [ "$got" != "yes" ]; then echo "wdt: selftest FAILED: test -o"; set re_bad=yes; fi
+  if [ "$re_bad" = "no" ]; then echo "wdt: selftest OK (18 regexp cases + test -o)"; fi
+}
+
+function tco_arm {
+  set wdt_ok=no
+  tco_selftest
+  if [ "$re_bad" != "no" ]; then echo "wdt: GRUB predicates untrustworthy, NOT arming"; return 1; fi
+  set lpcid=unset; set pmbase=unset; set rcba=unset
+  setpci -s 00:1f.0 -v lpcid 0.l
+  setpci -s 00:1f.0 -v pmbase 40.l
+  setpci -s 00:1f.0 -v rcba f0.l
+  echo "wdt: lpcid=$lpcid pmbase=$pmbase rcba=$rcba"
+  if [ "$lpcid" != "$lpc_expect" -o "$pmbase" != "$pmbase_expect" -o "$rcba" != "$rcba_expect" ]; then
+    echo "wdt: chipset mismatch, NOT arming"; return 1
+  fi
+  set cntpre=unset; set sts2pre=unset; set gcspre=unset
+  inw -v cntpre $tco1_cnt
+  inw -v sts2pre $tco2_sts
+  read_dword -v gcspre $gcs_addr
+  echo "wdt: before: GCS=$gcspre TCO1_CNT=$cntpre TCO2_STS=$sts2pre (6 = last reset was the watchdog)"
+  if regexp "$re_lock_clear" "$cntpre"; then set tco_locked=no; else set tco_locked=yes; fi
+  if [ "$tco_locked" = "yes" ]; then
+    if [ "$lock_mode" != "accept" ]; then echo "wdt: TCO_LOCK set, NOT arming (lock_mode=$lock_mode)"; return 1; fi
+    echo "wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to firmware SMI, reset on 2nd"
+  fi
+  write_dword $gcs_addr 0 0x20       # GCS: clear NO_REBOOT (bit 5), masked RMW
+  if [ "$tco_locked" = "no" ]; then
+    outl $smi_en 0 0x2000            # SMI_EN: clear TCO_EN (bit 13), masked RMW; locked: never written
+  fi
+  outw $tco1_sts 0x0008              # TCO1_STS: clear TIMEOUT (RW1C)
+  outw $tco2_sts 0x0002              # TCO2_STS: clear SECOND_TO_STS first ...
+  outw $tco2_sts 0x0004              # ... then BOOT_STS (Intel order)
+  outw $tco_tmr $tmr_val 0x03ff      # TCO_TMR: ticks of 0.6 s in bits 9:0 only
+  outw $tco_rld 1                    # TCO_RLD: reload
+  outw $tco1_cnt 0 0x0800            # TCO1_CNT: clear TCO_TMR_HLT (bit 11), masked RMW, never bit 12
+  set gcs=unset; set cnt=unset; set tmr=unset; set smien=unset; set c0=unset; set c1=unset
+  read_dword -v gcs $gcs_addr
+  inw -v cnt $tco1_cnt
+  inw -v tmr $tco_tmr
+  inl -v smien $smi_en
+  inw -v c0 $tco_rld
+  sleep 1
+  inw -v c1 $tco_rld
+  echo "wdt: after: GCS=$gcs TCO1_CNT=$cnt TCO_TMR=$tmr SMI_EN=$smien count $c0 -> $c1 locked=$tco_locked mode=$lock_mode"
+  if regexp "$re_noreboot_clear" "$gcs"; then true; else echo "wdt: NO_REBOOT still set"; return 1; fi
+  if regexp "$re_hlt_clear" "$cnt"; then true; else echo "wdt: timer still halted"; return 1; fi
+  if [ "$tco_locked" = "no" ]; then
+    if regexp "$re_tcoen_clear" "$smien"; then true; else echo "wdt: SMI_EN.TCO_EN still set"; return 1; fi
+  fi
+  if regexp "$tmr_re" "$tmr"; then true; else echo "wdt: TCO_TMR not $tmr_val"; return 1; fi
+  if [ "$c0" = "$c1" -o "$c0" = "unset" -o "$c1" = "unset" ]; then echo "wdt: counter not moving"; return 1; fi
+  set wdt_ok=yes
+}
+# PROPOSED M1 entries for the NC110 (NM10 8086:27bc, iTCO v2). UNTESTED ON HARDWARE.
+# The shared arm+verify body (tco-arm.cfg) is the one QEMU-tested on q35 (proof/wdt-grub.log); only the
+# constants below differ. Copy tco-arm.cfg to /baremetal/tco-arm.cfg (paths are relative to the GRUB root; spec uses /baremetal/). Add these as NEW entries with NEW
+# names (spec rule 3) and boot each ONLY via next_entry from Slot A (rule 2). Run the steps in order; stop on any surprise.
+# Before step 1, read in Slot A (read-only) and confirm the three guard strings:
+#   sudo setpci -s 00:1f.0 0.l 40.l f0.l   -> expect 27bc8086 / 00001001 / fed1c001 (GRUB prints 1001, no padding)
+#   and that TCO1_CNT (0x1068) has bit 12 TCO_LOCK = 0 (else the entry refuses, by design).
+#   2026-10-17: the NC110 BIOS 01VG.M013 sets TCO_LOCK=1 with TCO_EN=1 (~/party/nc110-m1/M1-RESULT.md), so these
+#   entries refuse as written. The lock_mode line in nc110_tco_consts stays commented out until the Linux-side
+#   test (pane brief step 1) shows a reset at ~2x the heartbeat. Rehearsed on q35: proof/wdt-grub-locked-*.log.
+
+# Step 0: prove the one-shot itself. Arms nothing, runs none of our code, reboots. Pass = Slot A comes back
+# by itself and grubenv next_entry is empty afterwards.
+menuentry "nc110-bm-step0-oneshot-probe" {
+  echo "step0: one-shot probe, nothing armed, rebooting in 10 s"
+  sleep 10
+  reboot
+}
+
+function nc110_tco_consts {
+  insmod iorw
+  insmod memrw
+  insmod setpci
+  insmod regexp
+  source /baremetal/tco-arm.cfg
+  set lpc_expect=27bc8086
+  set pmbase_expect=1001
+  set rcba_expect=fed1c001
+  set gcs_addr=0xfed1f410
+  set smi_en=0x1030
+  set tco_rld=0x1060
+  set tco1_sts=0x1064
+  set tco2_sts=0x1066
+  set tco1_cnt=0x1068
+  set tco_tmr=0x1072
+  set tmr_val=0x64
+  set tmr_re='^([0-9a-f]*[048c])?64$'
+  # set lock_mode=accept   # ONLY after step 1 reset at ~2x heartbeat on THIS board (firmware SMI does not swallow)
+}
+
+# Step 1: the watchdog proof proper. Pinned grub-armed kernel (cargo --features grub-armed, record its sha256),
+# deliberate hang. TMR 0x64 = 100 x 0.6 s = 60 s per stage, so reset ~120 s after arming. Pass = "HANG now"
+# on screen, reset within ~150 s, Slot A back unaided, then (Linux) TCO2_STS at 0x1066 reads SECOND_TO_STS|BOOT_STS
+# if firmware has not cleared it.
+menuentry "nc110-bm-step1-wdt-hang" {
+  terminal_output console
+  set gfxpayload=text
+  nc110_tco_consts
+  tco_arm
+  if [ "$wdt_ok" = "yes" ]; then
+    echo "wdt: armed and verified, ~120 s to reset; loading k-wdt-hang.elf"
+    sleep 3
+    insmod multiboot
+    multiboot /baremetal/k-wdt-hang.elf wdt=hang
+    boot
+  else
+    echo "wdt: NOT armed, refusing to boot our code, rebooting to Slot A"
+    sleep 10
+    reboot
+  fi
+}
+
+# Step 2 (only after step 1 passed): iPXE + DHCP + syslog to .179. iPXE does not pet, so the board returns
+# to Slot A ~120 s after arming whatever iPXE does. Pin ipxe.lkrn (sha256) and its embedded script.
+menuentry "nc110-bm-step2-ipxe" {
+  terminal_output console
+  set gfxpayload=text
+  nc110_tco_consts
+  tco_arm
+  if [ "$wdt_ok" = "yes" ]; then
+    echo "wdt: armed and verified, loading iPXE"
+    sleep 3
+    linux16 /baremetal/ipxe.lkrn
+    boot
+  else
+    echo "wdt: NOT armed, refusing to boot iPXE, rebooting to Slot A"
+    sleep 10
+    reboot
+  fi
+}
+
+# FUTURE (after M1 passes; NOT part of M1, do not add yet): our SSH kernel on the NC110. The client key is a
+# 72-byte multiboot module on /boot (format in src/mb.rs, built by tools/extract-keys.py), so it can be rotated
+# without rebuilding the ELF; the kernel wipes it from RAM after loading. Which key, and which node accepts it,
+# is the operator's decision (spec: "Decisions the operator owes"). Shape, tested on QEMU pc with GRUB 2.06
+# (grub-test/keymod-iso, proof/m25-grub-keymod-serial.log):
+#   menuentry "nc110-bm-m2-ssh" {
+#     terminal_output console
+#     set gfxpayload=text
+#     nc110_tco_consts
+#     tco_arm
+#     if [ "$wdt_ok" = "yes" ]; then
+#       insmod multiboot
+#       multiboot /baremetal/k-ssh.elf rng=dump
+#       module /baremetal/nc110-client.key
+#       boot
+#     else
+#       reboot
+#     fi
+#   }
+# M0.5 q35 rehearsal of the M1 arming sequence (shared body: grub-test/tco-arm.cfg, copied here).
+# q35 addresses: PMBASE 0x600 -> TCOBASE 0x660, RCBA 0xfed1c000. mode.cfg picks good / badrcba.
+set timeout=0
+serial --unit=0 --speed=115200
+terminal_input serial console
+terminal_output serial console
+# Same shape as the M1 file: constants in a function that also sources the shared body.
+function q35_tco_consts {
+  insmod iorw
+  insmod memrw
+  insmod setpci
+  insmod regexp
+  source /boot/grub/tco-arm.cfg
+  set lpc_expect=29188086
+  set pmbase_expect=601
+  set rcba_expect=fed1c001
+  source /boot/grub/mode.cfg
+  set gcs_addr=0xfed1f410
+  set smi_en=0x630
+  set tco_rld=0x660
+  set tco1_sts=0x664
+  set tco2_sts=0x666
+  set tco1_cnt=0x668
+  set tco_tmr=0x672
+  set tmr_val=5
+  set tmr_re='^(([0-9a-f]*[048c])?0)?5$'
+}
+menuentry "wdt-arm then multiboot (q35 rehearsal)" {
+  q35_tco_consts
+  # Rehearsal only: emulate firmware that left NO_REBOOT set (QEMU powers up with it clear).
+  write_dword 0xfed1f410 0x20 0x20
+  tco_arm
+  if [ "$wdt_ok" = "yes" ]; then
+    echo "grub: armed and verified, loading kernel"
+    insmod multiboot
+    multiboot /boot/k.elf wdt=hang
+    boot
+  else
+    echo "grub: NOT armed, refusing to boot our code, rebooting"
+    sleep 3
+    reboot
+  fi
+}
+#!/usr/bin/env python3
+"""M0.5 watchdog rehearsal: boot the kernel on QEMU q35 (ICH9 LPC + TCO) WITHOUT -no-reboot and
+record serial lines and QMP events (WATCHDOG, RESET) with host timestamps.
+
+Usage: python3 run-wdt.py <name> <kernel-elf | grub.iso> <cmdline (ignored for .iso)> <banners-to-wait-for> <deadline-s> <expect: watchdog|none|refuse> [locked]
+Pass for `watchdog`: a HANG marker, then a QMP WATCHDOG(action=reset) at most 7.5 s after it and at least 4.5 s
+after that boot started (TMR=5: 2 x 5 x 0.6 s = 6 s from the last reload, which may precede HANG), then the next
+boot banner. Pass for `none`: a HANG marker, no WATCHDOG and no RESET event before the deadline.
+Pass for `refuse`: GRUB printed "NOT arming", our kernel never booted, no WATCHDOG event.
+Writes proof/wdt-<name>.log. One QEMU, -m 128, always killed on exit.
+"""
+import json, os, socket, subprocess, sys, threading, time
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+PROOF = os.path.join(ROOT, "proof")
+name, kernel, cmdline, want, deadline = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), float(sys.argv[5])
+expect = sys.argv[6]
+locked = len(sys.argv) > 7 and sys.argv[7] == "locked"  # also require the 'after:' line to show TCO_EN and TCO_LOCK still set
+assert expect in ("watchdog", "none", "refuse")
+ev = []  # (t, kind)
+SERIAL = os.path.join(PROOF, f".wdt-{name}.serial")
+QMP = os.path.join(PROOF, ".qmp.sock")
+OUT = os.path.join(PROOF, f"wdt-{name}.log")
+for p in (SERIAL, QMP):
+    if os.path.exists(p):
+        os.unlink(p)
+
+cmd = [
+    "qemu-system-x86_64", "-machine", "q35", "-m", "128", "-display", "none", "-vga", "std",
+    "-global", "ICH9-LPC.noreboot=false",          # explicit: no NO_REBOOT pin strap
+    "-action", "watchdog=reset",                     # explicit: QEMU default, stated for the record
+    "-serial", f"file:{SERIAL}", "-qmp", f"unix:{QMP},server,wait=off",
+] + sum((["-trace", t] for t in os.environ.get("WDT_TRACE", "").split(",") if t), []) + (["-cdrom", kernel, "-boot", "d"] if kernel.endswith(".iso") else ["-kernel", kernel, "-append", cmdline])
+log = []
+t0 = time.time()
+def rec(src, msg):
+    ev.append((time.time() - t0, f"{src}: {msg}"))
+    log.append(f"[{time.time() - t0:7.3f}s] {src}: {msg}")
+    print(log[-1], flush=True)
+
+rec("host", " ".join(cmd))
+q = subprocess.Popen(cmd)
+stop = threading.Event()
+
+def qmp_reader():
+    for _ in range(50):
+        try:
+            s = socket.socket(socket.AF_UNIX); s.connect(QMP); break
+        except OSError:
+            time.sleep(0.1)
+    else:
+        rec("qmp", "connect failed"); return
+    f = s.makefile("rwb")
+    f.readline()
+    f.write(b'{"execute":"qmp_capabilities"}\n'); f.flush()
+    while not stop.is_set():
+        try:
+            line = f.readline()
+        except OSError:
+            break
+        if not line:
+            break
+        m = json.loads(line)
+        if "event" in m:
+            rec("qmp", f"{m['event']} {json.dumps(m.get('data', {}))}")
+    s.close()
+
+th = threading.Thread(target=qmp_reader, daemon=True); th.start()
+pos, banners, buf, settle = 0, 0, b"", 0.0
+try:
+    while time.time() - t0 < deadline and q.poll() is None:
+        if os.path.exists(SERIAL):
+            with open(SERIAL, "rb") as fh:
+                fh.seek(pos); chunk = fh.read(); pos += len(chunk)
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                text = line.decode(errors="replace")
+                rec("serial", text)
+                if "NC110 bare-metal" in text:
+                    banners += 1
+                    rec("host", f"boot #{banners}")
+        if banners >= want:
+            settle = settle or time.time() + 1.5  # let boot #want print its status lines
+            if time.time() > settle:
+                break
+        time.sleep(0.05)
+    rec("host", f"stop: banners={banners} want={want} elapsed={time.time() - t0:.1f}s")
+finally:
+    stop.set()
+    if q.poll() is None:
+        q.kill()
+    q.wait(timeout=10)
+    for p in (SERIAL, QMP):
+        if os.path.exists(p):
+            os.unlink(p)
+hang = next((t for t, m in ev if "HANG now" in m), None)
+wd = next((t for t, m in ev if m.startswith("qmp: WATCHDOG") and hang is not None and t > hang), None)
+rst = [t for t, m in ev if m.startswith("qmp: RESET")]
+nxt = next((t for t, m in ev if "NC110 bare-metal" in m and wd is not None and t > wd), None)
+start = max((t for t, m in ev if hang is not None and t <= hang and ("grub: mode" in m or "NC110 bare-metal" in m)), default=None)
+if expect == "watchdog":
+    ok = None not in (hang, wd, nxt, start) and wd - hang <= 7.5 and wd - start >= 4.5
+    if locked:  # GRUB %x: SMI_EN bit 13 and TCO1_CNT bit 12 = 4th hex digit from the right
+        import re
+        # Only the boot the WATCHDOG fired in: QEMU keeps TCO_LOCK across the watchdog reset while SMI_EN resets
+        # to 0x21, so on later boots the lock pins TCO_EN=0 and the emulated BIOS cannot set it again.
+        after = [re.search(r"TCO1_CNT=([0-9a-f]+) .*SMI_EN=([0-9a-f]+)", m) for t, m in ev
+                 if "wdt: after:" in m and hang is not None and t < hang
+                 and t > max((u for u, n in ev if "grub: mode" in n and u < hang), default=-1)]
+        bit = lambda h, b: (int(h, 16) >> b) & 1
+        lock_ok = bool(after) and all(a and bit(a[1], 12) and bit(a[2], 13) for a in after)
+        rec("host", f"locked check: {len(after)} 'after:' line(s) in the watchdog's boot, TCO_LOCK and TCO_EN still set in all: {lock_ok}")
+        ok = ok and lock_ok
+    verdict = (f"boot-start->WATCHDOG {wd - start:.2f}s, HANG->WATCHDOG {wd - hang:.2f}s, next banner {nxt - wd:.2f}s later"
+               if ok else f"start={start} hang={hang} wd={wd} next={nxt}")
+elif expect == "refuse":
+    wds = [t for t, m in ev if m.startswith("qmp: WATCHDOG")]
+    refusals = sum("NOT arming" in m for _, m in ev)
+    ok = refusals > 0 and banners == 0 and not wds
+    verdict = f"{refusals} refusals, {len(rst)} GRUB reboots, 0 kernel boots, 0 WATCHDOG" if ok else f"refusals={refusals} banners={banners} wd={wds}"
+else:
+    ok = hang is not None and wd is None and not rst
+    verdict = f"no WATCHDOG/RESET for {time.time() - t0 - hang:.1f}s after HANG" if ok else f"hang={hang} wd={wd} resets={rst}"
+rec("host", f"VERDICT expect={expect}: {'PASS' if ok else 'FAIL'} ({verdict})")
+open(OUT, "w").write("\n".join(log) + "\n")
+print(f"wrote {OUT}")
+sys.exit(0 if ok else 1)
+tco_io_write addr=0x8 val=0x1000
+tco_io_write addr=0x4 val=0x8
+tco_io_write addr=0x6 val=0x2
+tco_io_write addr=0x6 val=0x4
+tco_io_write addr=0x12 val=0x5
+tco_io_write addr=0x0 val=0x1
+tco_io_write addr=0x8 val=0x1000
+tco_timer_expired timeouts_no=0 no_reboot=0/0
+tco_timer_expired timeouts_no=1 no_reboot=0/0
+tco_io_write addr=0x8 val=0x1000
+tco_io_write addr=0x4 val=0x8
+tco_io_write addr=0x6 val=0x2
+tco_io_write addr=0x6 val=0x4
+tco_io_write addr=0x12 val=0x5
+tco_io_write addr=0x0 val=0x1
+tco_io_write addr=0x8 val=0x1000
+[  0.000s] host: qemu-system-x86_64 -machine q35 -m 128 -display none -vga std -global ICH9-LPC.noreboot=false -action watchdog=reset -serial file:~/nc110-baremetal/proof/.wdt-grub-locked-accept.serial -qmp unix:~/nc110-baremetal/proof/.qmp.sock,server,wait=off -cdrom grub-test/wdt-locked-accept.iso -boot d
+[  0.336s] serial: [H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  0.336s] serial: 
+[  0.446s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=2021
+[  0.446s] serial: 
+grub: mode locked-accept
+[  0.446s] serial: 
+wdt: selftest OK (18 regexp cases + test -o)
+[  0.446s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  0.446s] serial: 
+wdt: before: GCS=20 TCO1_CNT=1000 TCO2_STS=0 (6 = last reset was the watchdog)
+[  0.446s] serial: 
+wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to
+[  0.544s] serial: 
+firmware SMI, reset on 2nd
+[  1.552s] serial: 
+wdt: after: GCS=0 TCO1_CNT=1000 TCO_TMR=5 SMI_EN=2021 count 4 -> 3 locked=yes
+[  1.552s] serial: 
+mode=accept
+[  1.552s] serial: 
+grub: armed and verified, loading kernel
+[  1.781s] serial: 
+NC110 bare-metal M2.5: hello from our own x86_64 kernel (Rust, no_std)
+[  1.781s] host: boot #1
+[  1.781s] serial: multiboot magic=0x2badb002 info=0x10000 -> long mode OK
+[  1.781s] serial: wdt: left to GRUB (grub-armed build); live registers follow (result=4)
+[  1.781s] serial: wdt: live TCOBASE=0x660 GCS=0x00000000 NO_REBOOT=0 TCO1_CNT=0x1000 HLT=0 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=5
+[  2.582s] serial: wdt: verify NO_REBOOT=0 HLT=0 TMR=5 count 2->1 => VERIFIED
+[  2.582s] serial: keymod: no multiboot module
+[  2.582s] serial: cmdline: wdt=hang
+[  2.582s] serial: wdt: HANG now: cli; hlt with the timer running, nobody pets
+[  6.517s] qmp: WATCHDOG {"action": "reset"}
+[  6.520s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  6.572s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  6.919s] serial: [H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  6.919s] serial: 
+[  7.040s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=21
+[  7.041s] serial: 
+grub: mode locked-accept
+[  7.041s] serial: 
+wdt: selftest OK (18 regexp cases + test -o)
+[  7.041s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  7.041s] serial: 
+wdt: before: GCS=20 TCO1_CNT=1000 TCO2_STS=6 (6 = last reset was the watchdog)
+[  7.041s] serial: 
+wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to
+[  7.041s] serial: 
+firmware SMI, reset on 2nd
+[  8.097s] serial: 
+wdt: after: GCS=0 TCO1_CNT=1000 TCO_TMR=5 SMI_EN=21 count 4 -> 3 locked=yes
+[  8.097s] serial: 
+mode=accept
+[  8.097s] serial: 
+grub: armed and verified, loading kernel
+[  8.304s] serial: 
+NC110 bare-metal M2.5: hello from our own x86_64 kernel (Rust, no_std)
+[  8.304s] host: boot #2
+[  8.304s] serial: multiboot magic=0x2badb002 info=0x10000 -> long mode OK
+[  8.304s] serial: wdt: left to GRUB (grub-armed build); live registers follow (result=4)
+[  8.304s] serial: wdt: live TCOBASE=0x660 GCS=0x00000000 NO_REBOOT=0 TCO1_CNT=0x1000 HLT=0 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=5
+[  8.998s] serial: wdt: verify NO_REBOOT=0 HLT=0 TMR=5 count 3->1 => VERIFIED
+[  8.998s] serial: keymod: no multiboot module
+[  8.998s] serial: cmdline: wdt=hang
+[  8.998s] serial: wdt: HANG now: cli; hlt with the timer running, nobody pets
+[  9.817s] host: stop: banners=2 want=2 elapsed=9.8s
+[  9.830s] host: locked check: 1 'after:' line(s) in the watchdog's boot, TCO_LOCK and TCO_EN still set in all: True
+[  9.830s] host: VERDICT expect=watchdog: PASS (boot-start->WATCHDOG 4.74s, HANG->WATCHDOG 3.94s, next banner 1.79s later)
+
+web search: 
+web search: https://raw.githubusercontent.com/torvalds/linux/v6.12/drivers/watchdog/iTCO_wdt.c
+codex
+The normal caller paths re-source the defaults on each invocation, so a previous menuentry’s `accept` setting is cleared. The trace also confirms that the masked TCO1_CNT write sends `0x1000`: it preserves TCO_LOCK rather than avoiding a write to that bit. I’m checking the register semantics and failure paths before assigning findings.
+web search: 
+web search: https://raw.githubusercontent.com/torvalds/linux/v6.12/drivers/watchdog/iTCO_wdt.c
+exec
+/bin/zsh -lc 'git status --short; git show --stat 3bcac1a; cat proof/wdt-grub.log proof/wdt-grub-badrcba.log proof/wdt-grub-locked-refuse.log' in ~/nc110-baremetal
+ succeeded in 0ms:
+?? grub-test/wdt-locked-accept.iso
+?? grub-test/wdt-locked-refuse.iso
+?? proof/codex-review-m1-lock.txt
+commit 3bcac1a94754cbef8b441a6918dcc48749cfd463
+Author: evnchn <user1@example.invalid>
+Date:   Sat Oct 17 19:48:07 2026 +0800
+
+    M1 rework: opt-in lock_mode=accept in tco-arm.cfg for TCO_LOCK=1 firmware (NC110 BIOS); q35 rehearsal of locked-refuse/locked-accept (emulator only)
+    
+    Default stays refuse. accept never writes SMI_EN and skips the TCO_EN check; the NC110 entry keeps the
+    line commented out until the Linux-side TCO test shows a reset at ~2x heartbeat.
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+ grub-test/build-iso.sh                 |  10 ++++-
+ grub-test/iso/boot/grub/tco-arm.cfg    |  23 ++++++++--
+ grub-test/iso/boot/k.elf               | Bin 36824 -> 457416 bytes
+ grub-test/m1-nc110-entry.cfg           |   4 ++
+ grub-test/tco-arm.cfg                  |  23 ++++++++--
+ proof/wdt-grub-badrcba.log             |  64 +++++++++++++--------------
+ proof/wdt-grub-locked-accept.log       |  49 +++++++++++++++++++++
+ proof/wdt-grub-locked-accept.trace.txt |  16 +++++++
+ proof/wdt-grub-locked-refuse.log       |  42 ++++++++++++++++++
+ proof/wdt-grub.log                     |  78 +++++++++++++++++----------------
+ run-wdt.py                             |  16 ++++++-
+ 11 files changed, 245 insertions(+), 80 deletions(-)
+[  0.000s] host: qemu-system-x86_64 -machine q35 -m 128 -display none -vga std -global ICH9-LPC.noreboot=false -action watchdog=reset -serial file:~/nc110-baremetal/proof/.wdt-grub.serial -qmp unix:~/nc110-baremetal/proof/.qmp.sock,server,wait=off -cdrom grub-test/wdt.iso -boot d
+[  0.365s] serial: [H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  0.365s] serial: 
+[  0.365s] serial: 
+grub: mode good
+[  0.365s] serial: 
+wdt: selftest OK (18 regexp cases + test -o)
+[  0.365s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  0.365s] serial: 
+wdt: before: GCS=20 TCO1_CNT=0 TCO2_STS=0 (6 = last reset was the watchdog)
+[  1.464s] serial: 
+wdt: after: GCS=0 TCO1_CNT=0 TCO_TMR=5 SMI_EN=21 count 4 -> 3 locked=no
+[  1.464s] serial: 
+mode=refuse
+[  1.464s] serial: 
+grub: armed and verified, loading kernel
+[  1.588s] serial: 
+NC110 bare-metal M2.5: hello from our own x86_64 kernel (Rust, no_std)
+[  1.589s] host: boot #1
+[  1.589s] serial: multiboot magic=0x2badb002 info=0x10000 -> long mode OK
+[  1.589s] serial: wdt: left to GRUB (grub-armed build); live registers follow (result=4)
+[  1.589s] serial: wdt: live TCOBASE=0x660 GCS=0x00000000 NO_REBOOT=0 TCO1_CNT=0x0000 HLT=0 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=5
+[  2.300s] serial: wdt: verify NO_REBOOT=0 HLT=0 TMR=5 count 3->1 => VERIFIED
+[  2.300s] serial: keymod: no multiboot module
+[  2.300s] serial: cmdline: wdt=hang
+[  2.300s] serial: wdt: HANG now: cli; hlt with the timer running, nobody pets
+[  6.458s] qmp: WATCHDOG {"action": "reset"}
+[  6.460s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  6.499s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  6.882s] serial: [H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  6.882s] serial: 
+[  7.006s] serial: 
+grub: mode good
+[  7.006s] serial: 
+wdt: selftest OK (18 regexp cases + test -o)
+[  7.006s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  7.006s] serial: 
+wdt: before: GCS=20 TCO1_CNT=0 TCO2_STS=6 (6 = last reset was the watchdog)
+[  8.060s] serial: 
+wdt: after: GCS=0 TCO1_CNT=0 TCO_TMR=5 SMI_EN=21 count 4 -> 3 locked=no
+[  8.060s] serial: 
+mode=refuse
+[  8.060s] serial: 
+grub: armed and verified, loading kernel
+[  8.238s] serial: 
+NC110 bare-metal M2.5: hello from our own x86_64 kernel (Rust, no_std)
+[  8.238s] host: boot #2
+[  8.238s] serial: multiboot magic=0x2badb002 info=0x10000 -> long mode OK
+[  8.238s] serial: wdt: left to GRUB (grub-armed build); live registers follow (result=4)
+[  8.238s] serial: wdt: live TCOBASE=0x660 GCS=0x00000000 NO_REBOOT=0 TCO1_CNT=0x0000 HLT=0 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=5
+[  9.046s] serial: wdt: verify NO_REBOOT=0 HLT=0 TMR=5 count 3->1 => VERIFIED
+[  9.046s] serial: keymod: no multiboot module
+[  9.046s] serial: cmdline: wdt=hang
+[  9.046s] serial: wdt: HANG now: cli; hlt with the timer running, nobody pets
+[  9.755s] host: stop: banners=2 want=2 elapsed=9.8s
+[  9.772s] host: VERDICT expect=watchdog: PASS (boot-start->WATCHDOG 4.87s, HANG->WATCHDOG 4.16s, next banner 1.78s later)
+[  0.000s] host: qemu-system-x86_64 -machine q35 -m 128 -display none -vga std -global ICH9-LPC.noreboot=false -action watchdog=reset -serial file:~/nc110-baremetal/proof/.wdt-grub-badrcba.serial -qmp unix:~/nc110-baremetal/proof/.qmp.sock,server,wait=off -cdrom grub-test/wdt-badrcba.iso -boot d
+[  0.343s] serial: [H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  0.343s] serial: 
+[  0.343s] serial: 
+grub: mode badrcba
+[  0.343s] serial: 
+wdt: selftest OK (18 regexp cases + test -o)
+[  0.343s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  0.343s] serial: 
+wdt: chipset mismatch, NOT arming
+[  0.343s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[  3.366s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  3.795s] serial: 
+[H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  3.795s] serial: 
+[  3.795s] serial: 
+grub: mode badrcba
+[  3.919s] serial: 
+wdt: selftest OK (18 regexp cases + test -o)
+[  3.919s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  3.919s] serial: 
+wdt: chipset mismatch, NOT arming
+[  3.919s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[  6.886s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  7.340s] serial: 
+[H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  7.340s] serial: 
+[  7.340s] serial: 
+grub: mode badrcba
+[  7.460s] serial: 
+wdt: selftest OK (18 regexp cases + test -o)
+[  7.460s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  7.460s] serial: 
+wdt: chipset mismatch, NOT arming
+[  7.460s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[ 10.442s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[ 10.851s] serial: 
+[H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[ 10.851s] serial: 
+[ 10.960s] serial: 
+grub: mode badrcba
+[ 10.960s] serial: 
+wdt: selftest OK (18 regexp cases + test -o)
+[ 10.960s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[ 10.960s] serial: 
+wdt: chipset mismatch, NOT arming
+[ 10.960s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[ 12.028s] host: stop: banners=0 want=1 elapsed=12.0s
+[ 12.032s] host: VERDICT expect=refuse: PASS (4 refusals, 3 GRUB reboots, 0 kernel boots, 0 WATCHDOG)
+[  0.000s] host: qemu-system-x86_64 -machine q35 -m 128 -display none -vga std -global ICH9-LPC.noreboot=false -action watchdog=reset -serial file:~/nc110-baremetal/proof/.wdt-grub-locked-refuse.serial -qmp unix:~/nc110-baremetal/proof/.qmp.sock,server,wait=off -cdrom grub-test/wdt-locked-refuse.iso -boot d
+[  0.364s] serial: [H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  0.364s] serial: 
+[  0.364s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=2021
+[  0.364s] serial: 
+grub: mode locked-refuse
+[  0.364s] serial: 
+wdt: selftest OK (18 regexp cases + test -o)
+[  0.364s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  0.477s] serial: 
+wdt: before: GCS=20 TCO1_CNT=1000 TCO2_STS=0 (6 = last reset was the watchdog)
+[  0.477s] serial: 
+wdt: TCO_LOCK set, NOT arming (lock_mode=refuse)
+[  0.477s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[  3.463s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  3.941s] serial: 
+[H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  3.941s] serial: 
+[  3.941s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=21
+[  3.941s] serial: 
+grub: mode locked-refuse
+[  4.057s] serial: 
+wdt: selftest OK (18 regexp cases + test -o)
+[  4.057s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  4.057s] serial: 
+wdt: before: GCS=20 TCO1_CNT=1000 TCO2_STS=0 (6 = last reset was the watchdog)
+[  4.057s] serial: 
+wdt: TCO_LOCK set, NOT arming (lock_mode=refuse)
+[  4.057s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[  7.081s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  7.486s] serial: 
+[H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  7.486s] serial: 
+[  7.486s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=21
+[  7.486s] serial: 
+grub: mode locked-refuse
+[  7.601s] serial: 
+wdt: selftest OK (18 regexp cases + test -o)
+[  7.601s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  7.601s] serial: 
+wdt: before: GCS=20 TCO1_CNT=1000 TCO2_STS=6 (6 = last reset was the watchdog)
+[  7.601s] serial: 
+wdt: TCO_LOCK set, NOT arming (lock_mode=refuse)
+[  7.601s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[ 10.639s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[ 11.108s] serial: 
+[H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[ 11.108s] serial: 
+[ 11.232s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=21
+[ 11.232s] serial: 
+grub: mode locked-refuse
+[ 11.232s] serial: 
+wdt: selftest OK (18 regexp cases + test -o)
+[ 11.232s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[ 11.232s] serial: 
+wdt: before: GCS=20 TCO1_CNT=1000 TCO2_STS=6 (6 = last reset was the watchdog)
+[ 11.232s] serial: 
+wdt: TCO_LOCK set, NOT arming (lock_mode=refuse)
+[ 11.232s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[ 12.017s] host: stop: banners=0 want=1 elapsed=12.0s
+[ 12.021s] host: VERDICT expect=refuse: PASS (4 refusals, 3 GRUB reboots, 0 kernel boots, 0 WATCHDOG)
+
+web search: 
+web search: https://github.com/torvalds/linux/blob/v6.12/drivers/watchdog/iTCO_wdt.c
+exec
+/bin/zsh -lc 'nl -ba grub-test/build-iso.sh; nl -ba grub-test/tco-arm.cfg | tail -55; nl -ba run-wdt.py | tail -42' in ~/nc110-baremetal
+ succeeded in 0ms:
+     1	#!/bin/sh
+     2	# Build the q35 GRUB rehearsal ISOs in a throwaway amd64 Debian container (GRUB 2.06, as Debian 12 ships).
+     3	# Run from the repo root: sh grub-test/build-iso.sh   -> grub-test/wdt.iso (good), grub-test/wdt-badrcba.iso (guard test),
+     4	#   grub-test/wdt-locked-{refuse,accept}.iso (TCO_LOCK=1 as on the NC110 BIOS)
+     5	set -e
+     6	cp grub-test/tco-arm.cfg grub-test/iso/boot/grub/tco-arm.cfg
+     7	cp target/grub/x86_64-unknown-none/release/nc110-kernel grub-test/iso/boot/k.elf
+     8	docker run --rm --platform linux/amd64 -v "$PWD/grub-test:/w" debian:bookworm-slim sh -c '
+     9	  set -e
+    10	  apt-get update -qq >/dev/null
+    11	  apt-get install -y -qq --no-install-recommends grub-pc-bin grub-common xorriso mtools >/dev/null 2>&1
+    12	  for f in /w/tco-arm.cfg /w/iso/boot/grub/grub.cfg /w/m1-nc110-entry.cfg; do grub-script-check "$f"; done
+    13	  echo "echo \"grub: mode good\"" > /w/iso/boot/grub/mode.cfg
+    14	  grub-mkrescue -o /w/wdt.iso /w/iso 2>&1 | tail -1
+    15	  echo "set rcba_expect=fed1c000; echo \"grub: mode badrcba\"" > /w/iso/boot/grub/mode.cfg
+    16	  grub-mkrescue -o /w/wdt-badrcba.iso /w/iso 2>&1 | tail -1
+    17	  # TCO_LOCK rehearsals: emulate the NC110 BIOS (TCO_EN=1 then TCO_LOCK=1), probe whether QEMU enforces the lock,
+    18	  # and put TCO_EN back if it did not, so tco_arm sees the NC110 state either way.
+    19	  lock="outl 0x630 0x2000 0x2000; outw 0x668 0x1000 0x1000; outl 0x630 0 0x2000; inl -v p 0x630; echo \"q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=\$p\"; outl 0x630 0x2000 0x2000"
+    20	  echo "$lock; echo \"grub: mode locked-refuse\"" > /w/iso/boot/grub/mode.cfg
+    21	  grub-mkrescue -o /w/wdt-locked-refuse.iso /w/iso 2>&1 | tail -1
+    22	  echo "$lock; set lock_mode=accept; echo \"grub: mode locked-accept\"" > /w/iso/boot/grub/mode.cfg
+    23	  grub-mkrescue -o /w/wdt-locked-accept.iso /w/iso 2>&1 | tail -1
+    24	  echo "echo \"grub: mode good\"" > /w/iso/boot/grub/mode.cfg'
+    51	  if [ "a" != "a" -o "b" != "c" ]; then set got=yes; else set got=no; fi
+    52	  if [ "$got" != "yes" ]; then echo "wdt: selftest FAILED: test -o"; set re_bad=yes; fi
+    53	  if [ "$re_bad" = "no" ]; then echo "wdt: selftest OK (18 regexp cases + test -o)"; fi
+    54	}
+    55	
+    56	function tco_arm {
+    57	  set wdt_ok=no
+    58	  tco_selftest
+    59	  if [ "$re_bad" != "no" ]; then echo "wdt: GRUB predicates untrustworthy, NOT arming"; return 1; fi
+    60	  set lpcid=unset; set pmbase=unset; set rcba=unset
+    61	  setpci -s 00:1f.0 -v lpcid 0.l
+    62	  setpci -s 00:1f.0 -v pmbase 40.l
+    63	  setpci -s 00:1f.0 -v rcba f0.l
+    64	  echo "wdt: lpcid=$lpcid pmbase=$pmbase rcba=$rcba"
+    65	  if [ "$lpcid" != "$lpc_expect" -o "$pmbase" != "$pmbase_expect" -o "$rcba" != "$rcba_expect" ]; then
+    66	    echo "wdt: chipset mismatch, NOT arming"; return 1
+    67	  fi
+    68	  set cntpre=unset; set sts2pre=unset; set gcspre=unset
+    69	  inw -v cntpre $tco1_cnt
+    70	  inw -v sts2pre $tco2_sts
+    71	  read_dword -v gcspre $gcs_addr
+    72	  echo "wdt: before: GCS=$gcspre TCO1_CNT=$cntpre TCO2_STS=$sts2pre (6 = last reset was the watchdog)"
+    73	  if regexp "$re_lock_clear" "$cntpre"; then set tco_locked=no; else set tco_locked=yes; fi
+    74	  if [ "$tco_locked" = "yes" ]; then
+    75	    if [ "$lock_mode" != "accept" ]; then echo "wdt: TCO_LOCK set, NOT arming (lock_mode=$lock_mode)"; return 1; fi
+    76	    echo "wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to firmware SMI, reset on 2nd"
+    77	  fi
+    78	  write_dword $gcs_addr 0 0x20       # GCS: clear NO_REBOOT (bit 5), masked RMW
+    79	  if [ "$tco_locked" = "no" ]; then
+    80	    outl $smi_en 0 0x2000            # SMI_EN: clear TCO_EN (bit 13), masked RMW; locked: never written
+    81	  fi
+    82	  outw $tco1_sts 0x0008              # TCO1_STS: clear TIMEOUT (RW1C)
+    83	  outw $tco2_sts 0x0002              # TCO2_STS: clear SECOND_TO_STS first ...
+    84	  outw $tco2_sts 0x0004              # ... then BOOT_STS (Intel order)
+    85	  outw $tco_tmr $tmr_val 0x03ff      # TCO_TMR: ticks of 0.6 s in bits 9:0 only
+    86	  outw $tco_rld 1                    # TCO_RLD: reload
+    87	  outw $tco1_cnt 0 0x0800            # TCO1_CNT: clear TCO_TMR_HLT (bit 11), masked RMW, never bit 12
+    88	  set gcs=unset; set cnt=unset; set tmr=unset; set smien=unset; set c0=unset; set c1=unset
+    89	  read_dword -v gcs $gcs_addr
+    90	  inw -v cnt $tco1_cnt
+    91	  inw -v tmr $tco_tmr
+    92	  inl -v smien $smi_en
+    93	  inw -v c0 $tco_rld
+    94	  sleep 1
+    95	  inw -v c1 $tco_rld
+    96	  echo "wdt: after: GCS=$gcs TCO1_CNT=$cnt TCO_TMR=$tmr SMI_EN=$smien count $c0 -> $c1 locked=$tco_locked mode=$lock_mode"
+    97	  if regexp "$re_noreboot_clear" "$gcs"; then true; else echo "wdt: NO_REBOOT still set"; return 1; fi
+    98	  if regexp "$re_hlt_clear" "$cnt"; then true; else echo "wdt: timer still halted"; return 1; fi
+    99	  if [ "$tco_locked" = "no" ]; then
+   100	    if regexp "$re_tcoen_clear" "$smien"; then true; else echo "wdt: SMI_EN.TCO_EN still set"; return 1; fi
+   101	  fi
+   102	  if regexp "$tmr_re" "$tmr"; then true; else echo "wdt: TCO_TMR not $tmr_val"; return 1; fi
+   103	  if [ "$c0" = "$c1" -o "$c0" = "unset" -o "$c1" = "unset" ]; then echo "wdt: counter not moving"; return 1; fi
+   104	  set wdt_ok=yes
+   105	}
+    87	        time.sleep(0.05)
+    88	    rec("host", f"stop: banners={banners} want={want} elapsed={time.time() - t0:.1f}s")
+    89	finally:
+    90	    stop.set()
+    91	    if q.poll() is None:
+    92	        q.kill()
+    93	    q.wait(timeout=10)
+    94	    for p in (SERIAL, QMP):
+    95	        if os.path.exists(p):
+    96	            os.unlink(p)
+    97	hang = next((t for t, m in ev if "HANG now" in m), None)
+    98	wd = next((t for t, m in ev if m.startswith("qmp: WATCHDOG") and hang is not None and t > hang), None)
+    99	rst = [t for t, m in ev if m.startswith("qmp: RESET")]
+   100	nxt = next((t for t, m in ev if "NC110 bare-metal" in m and wd is not None and t > wd), None)
+   101	start = max((t for t, m in ev if hang is not None and t <= hang and ("grub: mode" in m or "NC110 bare-metal" in m)), default=None)
+   102	if expect == "watchdog":
+   103	    ok = None not in (hang, wd, nxt, start) and wd - hang <= 7.5 and wd - start >= 4.5
+   104	    if locked:  # GRUB %x: SMI_EN bit 13 and TCO1_CNT bit 12 = 4th hex digit from the right
+   105	        import re
+   106	        # Only the boot the WATCHDOG fired in: QEMU keeps TCO_LOCK across the watchdog reset while SMI_EN resets
+   107	        # to 0x21, so on later boots the lock pins TCO_EN=0 and the emulated BIOS cannot set it again.
+   108	        after = [re.search(r"TCO1_CNT=([0-9a-f]+) .*SMI_EN=([0-9a-f]+)", m) for t, m in ev
+   109	                 if "wdt: after:" in m and hang is not None and t < hang
+   110	                 and t > max((u for u, n in ev if "grub: mode" in n and u < hang), default=-1)]
+   111	        bit = lambda h, b: (int(h, 16) >> b) & 1
+   112	        lock_ok = bool(after) and all(a and bit(a[1], 12) and bit(a[2], 13) for a in after)
+   113	        rec("host", f"locked check: {len(after)} 'after:' line(s) in the watchdog's boot, TCO_LOCK and TCO_EN still set in all: {lock_ok}")
+   114	        ok = ok and lock_ok
+   115	    verdict = (f"boot-start->WATCHDOG {wd - start:.2f}s, HANG->WATCHDOG {wd - hang:.2f}s, next banner {nxt - wd:.2f}s later"
+   116	               if ok else f"start={start} hang={hang} wd={wd} next={nxt}")
+   117	elif expect == "refuse":
+   118	    wds = [t for t, m in ev if m.startswith("qmp: WATCHDOG")]
+   119	    refusals = sum("NOT arming" in m for _, m in ev)
+   120	    ok = refusals > 0 and banners == 0 and not wds
+   121	    verdict = f"{refusals} refusals, {len(rst)} GRUB reboots, 0 kernel boots, 0 WATCHDOG" if ok else f"refusals={refusals} banners={banners} wd={wds}"
+   122	else:
+   123	    ok = hang is not None and wd is None and not rst
+   124	    verdict = f"no WATCHDOG/RESET for {time.time() - t0 - hang:.1f}s after HANG" if ok else f"hang={hang} wd={wd} resets={rst}"
+   125	rec("host", f"VERDICT expect={expect}: {'PASS' if ok else 'FAIL'} ({verdict})")
+   126	open(OUT, "w").write("\n".join(log) + "\n")
+   127	print(f"wrote {OUT}")
+   128	sys.exit(0 if ok else 1)
+
+codex
+Most is sound. I found **no MUST-FIX defect in the intended, successful-source path**. The locked-bit handling is valid, and the hardware opt-in remains disabled. There are two failure-path weaknesses worth tightening.
+
+- **SHOULD-FIX — Default refusal depends on successfully sourcing the file.** [m1-nc110-entry.cfg:25](~/nc110-baremetal/grub-test/m1-nc110-entry.cfg:25)  
+  GRUB function variables are not local: ordinary `set` values survive function return. Every supplied arming entry calls its constants function, which re-sources `tco-arm.cfg`, resetting `lock_mode=refuse`; the optional override follows that source. Thus ordinary previous-menuentry leftovers are handled correctly. Setting `accept` *before* sourcing is overwritten, safely. [GRUB execution source](https://raw.githubusercontent.com/rhboot/grub2/grub-2.06/grub-core/script/execute.c)
+
+  However, if a previous invocation left `accept` and the function definitions resident, and a subsequent source fails—for example, because GRUB’s root changed—the caller continues with those old definitions and policy. A direct second `tco_arm` call likewise retains `accept`. This is a source-time default, not a per-call default. Reset policy before attempting the source and gate arming on successful initialization.
+
+- **SHOULD-FIX — Invalid initial reads become permission to take the accept branch.** [tco-arm.cfg:73](~/nc110-baremetal/grub-test/tco-arm.cfg:73)  
+  Every nonmatching `cntpre`, including `unset`, becomes `tco_locked=yes`. Previously that caused refusal; with `accept`, it permits writes and skips SMI_EN verification. A later successful read can let the entire check pass despite the failed initial classification. Require a valid 16-bit hexadecimal read before classifying the lock. This is a fail-closed weakness, not evidence that the supplied hardware path currently misreads.
+
+**(a) Locked writes:** The TCO1_CNT masked RMW physically writes bit 12 back as one, as the trace shows. That is harmless preservation of a sticky lock. TCO_LOCK protects **SMI_EN.TCO_EN**, not TMR_HLT or the whole TCO1_CNT register; rewriting an already-set lock does not violate that protection. The locked branch never writes SMI_EN. [Intel NM10 datasheet, §13.9.6](https://www.mouser.com/pdfdocs/82NM10datasheet.pdf)
+
+**NIT:** “never bit 12” and “writing NO locked bit” are imprecise comments; say “preserves TCO_LOCK; never writes SMI_EN when locked.” Also, `lock_mode=accept` on an *unlocked* device still clears TCO_EN. The no-SMI_EN-write promise applies to the locked branch. The deliberate locked-bit write attempts in `build-iso.sh` are QEMU fixture setup, outside that branch.
+
+**(c) What verification establishes:** The predicates establish a configured, moving timer at the sampled instant—not an inevitable reset. Firmware can subsequently reload it, halt it, or inhibit reset. Even a decreasing counter over one second cannot exclude periodic firmware servicing. That is precisely why the real reset gate matters. Linux’s default v2 behavior supports leaving TCO_EN enabled, but cannot validate Phoenix’s handler. [Linux v6.12 driver](https://github.com/torvalds/linux/blob/v6.12/drivers/watchdog/iTCO_wdt.c)
+
+Also, TCO_LOCK does not stop privileged bare-metal code from halting or feeding the watchdog. This protects against hangs only insofar as the loaded code does not disable that protection; it is not containment for actively malicious code.
+
+**(d) QEMU evidence:** The supplied first boot demonstrates `TCO_LOCK=1`, `TCO_EN=1`, a moving counter, two traced expirations, `WATCHDOG(action=reset)`, and another kernel banner. Restricting the locked check to that first boot is correct: the second boot has `SMI_EN=21`, so it is not another locked-TCO_EN-on proof.
+
+It does **not** establish Phoenix SMI behavior, real NM10 reset wiring/straps, hardware timing, or return to Slot A. The TCO-only trace also does not independently prove absence of SMI_EN writes; code inspection establishes that. A Linux-side reset is useful evidence, but the subsequent GRUB hang test remains necessary because firmware state can differ.
+
+Two small proof-tool weaknesses do not invalidate these logs:
+
+- `grub-mkrescue | tail -1` masks build failure despite `set -e`, potentially leaving stale artifacts.
+- `run-wdt.py` does not actually require the WATCHDOG action to equal `reset`; the supplied log does show it.
+
+Reviewed code and existing evidence only; no files changed or hardware tests run.
+
+**Score: 8/10.**
+tokens used
+45,903
+Most is sound. I found **no MUST-FIX defect in the intended, successful-source path**. The locked-bit handling is valid, and the hardware opt-in remains disabled. There are two failure-path weaknesses worth tightening.
+
+- **SHOULD-FIX — Default refusal depends on successfully sourcing the file.** [m1-nc110-entry.cfg:25](~/nc110-baremetal/grub-test/m1-nc110-entry.cfg:25)  
+  GRUB function variables are not local: ordinary `set` values survive function return. Every supplied arming entry calls its constants function, which re-sources `tco-arm.cfg`, resetting `lock_mode=refuse`; the optional override follows that source. Thus ordinary previous-menuentry leftovers are handled correctly. Setting `accept` *before* sourcing is overwritten, safely. [GRUB execution source](https://raw.githubusercontent.com/rhboot/grub2/grub-2.06/grub-core/script/execute.c)
+
+  However, if a previous invocation left `accept` and the function definitions resident, and a subsequent source fails—for example, because GRUB’s root changed—the caller continues with those old definitions and policy. A direct second `tco_arm` call likewise retains `accept`. This is a source-time default, not a per-call default. Reset policy before attempting the source and gate arming on successful initialization.
+
+- **SHOULD-FIX — Invalid initial reads become permission to take the accept branch.** [tco-arm.cfg:73](~/nc110-baremetal/grub-test/tco-arm.cfg:73)  
+  Every nonmatching `cntpre`, including `unset`, becomes `tco_locked=yes`. Previously that caused refusal; with `accept`, it permits writes and skips SMI_EN verification. A later successful read can let the entire check pass despite the failed initial classification. Require a valid 16-bit hexadecimal read before classifying the lock. This is a fail-closed weakness, not evidence that the supplied hardware path currently misreads.
+
+**(a) Locked writes:** The TCO1_CNT masked RMW physically writes bit 12 back as one, as the trace shows. That is harmless preservation of a sticky lock. TCO_LOCK protects **SMI_EN.TCO_EN**, not TMR_HLT or the whole TCO1_CNT register; rewriting an already-set lock does not violate that protection. The locked branch never writes SMI_EN. [Intel NM10 datasheet, §13.9.6](https://www.mouser.com/pdfdocs/82NM10datasheet.pdf)
+
+**NIT:** “never bit 12” and “writing NO locked bit” are imprecise comments; say “preserves TCO_LOCK; never writes SMI_EN when locked.” Also, `lock_mode=accept` on an *unlocked* device still clears TCO_EN. The no-SMI_EN-write promise applies to the locked branch. The deliberate locked-bit write attempts in `build-iso.sh` are QEMU fixture setup, outside that branch.
+
+**(c) What verification establishes:** The predicates establish a configured, moving timer at the sampled instant—not an inevitable reset. Firmware can subsequently reload it, halt it, or inhibit reset. Even a decreasing counter over one second cannot exclude periodic firmware servicing. That is precisely why the real reset gate matters. Linux’s default v2 behavior supports leaving TCO_EN enabled, but cannot validate Phoenix’s handler. [Linux v6.12 driver](https://github.com/torvalds/linux/blob/v6.12/drivers/watchdog/iTCO_wdt.c)
+
+Also, TCO_LOCK does not stop privileged bare-metal code from halting or feeding the watchdog. This protects against hangs only insofar as the loaded code does not disable that protection; it is not containment for actively malicious code.
+
+**(d) QEMU evidence:** The supplied first boot demonstrates `TCO_LOCK=1`, `TCO_EN=1`, a moving counter, two traced expirations, `WATCHDOG(action=reset)`, and another kernel banner. Restricting the locked check to that first boot is correct: the second boot has `SMI_EN=21`, so it is not another locked-TCO_EN-on proof.
+
+It does **not** establish Phoenix SMI behavior, real NM10 reset wiring/straps, hardware timing, or return to Slot A. The TCO-only trace also does not independently prove absence of SMI_EN writes; code inspection establishes that. A Linux-side reset is useful evidence, but the subsequent GRUB hang test remains necessary because firmware state can differ.
+
+Two small proof-tool weaknesses do not invalidate these logs:
+
+- `grub-mkrescue | tail -1` masks build failure despite `set -e`, potentially leaving stale artifacts.
+- `run-wdt.py` does not actually require the WATCHDOG action to equal `reset`; the supplied log does show it.
+
+Reviewed code and existing evidence only; no files changed or hardware tests run.
+
+**Score: 8/10.**

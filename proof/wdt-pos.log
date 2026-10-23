@@ -1,0 +1,37 @@
+[  0.000s] host: qemu-system-x86_64 -machine q35 -m 128 -display none -vga std -global ICH9-LPC.noreboot=false -action watchdog=reset -serial file:~/nc110-baremetal/proof/.wdt-pos.serial -qmp unix:~/nc110-baremetal/proof/.qmp.sock,server,wait=off -kernel target/x86_64-unknown-none/release/nc110-kernel -append wdt=pet:12
+[  0.125s] serial: NC110 bare-metal M0: hello from our own x86_64 kernel (Rust, no_std)
+[  0.125s] host: boot #1
+[  0.125s] serial: multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+[  0.125s] serial: wdt: armed by boot.s (result=0)
+[  0.125s] serial: wdt: TCOBASE=0x660 GCS 0x00000000 -> 0x00000000 NO_REBOOT=0 TCO1_CNT=0x0000 HLT=0 LOCK=0
+[  0.125s] serial: wdt: before-clear TCO1_STS=0x0000 TCO2_STS=0x0000 SECOND_TO_STS=0 BOOT_STS=0
+[  0.125s] serial: wdt: TCO_TMR=5 ticks x 0.6 s, reset expected after 2nd expiry (~6000 ms)
+[  0.916s] serial: wdt: verify NO_REBOOT=0 HLT=0 TMR=5 count 4->3 => VERIFIED
+[  0.916s] serial: cmdline: target/x86_64-unknown-none/release/nc110-kernel wdt=pet:12
+[  1.899s] serial: wdt: alive t=1s (petting every 500 ms)
+[  2.946s] serial: wdt: alive t=2s (petting every 500 ms)
+[  3.916s] serial: wdt: alive t=3s (petting every 500 ms)
+[  4.948s] serial: wdt: alive t=4s (petting every 500 ms)
+[  5.904s] serial: wdt: alive t=5s (petting every 500 ms)
+[  6.959s] serial: wdt: alive t=6s (petting every 500 ms)
+[  7.868s] serial: wdt: alive t=7s (petting every 500 ms)
+[  8.915s] serial: wdt: alive t=8s (petting every 500 ms)
+[  9.975s] serial: wdt: alive t=9s (petting every 500 ms)
+[ 10.918s] serial: wdt: alive t=10s (petting every 500 ms)
+[ 11.868s] serial: wdt: alive t=11s (petting every 500 ms)
+[ 12.869s] serial: wdt: alive t=12s (petting every 500 ms)
+[ 12.869s] serial: wdt: HANG now: cli; hlt with the timer running, nobody pets
+[ 18.441s] qmp: WATCHDOG {"action": "reset"}
+[ 18.443s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[ 18.481s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[ 18.597s] serial: NC110 bare-metal M0: hello from our own x86_64 kernel (Rust, no_std)
+[ 18.597s] host: boot #2
+[ 18.597s] serial: multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+[ 18.597s] serial: wdt: armed by boot.s (result=0)
+[ 18.597s] serial: wdt: TCOBASE=0x660 GCS 0x00000000 -> 0x00000000 NO_REBOOT=0 TCO1_CNT=0x0000 HLT=0 LOCK=0
+[ 18.597s] serial: wdt: before-clear TCO1_STS=0x0008 TCO2_STS=0x0006 SECOND_TO_STS=1 BOOT_STS=1
+[ 18.597s] serial: wdt: TCO_TMR=5 ticks x 0.6 s, reset expected after 2nd expiry (~6000 ms)
+[ 19.439s] serial: wdt: verify NO_REBOOT=0 HLT=0 TMR=5 count 4->3 => VERIFIED
+[ 19.439s] serial: cmdline: target/x86_64-unknown-none/release/nc110-kernel wdt=pet:12
+[ 20.105s] host: stop: banners=2 want=2 elapsed=20.1s
+[ 20.108s] host: VERDICT expect=watchdog: PASS (boot-start->WATCHDOG 18.32s, HANG->WATCHDOG 5.57s, next banner 0.16s later)

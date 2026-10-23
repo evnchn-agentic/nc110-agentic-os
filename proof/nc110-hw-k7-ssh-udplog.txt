@@ -1,0 +1,85 @@
+
+wdt: TCO_TMR=5 ticks x 0.6 s, reset expected after 2nd expiry (~6000 ms)
+wdt: ATTENDED build: no watchdog, the operator is the safety net (power cycle -> Slot A)
+wdt: probe arm: GCS 0x0 -> 0x0 TCO1_CNT=0x0000 TMR=50 RLD 49->47 SMI_EN=0x21 => ARMED
+keymod: no multiboot module
+cmdline: target/attended/x86_64-unknown-none/release/nc110-kernel 
+time: TSC 999300 ticks/ms (PIT ch2 calibrated)
+nic: rtl8139 C+ (10ec:8139) at 00:02.0 io=0xc000 mac=52:54:00:12:34:56
+udplog: broadcasting this log to UDP 5514
+dhcp: DISCOVER sent, waiting 4 s for an OFFER
+dhcp: OFFER 10.0.2.15 from 10.0.2.2 after 0 ms (1 frames seen)
+attended: log round 2, then reset
+nc110 1 00/01 NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: armed by boot.s (result=0)
+wdt: TCOBASE=0x660 GCS 0x00000000 -> 0x00000000 NO_REBOOT=0 TCO1_CNT=0x0000 HLT=0 LOCK=0
+wdt: before-clear TCO1_STS=0x0000 TCO2_STS=0x0000 SECOND_TO_STS=0 BOOT_STS=0
+cmdline: target/attended/x86_64-unknown-none/release/nc110-kernel wdt=probe
+nc110 2 00/01 NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+nc110 3 00/02 NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+wdt: HANG now (probe): 
+nc110 3 01/02 cli; hlt, nobody pets; expect a reset ~60 s from here
+time: TSC 999200 ticks/ms (PIT ch2 calibrated)
+multiboot magic=0x2badb002 info=0x10000 -> long mode OK
+wdt: NM10: GRUB owns the watchdog, kernel hands off; live registers follow (result=5)
+wdt: live TCOBASE=0x1060 GCS=0x00000460 NO_REBOOT=1 TCO1_CNT=0x1000 HLT=0 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=1000
+wdt: probe arm: GCS 0x460 -> 0x440 TCO1_CNT=0x1000 TMR=50 RLD 50->48 SMI_EN=0x22023 => ARMED
+cmdline: wdt=probe
+time: TSC 1662183 ticks/ms (PIT ch2 calibrated)
+nic: mass-storage memory BAR 0xf0504400 (max span 0x400), NIC window 0xf050c000+0x100
+nic: 10ec:8136 XID 0x40a -> r8169 RTL_GIGA_MAC_VER_30
+nic: RTL8101E family (10ec:8136) at 09:00.0 mmio=0xf050c000 (UC) mac=02:00:00:00:00:01
+nic: PHYstatus 0xeb link up
+nc110 2 00/02 NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+dhcp: OFFER 192.168.50.120 from 192.168.50.1 after
+nc110 2 01/02  3750 ms (5 frames seen)
+nc110 3 01/02  3750 ms (5 frames seen)
+wdt: HANG now (probe): cli; hlt, nobody pets; expect a reset ~60 s from here
+wdt: ATTENDED build: arming the TCO ourselves with NO_REBOOT cleared (one-shot boot, Slot A on any reset)
+keymod: client key from module 0 at 0x5a4000 (72 B), public key verified, module wiped
+dhcp: OFFER 10.0.2.15 from 10.0.2.2 after 0 ms (1 fra
+nc110 2 01/02 mes seen)
+nc110 4 00/03 NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+nc110 4 01/03 mes seen)
+rng: TSC granularity 1000 ticks, sample window 64000 ticks
+rng: jitter startup 4096 samples passed RCT(cut 301) + APT(W 512, cut 507); 65732 TSC ticks/sample
+rng: min-entropy per 8-bit sample: MCV 3.945 (max 228/4096, 179 distinct), lag-1 1.263; claimed 0.100
+rng: no RDRAND (as on the Atom N570): jitter is the only source
+dhcp: smoltcp lease 10.0.2.15/24 router Some(10.0.2.2)
+tcp: connecting 192.168.50.95:2223 from :57231
+tcp: connected to 192.168.50.95:2223
+ssh(a): server banner: SSH-2.0-OpenSSH_9.7
+ssh: host key ssh-ed25519 SHA256:CuNB3VjtmuYL5Eb0958nDAjO80F6deBx8lHK2kTbRJ0 matches pin
+ssh(b): key exchange done (curve25519-sha256, host sig verified, chacha20-poly1305)
+ssh: offering publickey ssh-ed25519 (throwaway test key)
+ssh(c): publickey auth OK as evnchn
+ssh: session channel open, pty-req xterm 80x25 (true), shell (true)
+kbd: i8042 command byte Some(113) -> translation on, decoding scancode set 1
+term: VGA attribute mode control 0x0c -> 0x04 (bit 3 blink off: bright ba
+nc110 4 02/03 ckgrounds)
+term: VGA now belongs to the remote shell; keyboard is live
+ssh: window-change 80x25 (true)
+ssh(d): first shell output (54 bytes)
+
+ssh: shell channel closed, disconnecting
+kbd: 0 keys dropped while the channel was not taking input
+term: replies sent: DSR 6n x0, DSR 5n x0, DA1 x0, DA2 x0; 0 dropped (reply buffer full)
+rng: 15 requests served, 1 reseeds, 20480 raw samples health-tested, failure latched: false
+ssh: M3 reached: interactive shell over SSH, drawn on VGA, typed on PS/2
+attended: final log round, then reset
+keymod: client key from module 0 at 0x5a3000 (72 B), public key verified, module wiped
+cmdline: 
+time: TSC 1662486 ticks/ms (PIT ch2 calibrated)
+dhcp: DISCOVER sent, waiting 
+nc110 2 01/02 4 s for an OFFER
+dhcp: OFFER 192.168.50.120 from 192.168.50.1 after 3180 ms (6 frames seen)
+nc110 4 01/03 4 s for an OFFER
+rng: TSC granularity 40 ticks, sample window 32768 ticks
+rng: jitter startup 4096 samples passed RCT(cut 301) + APT(W 512, cut 507); 33451 TSC ticks/sample
+rng: min-entropy per 8-bit sample: MCV 4.825 (max 117/4096, 98 distinct), lag-1 1.537; claimed 0.100
+dhcp: smoltcp lease 192.168.50.120/24 router Some(192.168.50.1)
+tcp: connecting 192.168.50.95:2223 from :57944
+kbd: i8042 command byte Some(87) -> translation on, decoding s
+nc110 4 02/03 cancode set 1
+term: VGA attribute mode control 0x0c -> 0x04 (bit 3 blink off: bright backgrounds)

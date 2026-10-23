@@ -1,0 +1,71 @@
+[  0.000s] host: qemu-system-x86_64 -machine q35 -m 128 -display none -vga std -global ICH9-LPC.noreboot=false -action watchdog=reset -serial file:~/nc110-baremetal/proof/.wdt-grub-locked-accept.serial -qmp unix:~/nc110-baremetal/proof/.qmp.sock,server,wait=off -cdrom grub-test/wdt-locked-accept.iso -boot d
+[  0.399s] serial: [H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  0.399s] serial: 
+[  0.399s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=2021
+[  0.399s] serial: 
+grub: mode locked-accept
+[  0.590s] serial: 
+wdt: selftest OK (21 regexp cases + test -o)
+[  0.591s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  0.591s] serial: 
+wdt: before: GCS=20 TCO1_CNT=1800 TCO2_STS=0 (6 = last reset was the watchdog)
+[  0.591s] serial: 
+wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to
+[  0.591s] serial: 
+firmware SMI, reset on 2nd
+[  1.683s] serial: 
+wdt: after: GCS=0 TCO1_CNT=1000 TCO_TMR=5 SMI_EN=2021 count 4 -> 3 locked=yes
+[  1.683s] serial: 
+mode=accept
+[  1.683s] serial: 
+grub: armed and verified, loading kernel
+[  1.882s] serial: 
+NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+[  1.882s] host: boot #1
+[  1.882s] serial: multiboot magic=0x2badb002 info=0x10000 -> long mode OK
+[  1.882s] serial: wdt: left to GRUB (grub-armed build); live registers follow (result=4)
+[  1.882s] serial: wdt: live TCOBASE=0x660 GCS=0x00000000 NO_REBOOT=0 TCO1_CNT=0x1000 HLT=0 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=5
+[  2.601s] serial: wdt: verify NO_REBOOT=0 HLT=0 TMR=5 count 2->1 => VERIFIED
+[  2.601s] serial: keymod: no multiboot module
+[  2.601s] serial: cmdline: wdt=hang
+[  2.601s] serial: wdt: HANG now: cli; hlt with the timer running, nobody pets
+[  6.645s] qmp: WATCHDOG {"action": "reset"}
+[  6.649s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  6.699s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  7.301s] serial: [H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  7.301s] serial: 
+[  7.479s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=21
+[  7.479s] serial: 
+grub: mode locked-accept
+[  7.479s] serial: 
+wdt: selftest OK (21 regexp cases + test -o)
+[  7.479s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  7.479s] serial: 
+wdt: before: GCS=20 TCO1_CNT=1800 TCO2_STS=6 (6 = last reset was the watchdog)
+[  7.671s] serial: 
+wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to
+[  7.671s] serial: 
+firmware SMI, reset on 2nd
+[  8.602s] serial: 
+wdt: after: GCS=0 TCO1_CNT=1000 TCO_TMR=5 SMI_EN=21 count 4 -> 3 locked=yes
+[  8.602s] serial: 
+mode=accept
+[  8.602s] serial: 
+grub: armed and verified, loading kernel
+[  8.784s] serial: 
+NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+[  8.784s] host: boot #2
+[  8.784s] serial: multiboot magic=0x2badb002 info=0x10000 -> long mode OK
+[  8.784s] serial: wdt: left to GRUB (grub-armed build); live registers follow (result=4)
+[  8.784s] serial: wdt: live TCOBASE=0x660 GCS=0x00000000 NO_REBOOT=0 TCO1_CNT=0x1000 HLT=0 TCO1_STS=0x0000 TCO2_STS=0x0000 TCO_TMR=5
+[  9.648s] serial: wdt: verify NO_REBOOT=0 HLT=0 TMR=5 count 2->1 => VERIFIED
+[  9.648s] serial: keymod: no multiboot module
+[  9.648s] serial: cmdline: wdt=hang
+[  9.648s] serial: wdt: HANG now: cli; hlt with the timer running, nobody pets
+[ 10.395s] host: stop: banners=2 want=2 elapsed=10.4s
+[ 10.405s] host: locked check: 1 'after:' line(s) in the watchdog's boot, TCO_LOCK and TCO_EN still set in all: True
+[ 10.405s] host: VERDICT expect=watchdog: PASS (boot-start->WATCHDOG 4.76s, HANG->WATCHDOG 4.04s, next banner 2.14s later)

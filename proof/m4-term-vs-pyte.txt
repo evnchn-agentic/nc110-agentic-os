@@ -1,0 +1,2 @@
+htop (last frame): byte 9840: 0 cells differ (0 in the character), cursor ours 24 0 true pyte 24 0
+vi (before :wq): byte 12957: 0 cells differ (0 in the character), cursor ours 24 69 false pyte 24 69

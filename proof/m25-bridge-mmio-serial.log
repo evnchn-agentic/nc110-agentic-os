@@ -1,0 +1,26 @@
+NC110 bare-metal M2.5: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: skipped (LPC 00:1f.0 is not ICH9 8086:2918 / NM10 8086:27bc) (result=1)
+keymod: client key from module 0 at 0x598000 (72 B), public key verified, module wiped
+cmdline: ~/nc110-baremetal/target/x86_64-unknown-none/release/nc110-kernel nic=mmio
+time: TSC 999200 ticks/ms (PIT ch2 calibrated)
+nic: rtl8139 C+ (10ec:8139) at 01:03.0 mmio=0xfe840000 (UC) mac=52:54:00:4e:43:11
+rng: TSC granularity 1000 ticks, sample window 64000 ticks
+rng: jitter startup 4096 samples passed RCT(cut 301) + APT(W 512, cut 507); 65738 TSC ticks/sample
+rng: min-entropy per 8-bit sample: MCV 2.721 (max 564/4096, 125 distinct), lag-1 1.525; claimed 0.100
+rng: no RDRAND (as on the Atom N570): jitter is the only source
+dhcp: smoltcp lease 10.0.2.15/24 router Some(10.0.2.2)
+tcp: connecting 10.0.2.2:2223 from :64963
+tcp: connected to 10.0.2.2:2223
+ssh(a): server banner: SSH-2.0-OpenSSH_10.2
+ssh: host key ssh-ed25519 SHA256:CuNB3VjtmuYL5Eb0958nDAjO80F6deBx8lHK2kTbRJ0 matches pin
+ssh(b): key exchange done (curve25519-sha256, host sig verified, chacha20-poly1305)
+ssh: offering publickey ssh-ed25519 (throwaway test key)
+ssh(c): publickey auth OK as evnchn
+ssh: session channel open, exec request
+ssh(d): stdout: nc110-m2-ok
+ssh(d): stdout: Darwin Mac 25.5.0 Darwin Kernel Version 25.5.0: Tue Jun  9 22:26:22 PDT 2026; root:xnu-12377.121.10~1/RELEASE_ARM64_T8132 arm64
+ssh: channel closed, disconnecting
+rng: 13 requests served, 1 reseeds, 20480 raw samples health-tested, failure latched: false
+ssh: M2 (d) reached: our kernel ran a command over SSH
+DONE

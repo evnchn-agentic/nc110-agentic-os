@@ -1,0 +1,76 @@
+NC110 bare-metal M2.5: hello from our own x86_64 kernel (Rust, no_std)
+multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+wdt: skipped (LPC 00:1f.0 is not ICH9 8086:2918 / NM10 8086:27bc) (result=1)
+keymod: client key from module 0 at 0x3d7000 (72 B), public key verified, module wiped
+cmdline: ~/nc110-baremetal/target/x86_64-unknown-none/release/nc110-kernel rng=dump
+time: TSC 998500 ticks/ms (PIT ch2 calibrated)
+nic: rtl8139 C+ (10ec:8139) at 00:03.0 io=0xc000 mac=52:54:00:4e:43:11
+rawdelta: 112000 55000 55000 54000 55000 55000 55000 54000 55000 55000 55000 58000 55000 55000 54000 55000 55000 55000 54000 55000 55000 55000 54000 55000 54000 55000 54000 55000 55000 54000 55000 54000 55000 55000 54000 55000 55000 54000 53000 53000 54000 55000 54000 54000 55000 54000 55000 54000 55000 55000 54000 55000 62000 54000 54000 55000 56000 55000 54000 55000 54000 55000 55000 55000
+rawjit 0000: d8 f0 d8 d8 d8 a8 d8 f0 d8 f0 d8 f0 d8 d8 d8 f0 d8 d8 f0 d8 d8 f0 d8 d8 d8 d8 f0 d8 d8 f0 d8 d8 d8 d8 d8 d8 f0 f0 d8 f0 d8 d8 d8 d8 d8 d8 d8 d8 d8 d8 f0 d8 d8 d8 d8 f0 d8 48 a8 d8 d8 f0 d8 d8
+rawjit 0064: d8 f0 f0 f0 d8 f0 f0 d8 d8 d8 a8 d8 d8 d8 f0 f0 d8 d8 f0 c0 f0 d8 d8 d8 f0 d8 d8 a8 f0 d8 d8 d8 d8 d8 d8 f0 f0 d8 f0 f0 d8 d8 d8 f0 d8 d8 d8 d8 d8 90 d8 f0 d8 d8 f0 d8 60 d8 f0 d8 d8 d8 f0 d8
+rawjit 0128: d8 d8 d8 f0 d8 d8 d8 d8 f0 d8 d8 d8 f0 d8 d8 d8 d8 f0 c0 f0 d8 d8 a8 d8 d8 f0 d8 d8 d8 f0 d8 c0 f0 d8 d8 d8 d8 f0 d8 f0 d8 f0 f0 d8 d8 d8 f0 d8 f0 d8 d8 d8 d8 d8 f0 c0 90 f0 d8 d8 d8 f0 d8 d8
+rawjit 0192: d8 d8 f0 f0 d8 f0 d8 d8 d8 d8 f0 d8 d8 f0 d8 d8 d8 f0 d8 f0 d8 d8 d8 d8 d8 d8 d8 f0 d8 d8 f0 f0 d8 d8 d8 d8 f0 d8 d8 d8 f0 a8 d8 f0 d8 f0 d8 d8 d8 d8 f0 d8 d8 d8 d8 48 d8 f0 f0 d8 d8 d8 f0 d8
+rawjit 0256: f0 d8 d8 b8 d8 d8 f0 d8 d8 f0 d8 d8 f0 d8 d8 d8 d8 a8 d8 f0 d8 d8 d8 d8 f0 d8 d8 d8 d8 a8 78 d8 d8 f0 d8 d8 d8 d8 d8 f0 d8 d8 d8 f0 d8 d8 a8 d8 d8 f0 d8 d8 d8 f0 d8 d8 d8 d8 f0 d8 d8 d8 f0 d8
+rawjit 0320: d8 d8 f0 f0 d8 d8 d8 f0 d8 d8 d8 d8 f0 f0 d8 d8 f0 d8 d8 a8 d8 d8 d8 d8 f0 f0 d8 60 d8 c0 d8 d8 d8 d8 f0 d8 d8 d8 a8 d8 d8 d8 d8 f0 d8 d8 f0 d8 90 f0 d8 d8 f0 f0 d8 d8 d8 d8 d8 d8 f0 d8 d8 d8
+rawjit 0384: d8 d8 d8 a8 f0 d8 d8 f0 d8 d8 f0 f0 d8 f0 d8 f0 d8 d8 d8 f0 d8 f0 d8 d8 f0 d8 d8 f0 a8 d8 f0 d8 f0 d8 f0 60 f0 d8 f0 d8 f0 d8 f0 d8 d8 f0 f0 d8 f0 d8 78 a8 d8 f0 d8 f0 d8 d8 f0 d8 f0 d8 d8 d8
+rawjit 0448: d8 78 f0 d8 d8 f0 d8 d8 d8 f0 d8 f0 d8 d8 d8 d8 f0 d8 d8 d8 f0 d8 f0 f0 d8 d8 f0 d8 d8 d8 f0 d8 d8 f0 d8 d8 f0 d8 a8 d8 d8 f0 d8 d8 a8 d8 d8 d8 f0 d8 d8 d8 d8 f0 f0 d8 f0 d8 d8 d8 f0 d8 d8 f0
+rawjit 0512: d8 f0 d8 d8 d8 d8 f0 f0 f0 d8 d8 a8 d8 d8 d8 d8 f0 d8 d8 d8 d8 f0 d8 d8 d8 d8 f0 d8 d8 d8 d8 d8 f0 d8 d8 f0 d8 d8 f0 d8 78 f0 d8 f0 d8 f0 f0 d8 d8 d8 f0 d8 d8 f0 d8 d8 d8 f0 d8 f0 d8 d8 d8 f0
+rawjit 0576: d8 f0 d8 d8 f0 d8 f0 00 d8 f0 d8 d8 d8 f0 d8 f0 d8 d8 d8 f0 f0 d8 f0 d8 a8 d8 f0 d8 d8 d8 d8 d8 d8 f0 d8 f0 d8 d8 f0 f0 d8 f0 f0 d8 d8 d8 f0 d8 d8 d8 d8 d8 90 d8 f0 f0 d8 d8 f0 d8 f0 d8 d8 f0
+rawjit 0640: f0 f0 d8 f0 d8 f0 d8 f0 d8 d8 f0 f0 d8 f0 f0 f0 d8 f0 f0 f0 f0 d8 f0 d8 f0 d8 d8 f0 f0 f0 f0 d8 f0 f0 d8 f0 d8 d8 a8 f0 f0 d8 d8 f0 d8 f0 78 f0 d8 d8 f0 f0 f0 d8 d8 f0 d8 d8 d8 f0 d8 f0 d8 f0
+rawjit 0704: f0 d8 f0 d8 d8 f0 d8 d8 f0 d8 f0 d8 f0 a8 f0 d8 d8 f0 d8 f0 f0 f0 d8 f0 f0 d8 f0 d8 d8 f0 d8 d8 f0 d8 d8 d8 f0 f0 d8 f0 d8 d8 08 f0 a8 d8 f0 d8 d8 f0 d8 d8 f0 d8 d8 d8 f0 d8 d8 f0 d8 d8 d8 f0
+rawjit 0768: f0 d8 d8 f0 f0 d8 f0 f0 d8 d8 d8 f0 f0 f0 d8 f0 d8 f0 a8 d8 f0 f0 d8 d8 f0 f0 d8 f0 f0 d8 f0 f0 f0 f0 f0 d8 f0 f0 d8 d8 f0 d8 f0 d8 a8 f0 f0 d8 f0 d8 f0 f0 d8 78 d8 f0 d8 d8 a8 f0 d8 d8 d8 f0
+rawjit 0832: d8 f0 d8 d8 f0 d8 d8 f0 a8 d8 f0 d8 d8 f0 d8 f0 f0 d8 f0 78 d8 d8 d8 f0 d8 d8 d8 d8 f0 90 d8 f0 d8 d8 d8 f0 d8 f0 d8 d8 f0 d8 d8 d8 f0 d8 d8 d8 f0 f0 d8 d8 d8 d8 f0 d8 d8 f0 d8 d8 f0 d8 a8 d8
+rawjit 0896: d8 a8 f0 d8 d8 f0 d8 d8 d8 d8 f0 d8 f0 f0 90 f0 d8 d8 d8 d8 f0 d8 f0 d8 d8 d8 f0 d8 f0 d8 d8 d8 f0 f0 d8 f0 f0 d8 d8 f0 d8 a8 f0 d8 d8 f0 d8 d8 f0 f0 d8 f0 f0 d8 f0 f0 d8 d8 78 d8 f0 d8 d8 d8
+rawjit 0960: f0 d8 d8 d8 f0 f0 d8 d8 f0 d8 f0 f0 d8 d8 f0 d8 d8 d8 f0 c0 d8 d8 f0 90 d8 78 f0 d8 d8 f0 d8 d8 d8 f0 d8 d8 f0 d8 d8 a8 d8 f0 d8 d8 d8 f0 d8 a8 d8 d8 f0 d8 d8 d8 d8 d8 f0 d8 d8 f0 d8 d8 d8 f0
+rawjit 1024: d8 d8 f0 d8 f0 f0 a8 d8 f0 d8 d8 f0 d8 f0 d8 d8 f0 d8 f0 d8 f0 f0 d8 d8 d8 f0 f0 f0 f0 f0 f0 d8 f0 d8 f0 d8 f0 f0 d8 f0 d8 f0 f0 f0 f0 f0 f0 d8 f0 f0 d8 f0 f0 f0 d8 f0 d8 f0 f0 d8 f0 d8 f0 d8
+rawjit 1088: f0 d8 f0 d8 f0 f0 f0 d8 f0 f0 d8 f0 f0 d8 f0 d8 d8 f0 d8 f0 f0 f0 f0 f0 f0 f0 f0 d8 f0 f0 d8 f0 f0 c0 d8 f0 f0 d8 a8 d8 d8 d8 f0 d8 d8 f0 d8 d8 f0 f0 f0 d8 d8 f0 d8 f0 d8 d8 f0 f0 d8 60 d8 a8
+rawjit 1152: f0 d8 c0 d8 f0 f0 d8 d8 f0 d8 d8 f0 d8 f0 d8 d8 f0 d8 f0 d8 d8 f0 d8 f0 d8 d8 f0 f0 d8 d8 f0 d8 a8 f0 d8 f0 d8 d8 f0 f0 d8 d8 d8 f0 d8 d8 f0 d8 f0 d8 f0 d8 c0 f0 d8 d8 f0 f0 d8 d8 f0 f0 d8 f0
+rawjit 1216: 60 d8 d8 d8 f0 d8 d8 f0 d8 d8 d8 d8 d8 d8 f0 d8 d8 c0 c0 c0 a8 c0 d8 c0 c0 d8 d8 a8 d8 d8 a8 a8 c0 c0 c0 c0 a8 c0 a8 c0 a8 c0 c0 48 c0 c0 a8 c0 a8 a8 c0 a8 c0 d8 c0 a8 c0 a8 c0 a8 a8 c0 c0 a8
+rawjit 1280: d8 d8 f0 a8 f0 d8 d8 f0 d8 f0 60 f0 f0 f0 d8 d8 d8 f0 d8 d8 f0 d8 f0 d8 d8 d8 f0 d8 f0 d8 f0 f0 d8 d8 f0 f0 d8 d8 f0 d8 d8 f0 d8 d8 d8 f0 f0 d8 f0 f0 d8 f0 d8 f0 d8 f0 d8 f0 f0 d8 d8 f0 d8 d8
+rawjit 1344: d8 d8 d8 c0 d8 d8 d8 d8 c0 d8 d8 c0 d8 f0 d8 f0 d8 c0 d8 d8 d8 d8 d8 f0 f0 d8 d8 f0 d8 d8 d8 d8 f0 f0 d8 d8 f0 d8 f0 f0 d8 d8 d8 d8 d8 d8 f0 d8 d8 d8 d8 f0 78 d8 d8 f0 d8 a8 d8 d8 f0 d8 d8 d8
+rawjit 1408: f0 f0 d8 d8 d8 d8 c0 f0 f0 d8 d8 d8 d8 78 d8 d8 f0 d8 d8 d8 a8 f0 d8 d8 d8 f0 d8 d8 f0 f0 d8 d8 f0 d8 d8 d8 d8 f0 d8 f0 d8 d8 d8 d8 f0 c0 90 d8 d8 d8 d8 d8 a8 f0 f0 f0 f0 d8 d8 d8 f0 d8 d8 d8
+rawjit 1472: d8 d8 f0 d8 d8 d8 78 d8 d8 f0 d8 30 d8 d8 d8 a8 d8 d8 f0 f0 d8 d8 d8 f0 d8 60 d8 f0 d8 d8 d8 d8 d8 f0 d8 d8 f0 d8 f0 d8 d8 d8 d8 d8 d8 f0 f0 d8 d8 18 d8 d8 c0 f0 d8 d8 d8 f0 90 d8 f0 d8 d8 d8
+rawjit 1536: d8 f0 d8 d8 78 90 d8 d8 d8 d8 f0 d8 d8 f0 c0 f0 d8 d8 a8 d8 d8 f0 d8 d8 d8 f0 d8 d8 f0 d8 d8 d8 f0 30 d8 d8 d8 f0 d8 f0 f0 d8 90 d8 d8 d8 d8 d8 d8 d8 d8 f0 d8 d8 f0 d8 d8 a8 d8 d8 d8 d8 f0 d8
+rawjit 1600: d8 f0 60 d8 d8 d8 f0 d8 d8 d8 f0 d8 d8 d8 d8 f0 d8 d8 f0 d8 d8 f0 f0 d8 d8 d8 f0 d8 d8 d8 f0 d8 d8 f0 d8 d8 d8 d8 f0 d8 d8 f0 f0 d8 d8 d8 d8 f0 d8 d8 d8 f0 d8 d8 d8 d8 a8 d8 d8 d8 f0 d8 d8 d8
+rawjit 1664: f0 d8 d8 f0 d8 d8 d8 d8 d8 f0 d8 d8 d8 d8 f0 30 d8 f0 f0 d8 d8 f0 d8 d8 f0 d8 d8 d8 d8 f0 f0 d8 d8 f0 d8 d8 d8 f0 d8 d8 d8 f0 d8 c0 d8 d8 f0 d8 d8 a8 d8 60 d8 d8 f0 d8 d8 d8 c0 d8 c0 c0 d8 d8
+rawjit 1728: a8 c0 a8 a8 a8 c0 c0 e8 d8 d8 a8 c0 c0 a8 a8 c0 c0 c0 c0 d8 c0 c0 a8 c0 d8 f0 d8 d8 f0 d8 f0 d8 d8 d8 d8 d8 d8 d8 f0 f0 d8 d8 f0 d8 d8 f0 d8 d8 d8 f0 d8 d8 d8 f0 d8 f0 d8 d8 f0 d8 d8 f0 d8 d8
+rawjit 1792: d8 d8 d8 d8 f0 d8 f0 d8 d8 d8 f0 d8 d8 f0 d8 f0 f0 d8 d8 d8 d8 f0 f0 d8 d8 18 d8 f0 f0 d8 f0 d8 d8 d8 f0 d8 d8 f0 f0 d8 a8 d8 d8 a8 d8 c0 f0 d8 c0 d8 d8 d8 d8 d8 d8 d8 d8 d8 d8 d8 f0 d8 d8 d8
+rawjit 1856: 78 d8 d8 d8 d8 d8 d8 d8 d8 d8 d8 d8 d8 d8 d8 d8 a8 d8 f0 f0 d8 d8 d8 d8 d8 d8 d8 d8 d8 d8 d8 d8 d8 f0 d8 d8 d8 d8 d8 d8 f0 d8 d8 d8 d8 d8 f0 f0 f0 d8 d8 d8 d8 d8 d8 d8 f0 d8 d8 d8 d8 f0 f0 d8
+rawjit 1920: a8 f0 d8 d8 d8 f0 d8 d8 d8 d8 d8 f0 f0 d8 d8 f0 d8 d8 f0 08 f0 f0 f0 f0 d8 78 d8 d8 d8 f0 d8 d8 d8 d8 f0 d8 60 f0 d8 08 f8 f8 f8 f8 f8 f8 f8 f8 f8 f8 e0 f8 10 f8 f8 f8 f8 70 70 70 58 70 40 10
+rawjit 1984: 10 f8 b0 d8 f0 f0 d8 d8 f0 f0 d8 d8 d8 d8 f0 d8 d8 78 d8 f0 d8 d8 d8 d8 d8 f0 d8 d8 d8 d8 d8 f0 d8 d8 d8 f0 d8 d8 d8 f0 d8 d8 c0 d8 f0 d8 d8 f0 f0 d8 f0 d8 d8 d8 f0 d8 d8 d8 d8 d8 f0 d8 d8 d8
+rawjit 2048: d8 f0 d8 d8 f0 d8 d8 f0 d8 d8 c0 f0 d8 d8 d8 d8 d8 f0 d8 d8 f0 d8 d8 f0 c0 f0 d8 f0 d8 d8 d8 90 f0 d8 d8 f0 f0 d8 d8 f0 d8 d8 f0 d8 d8 f0 d8 f0 f0 d8 d8 d8 f0 d8 f0 d8 d8 f0 f0 d8 d8 d8 f0 d8
+rawjit 2112: d8 d8 f0 d8 d8 f0 d8 d8 f0 d8 f0 c0 d8 d8 f0 d8 f0 d8 f0 d8 f0 f0 d8 f0 f0 f0 f0 d8 f0 d8 f0 d8 f0 f0 f0 d8 f0 f0 d8 f0 f0 f0 d8 f0 d8 f0 d8 f0 f0 f0 f0 08 60 d8 f0 d8 f0 d8 d8 f0 d8 f0 d8 f0
+rawjit 2176: 78 78 78 78 78 78 78 30 60 78 78 78 78 78 78 78 60 60 48 78 78 78 78 78 78 78 60 78 78 78 78 90 60 78 78 78 30 78 78 78 78 78 78 78 78 78 78 78 60 90 90 78 78 78 78 30 60 78 78 60 60 78 78 60
+rawjit 2240: 60 60 78 78 78 78 78 60 78 78 78 78 78 60 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 90 78 60 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 60 48 78 78 78 78 78 78 60 78 78 60 78 78 78 78 78
+rawjit 2304: 18 78 78 78 78 78 60 90 78 78 48 78 78 78 60 78 78 78 60 78 78 60 78 60 78 78 78 28 b0 e0 d8 38 98 50 e0 e0 10 10 f8 e0 f8 10 c8 28 e0 f8 c8 80 e0 f8 10 10 f8 f8 e0 f8 c8 f8 20 78 60 78 78 78
+rawjit 2368: e8 78 78 78 78 78 78 78 78 78 78 78 78 90 78 90 78 78 78 78 78 78 98 70 58 70 70 70 68 c8 70 58 70 70 58 70 70 70 58 f8 10 10 f8 10 f8 10 f8 10 10 10 10 f8 20 78 78 78 60 78 78 78 78 78 78 78
+rawjit 2432: 78 78 60 b8 60 78 78 78 78 78 78 78 78 60 60 78 78 60 78 78 78 78 78 78 78 78 78 78 78 78 60 78 78 78 60 78 78 78 78 78 48 78 78 78 78 78 78 78 60 78 78 78 78 78 78 78 60 78 78 78 78 78 78 60
+rawjit 2496: 18 78 78 78 60 78 78 78 78 78 78 60 78 78 a0 30 78 78 78 78 60 d0 78 60 78 78 78 60 78 78 78 78 78 60 78 78 78 90 78 78 78 78 78 78 60 60 90 60 78 90 60 78 78 78 78 78 78 78 60 78 78 60 30 78
+rawjit 2560: e8 78 78 60 90 78 78 48 78 78 78 78 60 78 48 78 78 60 60 78 78 78 e8 48 78 78 78 78 78 78 60 78 78 78 78 78 60 78 78 78 78 60 90 60 78 78 78 60 78 78 78 78 78 78 78 78 78 78 78 78 60 78 78 78
+rawjit 2624: 48 78 30 60 78 78 60 78 78 78 60 78 78 78 60 78 60 78 78 78 30 78 78 78 78 78 60 78 78 78 60 90 78 78 60 78 78 d0 78 60 78 78 78 78 78 78 78 78 78 78 60 78 78 78 60 78 78 78 78 78 78 78 78 60
+rawjit 2688: 60 78 78 78 60 78 78 60 78 78 78 78 78 78 60 78 78 78 60 78 78 78 60 48 78 78 60 78 78 78 78 78 90 78 78 78 78 78 78 78 78 78 78 78 60 78 78 78 60 78 78 78 78 78 78 78 78 00 78 78 30 78 78 60
+rawjit 2752: 78 78 78 78 78 78 60 78 78 78 90 90 78 78 78 78 60 78 78 78 90 78 90 18 78 78 78 78 78 48 78 78 78 60 78 60 30 78 98 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 78 90 60 78 78 78 78 78
+rawjit 2816: 78 78 90 78 78 78 78 78 78 90 78 78 78 78 78 78 78 78 30 90 90 78 78 78 78 78 90 78 78 78 78 90 90 78 78 78 78 90 78 90 78 78 90 78 78 78 78 90 90 78 78 78 90 78 78 78 78 90 78 78 18 78 78 90
+rawjit 2880: 18 78 90 78 90 60 48 60 78 60 78 78 78 78 78 90 78 78 78 e8 78 78 48 48 78 60 90 78 30 78 78 78 d0 78 60 90 78 90 78 90 78 60 48 78 78 78 90 78 78 78 78 90 78 78 78 78 78 78 60 90 78 78 78 60
+rawjit 2944: 78 78 78 78 90 78 78 78 78 78 78 78 78 90 60 78 90 78 78 78 78 78 90 78 78 78 78 78 90 78 78 78 78 90 90 78 78 78 78 78 a8 78 90 78 78 78 78 78 90 30 90 78 90 00 78 78 78 78 78 90 90 78 78 78
+rawjit 3008: 78 78 78 78 78 78 90 78 78 78 90 90 78 78 78 78 60 78 78 78 78 78 78 78 90 90 78 78 78 90 78 78 78 90 78 78 78 78 78 90 78 b8 78 78 78 78 90 90 78 78 78 78 78 90 90 78 78 90 90 60 78 78 48 78
+rawjit 3072: 60 90 78 78 78 78 90 90 90 78 78 78 78 90 78 78 90 78 78 78 78 78 90 78 78 48 78 78 90 78 78 78 90 78 78 78 78 78 90 78 78 78 60 78 78 90 78 18 78 78 78 78 78 78 78 90 78 78 78 78 78 78 78 48
+rawjit 3136: 78 78 78 78 90 90 78 78 78 78 18 78 30 78 78 78 78 78 48 60 78 90 78 78 78 78 78 78 90 78 78 48 90 78 78 78 78 78 78 78 78 78 78 90 78 90 78 78 78 78 78 78 78 78 78 78 48 78 78 78 78 90 78 78
+rawjit 3200: 78 30 78 78 90 78 78 78 78 78 78 78 78 78 78 78 90 78 78 78 78 e8 78 78 78 78 60 48 90 78 78 78 78 78 78 78 78 78 30 78 00 78 90 78 90 78 78 78 90 78 48 90 78 60 90 e8 78 78 78 90 78 78 60 78
+rawjit 3264: 78 78 78 18 78 78 78 78 78 90 78 90 90 78 78 78 90 78 90 78 78 78 78 78 78 78 90 90 78 78 78 78 78 78 78 78 78 88 90 78 78 78 78 60 48 60 78 78 78 78 78 90 78 78 60 90 78 90 78 78 78 78 78 78
+rawjit 3328: 78 78 78 78 78 78 78 78 78 78 78 78 18 78 78 60 78 78 78 78 78 60 78 78 78 78 90 60 78 78 78 78 78 78 78 78 78 78 60 78 78 78 78 78 60 78 78 78 78 78 78 78 78 78 60 78 78 78 78 78 60 90 78 78
+rawjit 3392: 90 90 78 78 78 78 78 78 78 78 90 78 90 90 78 78 78 78 90 30 78 90 78 90 78 60 90 60 78 78 78 60 78 78 78 78 78 78 30 78 90 78 78 78 78 90 78 60 90 90 78 78 60 90 78 78 78 90 30 78 78 78 90 78
+rawjit 3456: 60 78 90 78 78 78 78 78 90 90 30 78 78 78 90 90 78 78 90 78 78 78 78 90 48 a8 78 78 78 90 78 78 78 90 78 78 78 90 90 78 78 78 90 78 78 78 78 a8 78 78 78 78 90 78 90 78 78 30 78 78 78 78 48 78
+rawjit 3520: 78 a8 90 90 a8 a8 90 a8 a8 a8 a8 a8 90 a8 90 a8 a8 a8 a8 a8 90 30 c0 c0 a8 a8 78 a8 90 90 90 a8 90 60 a8 a8 a8 90 90 90 c0 a8 c0 90 90 90 90 90 a8 a8 a8 a8 a8 a8 a8 90 90 90 90 90 90 90 a8 a8
+rawjit 3584: 60 90 90 90 78 90 90 a8 a8 90 a8 90 a8 90 a8 60 a8 a8 00 60 a8 18 90 90 a8 a8 a8 a8 a8 90 a8 a8 90 78 90 90 a8 a8 90 a8 a8 90 a8 90 a8 a8 90 a8 a8 a8 60 a8 a8 30 a8 90 a8 90 a8 a8 a8 90 a8 a8
+rawjit 3648: a8 90 a8 a8 a8 90 a8 a8 a8 48 a8 90 a8 90 a8 a8 30 a8 90 a8 90 90 90 a8 90 a8 a8 90 a8 90 a8 90 90 90 90 a8 90 a8 a8 60 a8 a8 90 a8 a8 90 a8 60 90 a8 90 a8 a8 a8 a8 a8 90 a8 a8 a8 90 a8 90 60
+rawjit 3712: 90 a8 a8 a8 90 a8 a8 90 a8 90 a8 90 a8 a8 90 a8 a8 60 90 a8 a8 90 a8 90 a8 a8 a8 a8 90 a8 90 a8 a8 a8 90 a8 90 a8 90 a8 a8 90 a8 90 a8 a8 90 a8 90 30 a8 a8 90 60 90 60 a8 a8 a8 a8 90 90 a8 a8
+rawjit 3776: a8 90 a8 a8 90 a8 60 a8 90 a8 a8 a8 30 a8 90 a8 a8 90 a8 90 a8 90 90 a8 90 60 a8 a8 a8 90 a8 90 a8 90 a8 a8 a8 a8 a8 90 a8 90 a8 90 a8 90 18 a8 a8 90 78 90 90 a8 a8 90 a8 a8 a8 a8 a8 90 a8 a8
+rawjit 3840: a8 a8 90 a8 90 a8 90 a8 a8 a8 90 a8 a8 90 a8 90 a8 a8 a8 90 a8 90 a8 90 60 a8 a8 a8 90 a8 90 a8 90 90 a8 a8 a8 a8 90 90 a8 a8 a8 90 a8 48 90 a8 60 a8 90 a8 90 a8 a8 a8 90 a8 a8 a8 a8 90 90 a8
+rawjit 3904: a8 90 90 a8 a8 a8 90 90 78 90 a8 90 a8 90 a8 90 a8 90 90 a8 a8 a8 90 a8 a8 90 90 a8 90 90 a8 90 a8 a8 90 a8 90 a8 a8 90 a8 a8 a8 90 a8 90 a8 a8 a8 90 90 a8 90 a8 90 a8 90 a8 a8 90 90 a8 90 a8
+rawjit 3968: 90 a8 90 a8 90 90 a8 90 a8 a8 90 a8 90 a8 a8 a8 a8 90 a8 90 90 78 90 90 90 a8 a8 90 a8 90 a8 90 a8 90 a8 88 a8 90 90 a8 90 78 a8 90 a8 48 78 78 a8 90 a8 90 a8 90 a8 90 a8 90 a8 90 a8 90 a8 90
+rawjit 4032: 90 a8 90 a8 78 a8 a8 90 a8 90 a8 a8 90 a8 90 a8 90 90 a8 a8 90 a8 90 a8 90 90 a8 90 a8 90 a8 90 a8 90 a8 a8 90 90 a8 90 90 90 a8 a8 90 90 a8 90 90 a8 a8 90 a8 90 a8 a8 a8 90 a8 90 a8 90 a8 90
+rng: jitter startup 4096 samples passed RCT(cut 301) + APT(W 512, cut 507); 60372 TSC ticks/sample
+rng: min-entropy per 8-bit sample: MCV 0.353 (max 3137/4096, 18 distinct), lag-1 0.027; claimed 0.100
+rng: estimate below the claimed 0.1 bit/sample -> refusing to run SSH
+DONE

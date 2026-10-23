@@ -1,0 +1,6 @@
+samples 4096, distinct 207, most common 0xa1 x152 (0.037)
+MCV   min-entropy 4.483 bits/sample
+lag-1 min-entropy 0.935 bits/sample (contexts with >= 20 successors)
+min of the two    0.935 bits/sample
+top values: 0xa1:152, 0xa2:139, 0x9e:137, 0xa0:129, 0xa3:125, 0x9f:117, 0xa4:113, 0x99:107
+H=0.1: RCT cutoff 301 (1+ceil(30/H)), APT W=512 cutoff 507 (P(1+Bin(511,2^-H)>=C)<=2^-30)

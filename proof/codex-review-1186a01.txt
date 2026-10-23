@@ -1,0 +1,1522 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a15cd2-bb60-72c2-8812-234a7cbe30b7
+--------
+user
+Calibrated skeptic review of git show HEAD (commit 1186a01) in this repo: a no_std Rust kernel's bmctl UDP control server (src/bmctl.rs) and USB probe (src/usb.rs). Context: a prior review found (1) a 'who' flood from a keyless LAN host locked out the key holder (10/s global cap + 8-slot round-robin pending table holding full sessions) and (2) non-ASCII 64-byte pins panicked on byte slicing. The fix: 256 small pending records, oldest evicted, session key derived when the first frame arrives; who ceiling 1000/s; ASCII-hexdigit check before slicing. Look for: a way the new promotion path accepts a frame it should not (peer binding, sid reuse, a forged frame consuming or corrupting a pending entry, replay across promotion), borrow/aliasing mistakes in the cand/Option logic, the cost of a 256-entry min_by_key scan per who at 1000/s on an Atom N570, i64::MIN ordering, and whether the tests (tools/dos-q35-test.py, tools/pin-q35-test.py, tools/usb-q35-test.py) actually guard the fixes. Quote code. Output MUST-FIX (concrete failure + fix), SHOULD, NIT, then 0-10. 'Most is sound' is valid.
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll read the commit and surrounding protocol code, then check the promotion invariants and whether the QEMU tests exercise the reported failures.
+exec
+/bin/zsh -lc 'git show --stat HEAD && git status --short && rg --files -g AGENTS.md' in ~/nc110-baremetal
+ exited 1 in 0ms:
+commit 1186a01f7681250adfabb2df216488675f5f22f9
+Author: evnchn <user1@example.invalid>
+Date:   Wed Oct 21 12:57:48 2026 +0800
+
+    bmctl: a who flood no longer locks the key holder out; non-ASCII hex no longer panics (control review 2026-10-21)
+    
+    - Pending who entries are small records (id, client nonce, peer, time), 256 of them, oldest evicted; the session key is
+      derived when the first frame arrives. The who reply ceiling is 1000/s (was 10/s for everyone together). q35, 380 pps
+      who flood, idle=20: before 1/10 authenticated pings and an idle reset; after 21/21, no reset (tools/dos-q35-test.py).
+      Residual: a flood above the ceiling, or one spoofing many sources, still starves who; the real fix is a stateless
+      cookie handshake (protocol v2).
+    - host set pin and usb hex strings must be ASCII hex digits before byte slicing. Before: PANIC at bmctl.rs:701 and a
+      usb out panic; after: err replies, kernel keeps serving (tools/pin-q35-test.py, usb-q35-test.py).
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+ src/bmctl.rs          | 36 +++++++++++++++------
+ src/usb.rs            |  2 +-
+ tools/dos-q35-test.py | 89 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ tools/pin-q35-test.py | 37 +++++++++++++++++++++
+ tools/usb-q35-test.py |  2 ++
+ 5 files changed, 155 insertions(+), 11 deletions(-)
+ M proof/nc110-soak.log
+?? proof/acpi/nc110-FACP.dsl
+?? proof/codex-review-1186a01.txt
+?? proof/codex-review-agentos-followup.txt
+?? proof/codex-review-agentos-followup2.txt
+?? proof/codex-review-agentos-followup3.txt
+?? proof/codex-review-agentos-followup4.txt
+?? proof/codex-review-agentos.txt
+?? proof/review-home-deepseek.txt
+?? tools/nc110-wake.py
+
+exec
+/bin/zsh -lc 'git show HEAD -- src/bmctl.rs src/usb.rs tools/dos-q35-test.py tools/pin-q35-test.py tools/usb-q35-test.py' in ~/nc110-baremetal
+ succeeded in 0ms:
+commit 1186a01f7681250adfabb2df216488675f5f22f9
+Author: evnchn <user1@example.invalid>
+Date:   Wed Oct 21 12:57:48 2026 +0800
+
+    bmctl: a who flood no longer locks the key holder out; non-ASCII hex no longer panics (control review 2026-10-21)
+    
+    - Pending who entries are small records (id, client nonce, peer, time), 256 of them, oldest evicted; the session key is
+      derived when the first frame arrives. The who reply ceiling is 1000/s (was 10/s for everyone together). q35, 380 pps
+      who flood, idle=20: before 1/10 authenticated pings and an idle reset; after 21/21, no reset (tools/dos-q35-test.py).
+      Residual: a flood above the ceiling, or one spoofing many sources, still starves who; the real fix is a stateless
+      cookie handshake (protocol v2).
+    - host set pin and usb hex strings must be ASCII hex digits before byte slicing. Before: PANIC at bmctl.rs:701 and a
+      usb out panic; after: err replies, kernel keeps serving (tools/pin-q35-test.py, usb-q35-test.py).
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/src/bmctl.rs b/src/bmctl.rs
+index 1e381e4..8c1a899 100644
+--- a/src/bmctl.rs
++++ b/src/bmctl.rs
+@@ -33,7 +33,9 @@ const PORT: u16 = 5515;
+ const IDLE_MS: i64 = 600_000; // default; cmdline idle=<s> (5..3600) overrides it, used by the q35 stall test
+ 
+ static mut SESS: [Option<Sess>; 16] = [const { None }; 16]; // authenticated
+-static mut PEND: [Option<Sess>; 8] = [const { None }; 8]; // issued by `who`, no good frame yet
++// Issued by `who`, no good frame yet: small records (the session key is derived when the first frame arrives), many of
++// them and oldest-evicted, so a `who` flood cannot push a real client's entry out within its round trip (review 1021).
++static mut PEND: [Option<Pend>; 256] = [const { None }; 256];
+ static mut SOCKS: [SocketStorage<'static>; 3] = [SocketStorage::EMPTY; 3];
+ static mut RX_META: [udp::PacketMetadata; 8] = [udp::PacketMetadata::EMPTY; 8];
+ static mut RX_BUF: [u8; 8192] = [0; 8192];
+@@ -112,6 +114,13 @@ fn who_check(master: &[u8; 32], nc: &[u8; 16], boot_id: &[u8; 16], sess: u32) ->
+     h.finalize().into()
+ }
+ 
++struct Pend {
++    id: u32,
++    nc: [u8; 16],
++    peer: IpEndpoint,
++    t: i64,
++}
++
+ struct Sess {
+     id: u32,
+     key: [u8; 32],
+@@ -384,17 +393,19 @@ impl Ctl {
+                 (self.who_window, self.who_count) = (t, 0);
+             }
+             self.who_count += 1;
+-            if self.who_count > 10 {
+-                return None; // global cap: at most 10 clear-text replies per second (reflection)
++            // ponytail: one global ceiling (CPU and reflection; bmctl is LAN-only), not per sender. A flood above it, or
++            // one spoofing many sources, still starves `who`; the full fix is a stateless cookie handshake (protocol v2).
++            if self.who_count > 1000 {
++                return None;
+             }
+-            // Unauthenticated `who` only ever writes the pending table (round-robin), never an authenticated session.
+-            let slot = Some((self.next_sess as usize) % pend.len());
++            // Unauthenticated `who` only ever writes the pending table (oldest entry out), never an authenticated session.
++            let slot = (0..pend.len()).min_by_key(|&j| pend[j].as_ref().map_or(i64::MIN, |x| x.t));
+             let (Some(slot), Some(next)) = (slot, self.next_sess.checked_add(1)) else { return None };
+             let id = self.next_sess;
+             self.next_sess = next;
+             let mut nc = [0u8; 16];
+             nc.copy_from_slice(&buf[3..19]);
+-            pend[slot] = Some(Sess { id, key: session_key(&self.key, &self.boot_id, id, &nc), last_seq: 0, peer: Some(from), last_t: t, retx: 0, reply: [0; 8 + 1300 + 16], reply_len: 0 });
++            pend[slot] = Some(Pend { id, nc, peer: from, t });
+             let mut chk = heapless::String::<64>::new();
+             hex(&who_check(&self.key, &nc, &self.boot_id, id)[..16], &mut chk);
+             let mut h = heapless::String::<160>::new();
+@@ -411,10 +422,14 @@ impl Ctl {
+         // Authenticated session, or a pending one from the endpoint that asked `who` (promoted below once the frame
+         // authenticates; only then may it evict the least recently used authenticated session).
+         let in_sess = sess.iter().position(|x| x.as_ref().is_some_and(|x| x.id == sid && x.peer == Some(from)));
+-        let in_pend = pend.iter().position(|x| x.as_ref().is_some_and(|x| x.id == sid && x.peer == Some(from)));
++        let in_pend = pend.iter().position(|x| x.as_ref().is_some_and(|x| x.id == sid && x.peer == from));
++        let mut cand = None;
+         let se = match (in_sess, in_pend) {
+             (Some(i), _) => sess[i].as_mut().unwrap(),
+-            (None, Some(i)) => pend[i].as_mut().unwrap(),
++            (None, Some(i)) => {
++                let p = pend[i].as_ref().unwrap();
++                cand.insert(Sess { id: p.id, key: session_key(&self.key, &self.boot_id, p.id, &p.nc), last_seq: 0, peer: Some(from), last_t: t, retx: 0, reply: [0; 8 + 1300 + 16], reply_len: 0 })
++            }
+             _ => {
+                 self.bad += 1;
+                 return None;
+@@ -446,7 +461,8 @@ impl Ctl {
+         let se = if let (None, Some(i)) = (in_sess, in_pend) {
+             let dst = (0..sess.len()).find(|&j| sess[j].is_none())
+                 .unwrap_or_else(|| (0..sess.len()).min_by_key(|&j| sess[j].as_ref().map_or(i64::MIN, |x| x.last_t)).unwrap());
+-            sess[dst] = pend[i].take();
++            pend[i] = None;
++            sess[dst] = cand.take();
+             sess[dst].as_mut().unwrap()
+         } else {
+             se
+@@ -695,7 +711,7 @@ fn parse_host<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<crate::ssh::
+     let ip: Ipv4Address = it.next().and_then(|x| x.parse().ok()).ok_or("ip")?;
+     let port: u16 = it.next().and_then(|x| x.parse().ok()).filter(|&p| p > 0).ok_or("port")?;
+     let user = it.next().ok_or("user")?;
+-    let hexpin = it.next().filter(|x| x.len() == 64).ok_or("pin must be 64 hex digits")?;
++    let hexpin = it.next().filter(|x| x.len() == 64 && x.bytes().all(|c| c.is_ascii_hexdigit())).ok_or("pin must be 64 hex digits")?;
+     let mut pin = [0u8; 32];
+     for (i, b) in pin.iter_mut().enumerate() {
+         *b = u8::from_str_radix(&hexpin[2 * i..2 * i + 2], 16).map_err(|_| "pin is not hex")?;
+diff --git a/src/usb.rs b/src/usb.rs
+index e586a29..cd590ab 100644
+--- a/src/usb.rs
++++ b/src/usb.rs
+@@ -383,7 +383,7 @@ pub fn cmd<'a>(w: &mut dyn Write, it: &mut impl Iterator<Item = &'a str>, sub: &
+         return;
+     };
+     let hex = |s: &str, out: &mut [u8]| -> Option<usize> {
+-        if s.len() % 2 != 0 || s.len() / 2 > out.len() {
++        if s.len() % 2 != 0 || s.len() / 2 > out.len() || !s.bytes().all(|c| c.is_ascii_hexdigit()) {
+             return None;
+         }
+         for i in 0..s.len() / 2 {
+diff --git a/tools/dos-q35-test.py b/tools/dos-q35-test.py
+new file mode 100644
+index 0000000..35864a2
+--- /dev/null
++++ b/tools/dos-q35-test.py
+@@ -0,0 +1,89 @@
++"""q35 check (from the 2026-10-21 control review): a `who` flood from a host WITHOUT the key must not lock the key holder
++out of bmctl or let the idle bound reset the board. Usage: dos-q35-test.py [kernel] [who|junk|none]. Exit 1 on failure:
++under a flood, fewer than 80% of authenticated pings got through, or the kernel reset."""
++import hashlib, os, socket, struct, subprocess, sys, threading, time
++from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
++
++KERNEL = sys.argv[1] if len(sys.argv) > 1 else "target/attended/x86_64-unknown-none/release/nc110-kernel"
++KEY = "test-keys/client.key"
++PORT = 25515
++LOG = f"/tmp/dos-q35-{os.getpid()}.log"
++mode = sys.argv[2] if len(sys.argv) > 2 else "who"
++IDLE = 20
++open(LOG, "w").close()
++q = subprocess.Popen(["qemu-system-x86_64", "-machine", "q35", "-m", "128", "-display", "none", "-no-reboot",
++    "-global", "ICH9-LPC.noreboot=false", "-serial", f"file:{LOG}", "-kernel", KERNEL, "-initrd", KEY,
++    "-append", f"bmctl nic=mmio idle={IDLE}", "-netdev", f"user,id=n0,hostfwd=udp:127.0.0.1:{PORT}-:5515", "-device", "rtl8139,netdev=n0"])
++for _ in range(80):
++    if "bmctl: listening" in open(LOG, errors="replace").read():
++        break
++    time.sleep(0.5)
++else:
++    q.kill(); sys.exit("never listened")
++t_listen = time.time()
++km = open(KEY, "rb").read()
++master = hashlib.sha256(b"nc110-bmctl-v1" + km[8:40]).digest()
++ep = ("127.0.0.1", PORT)
++
++
++def legit_ping():
++    """One full bmctl.py-style run: who (3 tries, 1 s) then ping (3 tries). True on an authenticated pong."""
++    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.0)
++    nc = os.urandom(16)
++    w = None
++    for _ in range(3):
++        s.sendto(b"who" + nc, ep)
++        try:
++            w = s.recvfrom(256)[0].split(); break
++        except socket.timeout:
++            pass
++    if not w:
++        return False
++    boot, sid = bytes.fromhex(w[2].decode()), int(w[4])
++    a = ChaCha20Poly1305(hashlib.sha256(b"nc110-bmctl-v1 session" + master + boot + struct.pack("<I", sid) + nc).digest())
++    f = struct.pack("<IQ", sid, 1) + a.encrypt(b"C2K\0" + struct.pack("<Q", 1), b"ping", boot)
++    for _ in range(3):
++        s.sendto(f, ep)
++        try:
++            r = s.recvfrom(2048)[0]
++            return a.decrypt(b"K2C\0" + r[:8], r[8:], boot).startswith(b"pong")
++        except socket.timeout:
++            pass
++    return False
++
++
++stop = threading.Event()
++sent = [0]
++
++
++def flood():
++    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setblocking(False)
++    while not stop.is_set():
++        p = b"who" + os.urandom(16) if mode == "who" else os.urandom(28)
++        try:
++            s.sendto(p, ep); sent[0] += 1
++        except BlockingIOError:
++            pass
++        if mode == "who":
++            time.sleep(0.002) if sent[0] % 5 == 0 else None  # a few hundred pps of 19-byte datagrams
++
++
++print("baseline (no flood):", legit_ping())
++if mode != "none":
++    threading.Thread(target=flood, daemon=True).start()
++ok = tries = 0
++t0 = time.time()
++while time.time() - t0 < IDLE + 25 and q.poll() is None:
++    tries += 1; ok += legit_ping(); time.sleep(2)
++stop.set()
++alive = q.poll() is None
++print(f"mode={mode}: legit authenticated pings {ok}/{tries} during {time.time() - t0:.0f} s, flood packets {sent[0]}, "
++      f"qemu {'still running' if alive else 'EXITED (reset) after %.0f s' % (time.time() - t_listen)}")
++log = open(LOG, errors="replace").read()
++for l in log.splitlines():
++    if "idle" in l and "reset" in l or "hard reset" in l:
++        print("serial:", l.strip())
++if alive:
++    q.kill()
++good = alive and ok >= 0.8 * tries
++print("RESULT:", "PASS" if good else "FAIL"); sys.exit(0 if good else 1)
+diff --git a/tools/pin-q35-test.py b/tools/pin-q35-test.py
+new file mode 100644
+index 0000000..3b08ae1
+--- /dev/null
++++ b/tools/pin-q35-test.py
+@@ -0,0 +1,37 @@
++"""q35 check (from the 2026-10-21 control review): an authenticated `host set` with a 64-BYTE but non-ASCII pin, and a
++non-ASCII `usb out` hex string, must be refused with an error, not panic the kernel (a panic now means a dark board).
++Usage: pin-q35-test.py [kernel]. Exit 1 on failure."""
++import os, subprocess, sys, time
++
++KERNEL = sys.argv[1] if len(sys.argv) > 1 else "target/attended/x86_64-unknown-none/release/nc110-kernel"
++KEY = "test-keys/client.key"
++PORT = 25516
++LOG = f"/tmp/pin-q35-{os.getpid()}.log"
++open(LOG, "w").close()
++q = subprocess.Popen(["qemu-system-x86_64", "-machine", "q35", "-m", "128", "-display", "none", "-no-reboot",
++    "-global", "ICH9-LPC.noreboot=false", "-serial", f"file:{LOG}", "-kernel", KERNEL, "-initrd", KEY,
++    "-append", "bmctl nic=mmio", "-netdev", f"user,id=n0,hostfwd=udp:127.0.0.1:{PORT}-:5515", "-device", "rtl8139,netdev=n0"])
++for _ in range(80):
++    if "bmctl: listening" in open(LOG, errors="replace").read():
++        break
++    time.sleep(0.5)
++B = ["tools/.venv/bin/python", "tools/bmctl.py", "--host", "127.0.0.1",
++     "--port", str(PORT), "--key", KEY]
++env = dict(os.environ, NC110_KEY=KEY)
++print("ping:", subprocess.run(B + ["ping"], capture_output=True, text=True, env=env).stdout.strip())
++pin = "€" + "0" * 61
++assert len(pin.encode()) == 64
++t0 = time.time()
++r = subprocess.run(B + ["host", "set", "0", "x", "1.2.3.4", "22", "u", pin], capture_output=True, text=True, env=env)
++print("host set (non-ASCII pin):", (r.stdout + r.stderr).strip())
++print("ping after:", (lambda r: (r.stdout + r.stderr).strip())(subprocess.run(B + ["ping"], capture_output=True, text=True, env=env)))
++time.sleep(3)
++print("qemu:", "EXITED (reset) %.0f s after the command" % (time.time() - t0) if q.poll() is not None else "still running")
++for l in open(LOG, errors="replace").read().splitlines():
++    if "PANIC" in l or "wdt:" in l:
++        print("serial:", l.strip())
++r2 = subprocess.run(B + ["ping"], capture_output=True, text=True, env=env).stdout
++good = "pin must be 64 hex digits" in (r.stdout + r.stderr) and r2.startswith("pong") and q.poll() is None
++if q.poll() is None:
++    q.kill()
++print("RESULT:", "PASS" if good else "FAIL"); sys.exit(0 if good else 1)
+diff --git a/tools/usb-q35-test.py b/tools/usb-q35-test.py
+index 28ee79f..4b008fd 100644
+--- a/tools/usb-q35-test.py
++++ b/tools/usb-q35-test.py
+@@ -41,6 +41,8 @@ r = bm("usb", "in", "0", "81", "8"); print("in 2:", r)
+ check(r == "ok 8: 00 00 00 00 00 00 00 00", "second usb in: key-up report (QEMU UHCI does not check toggles; real hardware will)")
+ r = bm("usb", "in", "0", "82", "8"); print("bad ep:", r)
+ check(r.startswith("err"), "unknown endpoint errors")
++r = bm("usb", "out", "0", "01", "\u20ac0"); print("non-ASCII hex:", r)
++check(r.startswith("err"), "usb out with non-ASCII hex is refused, no panic (review 1021)")
+ r = bm("ping"); check(r.startswith("pong"), "kernel still serving bmctl: " + r)
+ q.kill()
+ if os.path.exists(sock): os.unlink(sock)
+
+exec
+/bin/zsh -lc "nl -ba src/bmctl.rs | sed -n '1,210p;300,535p'; nl -ba src/usb.rs | sed -n '350,490p'; cat tools/usb-q35-test.py; cat Cargo.toml" in ~/nc110-baremetal
+ succeeded in 0ms:
+     1	//! bmctl: authenticated UDP control port (5515) so an agent can inspect and drive the kernel over the LAN, the way
+     2	//! the DS client is driven over net2. Frame: [seq u64 LE][ciphertext][16-byte tag], ChaCha20-Poly1305 (RFC 8439),
+     3	//! nonce = b"C2K\0"|b"K2C\0" ++ seq, AAD = this boot's random 16-byte id. Master = SHA-256("nc110-bmctl-v1" ++
+     4	//! client seed from the key module): nothing secret is compiled in. Handshake (Codex MUST-FIX x2, nonce reuse):
+     5	//! `who` ++ a fresh random 16-byte client nonce Nc is the only clear-text request; the reply carries the boot id, a
+     6	//! NEW session number and check = SHA-256("nc110-bmctl-v1 who" ++ master ++ Nc ++ boot id ++ session)[..16].
+     7	//! Traffic key = SHA-256("nc110-bmctl-v1 session" ++ master ++ boot id ++ session ++ Nc); seq counts from 1. A
+     8	//! replayed or forged `who` reply cannot make two client runs share a key, because Nc is fresh per run, and the
+     9	//! kernel never reissues a session number in a boot. A session binds to the endpoint that asked `who`; pending and authenticated sessions live in separate tables.
+    10	//! A duplicate of the last accepted seq gets the cached reply bytes back (safe UDP retries, nothing re-executed).
+    11	//! The loop pets the watchdog; 10 minutes without a valid command -> 0xCF9 reset.
+    12	//! `peek` is read-only and allowlisted (see `peek`): RAM only inside the multiboot map and never the kernel image
+    13	//! (text, data, bss: stack, session table, keys), NIC registers only inside its 256-byte MMIO window as aligned
+    14	//! dwords, ports only an explicit allowlist of PM/TCO registers; everything else is refused. Confidentiality note:
+    15	//! RAM outside the image can hold GRUB leftovers (multiboot info, maybe a copy of the key file). That is not an
+    16	//! escalation: the bmctl master key is derived from that same seed, so any authenticated peer already holds it.
+    17	//! NIC dword reads can clear RTL8139 statistics counters (QEMU only); r8169-family dumps use the same reads.
+    18	use crate::net::Nic;
+    19	use crate::nic::{Bus, Rtl};
+    20	use crate::port::{inb, inl, inw};
+    21	use crate::{console, kprintln, rng, time, wdt};
+    22	use chacha20::cipher::{KeyIvInit, StreamCipher};
+    23	use chacha20::ChaCha20;
+    24	use poly1305::universal_hash::{KeyInit, UniversalHash};
+    25	use poly1305::Poly1305;
+    26	use sha2::{Digest, Sha256};
+    27	use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+    28	use smoltcp::socket::{dhcpv4, udp};
+    29	use smoltcp::time::Instant;
+    30	use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
+    31	
+    32	const PORT: u16 = 5515;
+    33	const IDLE_MS: i64 = 600_000; // default; cmdline idle=<s> (5..3600) overrides it, used by the q35 stall test
+    34	
+    35	static mut SESS: [Option<Sess>; 16] = [const { None }; 16]; // authenticated
+    36	// Issued by `who`, no good frame yet: small records (the session key is derived when the first frame arrives), many of
+    37	// them and oldest-evicted, so a `who` flood cannot push a real client's entry out within its round trip (review 1021).
+    38	static mut PEND: [Option<Pend>; 256] = [const { None }; 256];
+    39	static mut SOCKS: [SocketStorage<'static>; 3] = [SocketStorage::EMPTY; 3];
+    40	static mut RX_META: [udp::PacketMetadata; 8] = [udp::PacketMetadata::EMPTY; 8];
+    41	static mut RX_BUF: [u8; 8192] = [0; 8192];
+    42	static mut TX_META: [udp::PacketMetadata; 8] = [udp::PacketMetadata::EMPTY; 8];
+    43	static mut TX_BUF: [u8; 8192] = [0; 8192];
+    44	
+    45	fn now() -> Instant {
+    46	    Instant::from_millis(time::now_ms())
+    47	}
+    48	
+    49	fn nonce(dir: &[u8; 4], seq: u64) -> [u8; 12] {
+    50	    let mut n = [0u8; 12];
+    51	    n[..4].copy_from_slice(dir);
+    52	    n[4..].copy_from_slice(&seq.to_le_bytes());
+    53	    n
+    54	}
+    55	
+    56	/// RFC 8439 tag over aad and ct with the one-time key from keystream block 0.
+    57	fn tag(pk: &[u8; 32], aad: &[u8], ct: &[u8]) -> [u8; 16] {
+    58	    let mut m = Poly1305::new(pk.into());
+    59	    m.update_padded(aad);
+    60	    m.update_padded(ct);
+    61	    let mut lens = [0u8; 16];
+    62	    lens[..8].copy_from_slice(&(aad.len() as u64).to_le_bytes());
+    63	    lens[8..].copy_from_slice(&(ct.len() as u64).to_le_bytes());
+    64	    m.update_padded(&lens);
+    65	    m.finalize().into()
+    66	}
+    67	
+    68	fn cipher(key: &[u8; 32], n: &[u8; 12]) -> (ChaCha20, [u8; 32]) {
+    69	    let mut c = ChaCha20::new(key.into(), n.into());
+    70	    let mut b0 = [0u8; 64];
+    71	    c.apply_keystream(&mut b0); // block 0 -> Poly1305 key; the stream continues at block 1
+    72	    let mut pk = [0u8; 32];
+    73	    pk.copy_from_slice(&b0[..32]);
+    74	    (c, pk)
+    75	}
+    76	
+    77	pub fn seal(key: &[u8; 32], n: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
+    78	    let (mut c, pk) = cipher(key, n);
+    79	    c.apply_keystream(buf);
+    80	    tag(&pk, aad, buf)
+    81	}
+    82	
+    83	pub fn open(key: &[u8; 32], n: &[u8; 12], aad: &[u8], buf: &mut [u8], t: &[u8]) -> bool {
+    84	    let (mut c, pk) = cipher(key, n);
+    85	    let want = tag(&pk, aad, buf);
+    86	    if t.len() != 16 {
+    87	        return false;
+    88	    }
+    89	    let diff = want.iter().zip(t).fold(0u8, |a, (x, y)| a | (x ^ y));
+    90	    if diff != 0 {
+    91	        return false;
+    92	    }
+    93	    c.apply_keystream(buf);
+    94	    true
+    95	}
+    96	
+    97	pub fn session_key(master: &[u8; 32], boot_id: &[u8; 16], sess: u32, nc: &[u8; 16]) -> [u8; 32] {
+    98	    let mut h = Sha256::new();
+    99	    h.update(b"nc110-bmctl-v1 session");
+   100	    h.update(master);
+   101	    h.update(boot_id);
+   102	    h.update(sess.to_le_bytes());
+   103	    h.update(nc);
+   104	    h.finalize().into()
+   105	}
+   106	
+   107	fn who_check(master: &[u8; 32], nc: &[u8; 16], boot_id: &[u8; 16], sess: u32) -> [u8; 32] {
+   108	    let mut h = Sha256::new();
+   109	    h.update(b"nc110-bmctl-v1 who");
+   110	    h.update(master);
+   111	    h.update(nc);
+   112	    h.update(boot_id);
+   113	    h.update(sess.to_le_bytes());
+   114	    h.finalize().into()
+   115	}
+   116	
+   117	struct Pend {
+   118	    id: u32,
+   119	    nc: [u8; 16],
+   120	    peer: IpEndpoint,
+   121	    t: i64,
+   122	}
+   123	
+   124	struct Sess {
+   125	    id: u32,
+   126	    key: [u8; 32],
+   127	    last_seq: u64,
+   128	    peer: Option<IpEndpoint>,
+   129	    last_t: i64,
+   130	    retx: u8,
+   131	    reply: [u8; 8 + 1300 + 16],
+   132	    reply_len: usize,
+   133	}
+   134	
+   135	pub fn derive_key(seed: &[u8; 32]) -> [u8; 32] {
+   136	    let mut h = Sha256::new();
+   137	    h.update(b"nc110-bmctl-v1");
+   138	    h.update(seed);
+   139	    h.finalize().into()
+   140	}
+   141	
+   142	fn hex(b: &[u8], out: &mut heapless::String<64>) {
+   143	    for x in b {
+   144	        let _ = core::fmt::write(out, format_args!("{:02x}", x));
+   145	    }
+   146	}
+   147	
+   148	extern "C" {
+   149	    static __load_start: u8;
+   150	    static __bss_end: u8;
+   151	}
+   152	
+   153	/// Allowlisted read. Returns Err(reason) for anything outside the policy; never touches refused addresses.
+   154	fn peek(w: &mut Writer, nic_mmio: Option<u64>, what: &str, a: &str, b: &str) -> Result<(), &'static str> {
+   155	    let addr = u64::from_str_radix(a.trim_start_matches("0x"), 16).map_err(|_| "addr: hex")?;
+   156	    let n: u64 = b.parse().map_err(|_| "len/width: decimal")?;
+   157	    match what {
+   158	        "mem" => {
+   159	            if n == 0 || n > 512 {
+   160	                return Err("len 1..512");
+   161	            }
+   162	            let end = addr.checked_add(n).ok_or("overflow")?;
+   163	            let (ks, ke) = (core::ptr::addr_of!(__load_start) as u64, core::ptr::addr_of!(__bss_end) as u64);
+   164	            if addr < ke && ks < end {
+   165	                return Err("refused: kernel image (code, stack, keys)");
+   166	            }
+   167	            if end > 0x1_0000_0000 || !crate::mb::ram_contains(addr, n) {
+   168	                return Err("refused: not inside one multiboot RAM range below 4 GiB");
+   169	            }
+   170	            for i in 0..n {
+   171	                let v = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
+   172	                let _ = core::fmt::write(w, format_args!("{:02x}", v));
+   173	            }
+   174	        }
+   175	        "nic" => {
+   176	            let base = nic_mmio.ok_or("refused: NIC not on MMIO")?;
+   177	            if addr % 4 != 0 || n % 4 != 0 || n == 0 || addr.checked_add(n).is_none_or(|e| e > 0x100) {
+   178	                return Err("nic: dword-aligned offset/len inside 0..0x100");
+   179	            }
+   180	            for o in (addr..addr + n).step_by(4) {
+   181	                let v = unsafe { core::ptr::read_volatile((base + o) as *const u32) };
+   182	                let _ = core::fmt::write(w, format_args!("{:08x} ", v));
+   183	            }
+   184	        }
+   185	        "io" => {
+   186	            // Explicit (offset from PMBASE, width) allowlist from the NM10 datasheet (13.8.3, 13.9). Deliberately
+   187	            // absent: LV2/LV3/LV4 at +0x14..+0x16, whose READ requests C2/C3/C4 (Codex MUST-FIX), and anything else.
+   188	            const OK: [(u64, u64); 16] = [
+   189	                (0x00, 2), (0x02, 2), (0x04, 4), (0x08, 4), (0x10, 4), (0x28, 4), (0x2c, 4), (0x30, 4), (0x34, 4),
+   190	                (0x60, 2), (0x64, 2), (0x66, 2), (0x68, 2), (0x6a, 2), (0x72, 2), (0x62, 1),
+   191	            ];
+   192	            let pm = wdt::pmbase() as u64;
+   193	            let off = addr.checked_sub(pm).ok_or("io: below PMBASE")?;
+   194	            if pm == 0 || !OK.contains(&(off, n)) {
+   195	                return Err("io: only allowlisted PM/TCO registers (PMBASE+off,width): 0/2 2/2 4/4 8/4 10/4 28/4 2c/4 30/4 34/4 60/2 62/1 64/2 66/2 68/2 6a/2 72/2");
+   196	            }
+   197	            let p = u16::try_from(addr).map_err(|_| "io: port > 0xffff")?;
+   198	            let v = unsafe { match n { 1 => inb(p) as u32, 2 => inw(p) as u32, _ => inl(p) } };
+   199	            let _ = core::fmt::write(w, format_args!("{:#x}", v));
+   200	        }
+   201	        _ => return Err("peek mem <hexaddr> <len> | peek nic <hexoff> <len> | peek io <hexport> <1|2|4>"),
+   202	    }
+   203	    Ok(())
+   204	}
+   205	
+   206	/// What the caller must do after `Ctl::step`; the caller owns the NIC, so it does the hop/reset itself.
+   207	pub enum Act {
+   208	    Idle,
+   209	    Reboot,
+   210	    Sleep(u32),
+   300	            Bus::Mmio(b) => Some(b),
+   301	            Bus::Pio(_) => None,
+   302	        };
+   303	        let mut boot_id = [0u8; 16];
+   304	        if rng::fill(&mut boot_id).is_err() {
+   305	            kprintln!("bmctl: entropy failed -> not starting");
+   306	            return None;
+   307	        }
+   308	        let mut bid = heapless::String::<64>::new();
+   309	        hex(&boot_id, &mut bid);
+   310	        sock.bind(PORT).expect("bind");
+   311	        kprintln!("bmctl: listening on {}:{} boot id {} (idle reset after {} s)", ip, PORT, bid, idle_ms / 1000);
+   312	        crate::udplog::dump(5);
+   313	        console::status("ready");
+   314	        let t = time::now_ms();
+   315	        Some(Ctl {
+   316	            seed, key: derive_key(&seed), boot_id, bid, ip, idle_ms, nic_mmio, last_ok: t, last_hello: t - 2001, last_footer: t - 1000, battery: None,
+   317	            ok: 0, bad: 0, replay: 0, retx: 0, next_sess: 1, who_window: 0, who_count: 0, reboot_at: None, sleep_at: None, stage: None, jump_at: None,
+   318	        })
+   319	    }
+   320	
+   321	    /// Carries out an `Act`: reboot and chain-load never return; false = idle timeout, the caller must reset.
+   322	    pub fn act(&mut self, a: Act, dev: &Nic) -> bool {
+   323	        match a {
+   324	            Act::Idle => false,
+   325	            Act::Reboot => wdt::hard_reset(),
+   326	            Act::Sleep(m) => {
+   327	                if let Err(e) = crate::sleep::enter(m, &dev.0) {
+   328	                    kprintln!("sleep: {}", e);
+   329	                    console::status("sleep failed (see log)");
+   330	                }
+   331	                true
+   332	            }
+   333	            Act::Jump(p) => crate::loader::jump(&p, &dev.0),
+   334	        }
+   335	    }
+   336	
+   337	    /// Deadlines first, then at most one datagram. Only an authenticated command counts as activity (`last_ok`).
+   338	    pub fn step(&mut self, sock: &mut udp::Socket, t: i64) -> Option<Act> {
+   339	        crate::hda::poll(t);
+   340	        if t - self.last_footer >= 1000 {
+   341	            self.last_footer = t;
+   342	            let mut r = heapless::String::<72>::new();
+   343	            let s = t / 1000;
+   344	            let _ = core::fmt::write(&mut r, format_args!("{}   up {}:{:02}:{:02}", self.ip, s / 3600, s / 60 % 60, s % 60));
+   345	            if s % 5 == 0 || self.battery.is_none() {
+   346	                self.battery = Some(crate::ec::battery());
+   347	            }
+   348	            if let Some(Some((pct, ac, chg))) = self.battery {
+   349	                let _ = core::fmt::write(&mut r, format_args!("   BAT {}%{}", pct, if chg { " charging" } else if ac { " AC" } else { "" }));
+   350	            }
+   351	            if let Some((h, m)) = time::rtc_hm() {
+   352	                let _ = core::fmt::write(&mut r, format_args!("   {:02}:{:02}", h, m));
+   353	            }
+   354	            console::footer(b"NC110 agentic OS", r.as_bytes());
+   355	        }
+   356	        if t - self.last_ok > self.idle_ms {
+   357	            kprintln!("bmctl: idle {} s -> reset", self.idle_ms / 1000);
+   358	            console::status("no control traffic: restarting");
+   359	            return Some(Act::Idle);
+   360	        }
+   361	        if self.jump_at.as_ref().is_some_and(|(j, _)| t > *j) {
+   362	            let (_, p) = self.jump_at.take().unwrap();
+   363	            kprintln!("bmctl: chain-loading the staged kernel");
+   364	            console::status("loading new kernel");
+   365	            crate::udplog::dump(7);
+   366	            return Some(Act::Jump(p));
+   367	        }
+   368	        if let Some((at, m)) = self.sleep_at {
+   369	            if t > at {
+   370	                self.sleep_at = None;
+   371	                console::status("sleeping (wake: magic packet, power button, or the RTC alarm)");
+   372	                return Some(Act::Sleep(m));
+   373	            }
+   374	        }
+   375	        if self.reboot_at.is_some_and(|r| t > r) {
+   376	            kprintln!("bmctl: reboot requested");
+   377	            console::status("restarting");
+   378	            return Some(Act::Reboot);
+   379	        }
+   380	        if t - self.last_hello > 2000 {
+   381	            self.last_hello = t;
+   382	            let mut h = heapless::String::<128>::new();
+   383	            let _ = core::fmt::write(&mut h, format_args!("nc110 hello bmctl {}:{} boot {}", self.ip, PORT, self.bid));
+   384	            let _ = sock.send_slice(h.as_bytes(), IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::BROADCAST), 5514));
+   385	        }
+   386	        let sess = unsafe { &mut *core::ptr::addr_of_mut!(SESS) };
+   387	        let pend = unsafe { &mut *core::ptr::addr_of_mut!(PEND) };
+   388	        let mut buf = [0u8; 1500];
+   389	        let Ok((n, meta)) = sock.recv_slice(&mut buf) else { return None };
+   390	        let from = meta.endpoint;
+   391	        if n == 3 + 16 && &buf[..3] == b"who" {
+   392	            if t - self.who_window > 1000 {
+   393	                (self.who_window, self.who_count) = (t, 0);
+   394	            }
+   395	            self.who_count += 1;
+   396	            // ponytail: one global ceiling (CPU and reflection; bmctl is LAN-only), not per sender. A flood above it, or
+   397	            // one spoofing many sources, still starves `who`; the full fix is a stateless cookie handshake (protocol v2).
+   398	            if self.who_count > 1000 {
+   399	                return None;
+   400	            }
+   401	            // Unauthenticated `who` only ever writes the pending table (oldest entry out), never an authenticated session.
+   402	            let slot = (0..pend.len()).min_by_key(|&j| pend[j].as_ref().map_or(i64::MIN, |x| x.t));
+   403	            let (Some(slot), Some(next)) = (slot, self.next_sess.checked_add(1)) else { return None };
+   404	            let id = self.next_sess;
+   405	            self.next_sess = next;
+   406	            let mut nc = [0u8; 16];
+   407	            nc.copy_from_slice(&buf[3..19]);
+   408	            pend[slot] = Some(Pend { id, nc, peer: from, t });
+   409	            let mut chk = heapless::String::<64>::new();
+   410	            hex(&who_check(&self.key, &nc, &self.boot_id, id)[..16], &mut chk);
+   411	            let mut h = heapless::String::<160>::new();
+   412	            let _ = core::fmt::write(&mut h, format_args!("nc110 boot {} session {} check {}", self.bid, id, chk));
+   413	            let _ = sock.send_slice(h.as_bytes(), from);
+   414	            return None;
+   415	        }
+   416	        // Frame: [session u32 LE][seq u64 LE][ct][tag]
+   417	        if n < 4 + 8 + 16 {
+   418	            self.bad += 1;
+   419	            return None;
+   420	        }
+   421	        let sid = u32::from_le_bytes(buf[..4].try_into().unwrap());
+   422	        // Authenticated session, or a pending one from the endpoint that asked `who` (promoted below once the frame
+   423	        // authenticates; only then may it evict the least recently used authenticated session).
+   424	        let in_sess = sess.iter().position(|x| x.as_ref().is_some_and(|x| x.id == sid && x.peer == Some(from)));
+   425	        let in_pend = pend.iter().position(|x| x.as_ref().is_some_and(|x| x.id == sid && x.peer == from));
+   426	        let mut cand = None;
+   427	        let se = match (in_sess, in_pend) {
+   428	            (Some(i), _) => sess[i].as_mut().unwrap(),
+   429	            (None, Some(i)) => {
+   430	                let p = pend[i].as_ref().unwrap();
+   431	                cand.insert(Sess { id: p.id, key: session_key(&self.key, &self.boot_id, p.id, &p.nc), last_seq: 0, peer: Some(from), last_t: t, retx: 0, reply: [0; 8 + 1300 + 16], reply_len: 0 })
+   432	            }
+   433	            _ => {
+   434	                self.bad += 1;
+   435	                return None;
+   436	            }
+   437	        };
+   438	        let seq = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+   439	        let (body, tg) = buf[12..n].split_at_mut(n - 12 - 16);
+   440	        if !open(&se.key, &nonce(b"C2K\0", seq), &self.boot_id, body, tg) {
+   441	            self.bad += 1;
+   442	            return None;
+   443	        }
+   444	        if seq == se.last_seq && se.reply_len > 0 {
+   445	            if se.retx >= 5 {
+   446	                return None; // cap resends of one reply
+   447	            }
+   448	            se.retx += 1;
+   449	            self.retx += 1; // retry of the last request: same bytes again (to the bound peer), nothing re-executed
+   450	            let _ = sock.send_slice(&se.reply[..se.reply_len], from);
+   451	            return None;
+   452	        }
+   453	        if seq <= se.last_seq {
+   454	            self.replay += 1;
+   455	            return None;
+   456	        }
+   457	        se.last_seq = seq;
+   458	        se.last_t = t;
+   459	        se.retx = 0;
+   460	        self.last_ok = t;
+   461	        let se = if let (None, Some(i)) = (in_sess, in_pend) {
+   462	            let dst = (0..sess.len()).find(|&j| sess[j].is_none())
+   463	                .unwrap_or_else(|| (0..sess.len()).min_by_key(|&j| sess[j].as_ref().map_or(i64::MIN, |x| x.last_t)).unwrap());
+   464	            pend[i] = None;
+   465	            sess[dst] = cand.take();
+   466	            sess[dst].as_mut().unwrap()
+   467	        } else {
+   468	            se
+   469	        };
+   470	        self.ok += 1;
+   471	        let mut out = [0u8; 1300];
+   472	        let len = {
+   473	            let mut w = Writer { b: &mut out, n: 0 };
+   474	            let loading = |c: &[u8]| c.starts_with(b"ldat") || c.starts_with(b"lbeg") || c.starts_with(b"lcom"); // incl. lcomlinux
+   475	            if self.jump_at.is_some() && loading(body) {
+   476	                // committed: the staged image is frozen until the hop (Codex loader MUST-FIX 2)
+   477	                let _ = core::fmt::write(&mut w, format_args!("err committed, jump pending"));
+   478	            } else if body.len() >= 8 && &body[..4] == b"ldat" {
+   479	                // binary chunk: "ldat" ++ u32 LE offset ++ bytes (checked before the text parser)
+   480	                let off = u32::from_le_bytes(body[4..8].try_into().unwrap()) as u64;
+   481	                let r = match self.stage.as_mut() {
+   482	                    Some(st) => crate::loader::data(st, off, &body[8..]),
+   483	                    None => Err("no lbeg"),
+   484	                };
+   485	                match r {
+   486	                    Ok(got) => { let _ = core::fmt::write(&mut w, format_args!("ok {}", got)); }
+   487	                    Err(e) => { let _ = core::fmt::write(&mut w, format_args!("err {}", e)); }
+   488	                }
+   489	            }
+   490	            let cmd = if w.n > 0 { "" } else { core::str::from_utf8(body).unwrap_or("") };
+   491	            let mut it = cmd.split(' ');
+   492	            match it.next().unwrap_or("") {
+   493	                "" if w.n > 0 => {} // already answered (ldat)
+   494	                "lbeg" => {
+   495	                    let size: u64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+   496	                    match crate::loader::begin(size, it.next().unwrap_or("")) {
+   497	                        Ok(st) => {
+   498	                            self.stage = Some(st);
+   499	                            let _ = core::fmt::write(&mut w, format_args!("ok staging {} B at {:#x}", size, crate::loader::STAGE));
+   500	                        }
+   501	                        Err(e) => { let _ = core::fmt::write(&mut w, format_args!("err {}", e)); }
+   502	                    }
+   503	                }
+   504	                "lcomlinux" => {
+   505	                    let rest = cmd.splitn(2, ' ').nth(1).unwrap_or("");
+   506	                    let r = match self.stage.as_ref() {
+   507	                        Some(st) => crate::loader::prepare_linux(st, rest),
+   508	                        None => Err("no lbeg"),
+   509	                    };
+   510	                    match r {
+   511	                        Ok(p) => {
+   512	                            let _ = core::fmt::write(&mut w, format_args!("ok booting Linux in 300 ms"));
+   513	                            self.jump_at = Some((t + 300, p));
+   514	                        }
+   515	                        Err(e) => { let _ = core::fmt::write(&mut w, format_args!("err {}", e)); }
+   516	                    }
+   517	                }
+   518	                "lcom" => {
+   519	                    let rest = cmd.splitn(2, ' ').nth(1).unwrap_or("");
+   520	                    let r = match self.stage.as_ref() {
+   521	                        Some(st) => crate::loader::prepare(st, rest, &self.seed),
+   522	                        None => Err("no lbeg"),
+   523	                    };
+   524	                    match r {
+   525	                        Ok(p) => {
+   526	                            let _ = core::fmt::write(&mut w, format_args!("ok jumping in 300 ms"));
+   527	                            self.jump_at = Some((t + 300, p)); // the reply leaves first, then the hop
+   528	                        }
+   529	                        Err(e) => { let _ = core::fmt::write(&mut w, format_args!("err {}", e)); }
+   530	                    }
+   531	                }
+   532	                "ping" => {
+   533	                    let _ = core::fmt::write(&mut w, format_args!("pong uptime_ms={} ip={}", t, self.ip));
+   534	                }
+   535	                "stats" => {
+   350	                    }
+   351	                    if st & (1 << 23) != 0 {
+   352	                        active = true;
+   353	                        break;
+   354	                    }
+   355	                    let a = st & 0x7FF;
+   356	                    let a = if a == 0x7FF { 0 } else { a as usize + 1 };
+   357	                    got += a;
+   358	                    done_toggles += 1;
+   359	                    if inp && a < mps as usize {
+   360	                        break; // short packet ends the transfer
+   361	                    }
+   362	                }
+   363	                if !active {
+   364	                    if res.is_ok() || res == Err("timeout") {
+   365	                        d.eps[e].2 = ((d.eps[e].2 as u32 + done_toggles) & 1) as u8;
+   366	                        res = Ok(got);
+   367	                    }
+   368	                    break;
+   369	                }
+   370	            }
+   371	            write_volatile(&mut qh.0[1], 1);
+   372	            self.w16(0, 0);
+   373	            res
+   374	        }
+   375	    }
+   376	}
+   377	
+   378	/// bmctl `usb ctl <dev> <setup: 16 hex> [len]`, `usb in <dev> <ep hex> <len>`, `usb out <dev> <ep hex> <data hex>`.
+   379	pub fn cmd<'a>(w: &mut dyn Write, it: &mut impl Iterator<Item = &'a str>, sub: &str) {
+   380	    let devs = unsafe { &mut *core::ptr::addr_of_mut!(DEVS) };
+   381	    let Some(d) = it.next().and_then(|x| x.parse::<usize>().ok()).and_then(|i| devs.get_mut(i)).and_then(|x| x.as_mut()) else {
+   382	        let _ = write!(w, "err no such device (run usb first)");
+   383	        return;
+   384	    };
+   385	    let hex = |s: &str, out: &mut [u8]| -> Option<usize> {
+   386	        if s.len() % 2 != 0 || s.len() / 2 > out.len() || !s.bytes().all(|c| c.is_ascii_hexdigit()) {
+   387	            return None;
+   388	        }
+   389	        for i in 0..s.len() / 2 {
+   390	            out[i] = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+   391	        }
+   392	        Some(s.len() / 2)
+   393	    };
+   394	    let h = Uhci(d.io);
+   395	    let r = match sub {
+   396	        "ctl" => {
+   397	            let mut st = [0u8; 8];
+   398	            match it.next().and_then(|x| hex(x, &mut st)) {
+   399	                Some(8) => {
+   400	                    let len = it.next().and_then(|x| x.parse::<u16>().ok()).unwrap_or(u16::from_le_bytes([st[6], st[7]]));
+   401	                    h.start();
+   402	                    let r = h.control(d.addr, d.mps0, d.ls, st, len.min(512));
+   403	                    h.w16(0, 0);
+   404	                    r
+   405	                }
+   406	                _ => Err("setup must be 16 hex digits"),
+   407	            }
+   408	        }
+   409	        "in" => match it.next().and_then(|x| u8::from_str_radix(x, 16).ok()) {
+   410	            Some(ep) => h.data(d, ep | 0x80, &[], it.next().and_then(|x| x.parse().ok()).unwrap_or(64)),
+   411	            None => Err("ep"),
+   412	        },
+   413	        "out" => {
+   414	            let ep = it.next().and_then(|x| u8::from_str_radix(x, 16).ok());
+   415	            let mut b = [0u8; 512];
+   416	            match (ep, it.next().and_then(|x| hex(x, &mut b))) {
+   417	                (Some(ep), Some(n)) => h.data(d, ep & 0x7F, &b[..n], 0).map(|_| 0),
+   418	                _ => Err("ep / data hex"),
+   419	            }
+   420	        }
+   421	        _ => Err("usb [ctl|in|out]"),
+   422	    };
+   423	    match r {
+   424	        Ok(n) => {
+   425	            let _ = write!(w, "ok {}:", n);
+   426	            for b in &buf()[..n.min(512)] {
+   427	                let _ = write!(w, " {:02x}", b);
+   428	            }
+   429	        }
+   430	        Err(e) => {
+   431	            let _ = write!(w, "err {}", e);
+   432	        }
+   433	    }
+   434	}
+#!/usr/bin/env python3
+"""q35 check of the generic USB primitives over bmctl: `usb` enumerates a UHCI usb-kbd into dev 0, `usb ctl` reads its
+device descriptor again, `usb in` reads a HID report off the interrupt endpoint after a QMP key press (data toggle
+carried across two transfers), and a bad endpoint errors cleanly. Exit 1 on any failure."""
+import json, os, socket, subprocess, sys, time
+L, sock = "/tmp/usb-q35.log", f"/tmp/usb-q35-{os.getpid()}.qmp"
+if os.path.exists(L): os.unlink(L)
+env = dict(os.environ, NC110_KEY="test-keys/client.key")
+q = subprocess.Popen(["qemu-system-x86_64", "-machine", "q35", "-m", "128", "-display", "none", "-no-reboot",
+    "-global", "ICH9-LPC.noreboot=false", "-serial", f"file:{L}", "-qmp", f"unix:{sock},server=on,wait=off",
+    "-kernel", "target/attended/x86_64-unknown-none/release/nc110-kernel", "-initrd", "test-keys/client.key",
+    "-append", "bmctl nic=mmio", "-netdev", "user,id=n0,hostfwd=udp:127.0.0.1:15516-:5515", "-device", "rtl8139,netdev=n0",
+    "-device", "ich9-usb-uhci1,id=u", "-device", "usb-kbd,bus=u.0"])
+fail = 0
+def check(ok, what):
+    global fail
+    print(("ok   " if ok else "FAIL ") + what); fail |= not ok
+def bm(*a):
+    return subprocess.run(["tools/.venv/bin/python", "tools/bmctl.py", "--host", "127.0.0.1", "--port", "15516", *a],
+        capture_output=True, text=True, env=env, timeout=30).stdout.strip()
+for _ in range(80):
+    if os.path.exists(L) and "bmctl: listening" in open(L, errors="replace").read(): break
+    time.sleep(0.5)
+s = socket.socket(socket.AF_UNIX); s.connect(sock); f = s.makefile("rw"); f.readline()
+def qmp(c):
+    f.write(json.dumps(c) + "\n"); f.flush()
+    while True:
+        r = json.loads(f.readline())
+        if "return" in r or "error" in r: return r
+qmp({"execute": "qmp_capabilities"})
+r = bm("usb"); print(r)
+check("0627:0001" in r and "-> dev 0" in r, "usb-kbd enumerated as dev 0")
+r = bm("usb", "ctl", "0", "8006000100001200"); print("ctl:", r)
+check(r.startswith("ok 18:") and "27 06 01 00" in r, "usb ctl GET_DESCRIPTOR(device) returns 18 bytes with VID:PID")
+def key(k, down): qmp({"execute": "input-send-event", "arguments": {"events": [{"type": "key", "data": {"down": down, "key": {"type": "qcode", "data": k}}}]}})
+key("a", True); time.sleep(0.2)
+r = bm("usb", "in", "0", "81", "8"); print("in 1:", r)
+check(r.startswith("ok 8:") and " 04" in r, "usb in 81: HID report with usage 0x04 ('a') after a key press")
+key("a", False); time.sleep(0.2)
+r = bm("usb", "in", "0", "81", "8"); print("in 2:", r)
+check(r == "ok 8: 00 00 00 00 00 00 00 00", "second usb in: key-up report (QEMU UHCI does not check toggles; real hardware will)")
+r = bm("usb", "in", "0", "82", "8"); print("bad ep:", r)
+check(r.startswith("err"), "unknown endpoint errors")
+r = bm("usb", "out", "0", "01", "\u20ac0"); print("non-ASCII hex:", r)
+check(r.startswith("err"), "usb out with non-ASCII hex is refused, no panic (review 1021)")
+r = bm("ping"); check(r.startswith("pong"), "kernel still serving bmctl: " + r)
+q.kill()
+if os.path.exists(sock): os.unlink(sock)
+print("RESULT:", "PASS" if not fail else "FAIL"); sys.exit(fail)
+[package]
+name = "nc110-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+neg-control = []
+grub-armed = []
+attended = []  # NC110 with evnchn at the machine: no watchdog gate (the TCO hangs this board instead of resetting it), 0xCF9 reset after 60 s
+badpin = []  # negative control: flip one bit of the pinned host key
+badjitter = []  # negative control: constant TSC in the jitter source, startup health test must refuse SSH
+
+[dependencies]
+# M2: pinned exact versions (Cargo.lock is committed too).
+sunset = { version = "=0.6.0", default-features = false }
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-tcp", "socket-dhcpv4", "socket-udp"] }
+getrandom = { version = "0.4", default-features = false }
+log = "0.4"
+heapless = { version = "=0.9.3", default-features = false }  # M3: sunset::Pty.term is a heapless::String
+sha2 = { version = "=0.11.1", default-features = false }
+chacha20 = { version = "=0.9.1", default-features = false }  # bmctl AEAD (RFC 8439), same versions sunset already pulls in
+poly1305 = { version = "=0.9.1", default-features = false }
+
+[[bin]]
+name = "nc110-kernel"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+exec
+/bin/zsh -lc "rg -n 'next_sess|who_count|fn now|timestamp|fn poll|recv|handle|last_seq' src/bmctl.rs tools/bmctl.py; rg -n 'bmctl|dos-q35|pin-q35' .cargo/config.toml Makefile tools/*sh" in ~/nc110-baremetal
+ exited 2 in 0ms:
+tools/bmctl.py:42:                s.recvfrom(2048)
+tools/bmctl.py:50:                d, src = s.recvfrom(2048)
+src/bmctl.rs:45:fn now() -> Instant {
+src/bmctl.rs:127:    last_seq: u64,
+src/bmctl.rs:214:/// bmctl's per-boot state, so the same command handler runs in its own loop (`serve`) or inside the SSH loop.
+src/bmctl.rs:231:    next_sess: u32,
+src/bmctl.rs:233:    who_count: u32,
+src/bmctl.rs:317:            ok: 0, bad: 0, replay: 0, retx: 0, next_sess: 1, who_window: 0, who_count: 0, reboot_at: None, sleep_at: None, stage: None, jump_at: None,
+src/bmctl.rs:389:        let Ok((n, meta)) = sock.recv_slice(&mut buf) else { return None };
+src/bmctl.rs:393:                (self.who_window, self.who_count) = (t, 0);
+src/bmctl.rs:395:            self.who_count += 1;
+src/bmctl.rs:398:            if self.who_count > 1000 {
+src/bmctl.rs:403:            let (Some(slot), Some(next)) = (slot, self.next_sess.checked_add(1)) else { return None };
+src/bmctl.rs:404:            let id = self.next_sess;
+src/bmctl.rs:405:            self.next_sess = next;
+src/bmctl.rs:431:                cand.insert(Sess { id: p.id, key: session_key(&self.key, &self.boot_id, p.id, &p.nc), last_seq: 0, peer: Some(from), last_t: t, retx: 0, reply: [0; 8 + 1300 + 16], reply_len: 0 })
+src/bmctl.rs:444:        if seq == se.last_seq && se.reply_len > 0 {
+src/bmctl.rs:453:        if seq <= se.last_seq {
+src/bmctl.rs:457:        se.last_seq = seq;
+src/bmctl.rs:536:                    let _ = core::fmt::write(&mut w, format_args!("ok={} bad={} replay={} retx={} sessions_issued={} log_bytes={}", self.ok, self.bad, self.replay, self.retx, self.next_sess - 1, console::captured().len()));
+rg: Makefile: No such file or directory (os error 2)
+tools/ssh-bmctl-q35-test.sh:2:# q35 check of `bmctl ssh` (attended): bmctl answers WHILE the SSH shell is open, keeps serving after it closes, and
+tools/ssh-bmctl-q35-test.sh:7:B="$P tools/bmctl.py --host 127.0.0.1 --port 15515"
+tools/ssh-bmctl-q35-test.sh:11:    -kernel $K -initrd test-keys/client.key -append "bmctl ssh nic=mmio $1" -netdev user,id=n0,hostfwd=udp:127.0.0.1:15515-:5515 \
+tools/ssh-bmctl-q35-test.sh:25:r=$($B ping 2>&1); case "$r" in pong*) ok "bmctl ping while the shell is open: $r";; *) bad "ping during session: $r";; esac
+tools/ssh-bmctl-q35-test.sh:29:r=$($B ping 2>&1); case "$r" in pong*) ok "bmctl ping after the session closed: $r";; *) bad "ping after session: $r";; esac
+tools/ssh-bmctl-q35-test.sh:30:r=$($B logall 2>&1 | grep -c 'home: menu up'); [ "$r" -ge 1 ] && ok "bmctl log carries the session end" || bad "log lacks session end"
+tools/ssh-bmctl-q35-test.sh:32:kill -0 $Q 2>/dev/null && bad "qemu still running after bmctl reboot" || ok "bmctl reboot -> reset"
+tools/ssh-bmctl-q35-test.sh:34:echo "== run 2: idle=15, no bmctl traffic: the open session must end via the bmctl idle bound"
+tools/ssh-bmctl-q35-test.sh:37:waitfor 'bmctl: idle 15 s -> reset' 30 && ok "idle bound fired during the open session"
+tools/nc110-soak.sh:2:# Soak the NC110 agent OS: every 3 min an authenticated ping + stats over bmctl (also keeps the 10-min idle reset
+tools/nc110-soak.sh:6:LOG=proof/nc110-soak.log; B="tools/.venv/bin/python tools/bmctl.py"
+tools/nc110-install-agentos.sh:59:    if multiboot /baremetal/$KN bmctl grubtsc=\${nc110_tsc0},\${nc110_tsc1}; then
+tools/nc110-demo-nolinux.sh:10:B="tools/.venv/bin/python tools/bmctl.py"
+tools/nc110-demo-nolinux.sh:18:  $B load $K bmctl demo=$n || exit 1
+tools/bmctl-q35-test.sh:2:# q35 check of bmctl: positive path + wrong key + replay + tamper + other-boot + retry cache. Exit 1 on any failure.
+tools/bmctl-q35-test.sh:5:qemu-system-x86_64 -machine q35 -m 128 -display none -no-reboot -global ICH9-LPC.noreboot=false -serial file:/tmp/bmctl-q35.log \
+tools/bmctl-q35-test.sh:6:  -kernel $K -initrd test-keys/client.key -append "bmctl nic=mmio" -netdev user,id=n0,hostfwd=udp:127.0.0.1:15515-:5515 -device rtl8139,netdev=n0 &
+tools/bmctl-q35-test.sh:8:for i in $(seq 40); do grep -q 'bmctl: listening' /tmp/bmctl-q35.log 2>/dev/null && break; sleep 0.5; done
+tools/bmctl-q35-test.sh:9:B="$P tools/bmctl.py --host 127.0.0.1 --port 15515"
+tools/bmctl-q35-test.sh:11:head -c 72 /dev/urandom > /tmp/bmctl-badkey.bin
+tools/bmctl-q35-test.sh:12:r=$($B --key /tmp/bmctl-badkey.bin ping 2>&1); echo "2 bad key: $r"; case "$r" in *"failed its check"*) ;; *) fail=1;; esac
+tools/bmctl-q35-test.sh:16:km = open("test-keys/client.key", "rb").read(); master = hashlib.sha256(b"nc110-bmctl-v1" + km[8:40]).digest()
+tools/bmctl-q35-test.sh:22:    return ChaCha20Poly1305(hashlib.sha256(b"nc110-bmctl-v1 session" + master + boot + struct.pack("<I", sid) + nc).digest())
+tools/loader-q35-test.sh:14:  -kernel $K -initrd test-keys/client.key -append "bmctl gen=1" -netdev user,id=n0,hostfwd=udp:127.0.0.1:15515-:5515 -device rtl8139,netdev=n0 &
+tools/loader-q35-test.sh:16:for i in $(seq 40); do grep -q 'bmctl: listening' /tmp/loader-q35.log 2>/dev/null && break; sleep 0.5; done
+tools/loader-q35-test.sh:17:B="$P tools/bmctl.py --host 127.0.0.1 --port 15515"
+tools/loader-q35-test.sh:18:neg() { r=$(env $2 $B load $3 bmctl x 2>&1 | grep -E 'err|jumping' | tail -1); alive=$($B ping 2>&1)
+tools/loader-q35-test.sh:27:  r=$($B load $K bmctl gen=$g 2>&1 | tail -1); l=$($B logall | grep -c "cmdline: bmctl gen=$g")
+tools/loader-q35-test.sh:36:  -kernel $K -initrd test-keys/client.key -append "bmctl idle=10" -netdev user,id=n0,hostfwd=udp:127.0.0.1:15515-:5515 -device rtl8139,netdev=n0 &
+tools/loader-q35-test.sh:38:for i in $(seq 40); do grep -q 'bmctl: listening' /tmp/loader-q35-stall.log 2>/dev/null && break; sleep 0.5; done
+tools/loader-q35-test.sh:40:t0=$(date +%s); ab=$(BMCTL_TEST_SEND=300000 BMCTL_TEST_ABANDON=1 $B load $K bmctl x 2>&1)
+tools/loader-q35-test.sh:45:elif grep -q 'bmctl: idle 10 s -> reset' /tmp/loader-q35-stall.log && grep -q 'hard reset via 0xCF9' /tmp/loader-q35-stall.log; then
+tools/nc110-to-linux.sh:14:tools/.venv/bin/python tools/bmctl.py linux "$BZ" root=/dev/sda2 ro rootfstype=ext4 rootwait console=tty0 watchdog.open_timeout=300 nc110.lease=600 || exit 1
+tools/nc110-kick.sh:5:#   tools/.venv/bin/python tools/bmctl.py load <kernel.elf> bmctl [args]   # new build, in RAM, nothing on /boot
+tools/nc110-kick.sh:6:#   tools/.venv/bin/python tools/bmctl.py ping|logall|peek ...|reboot      # reboot = back to Slot A Linux
+tools/nc110-kick.sh:23:  r=$(tools/.venv/bin/python tools/bmctl.py ping 2>/dev/null) && { echo "netloader up: $r"; exit 0; }
+
+exec
+/bin/zsh -lc "sed -n '438,471p;672,700p' src/bmctl.rs; cat src/time.rs; cat tools/bmctl-q35-test.sh; sed -n '1,105p' tools/bmctl.py; cat .cargo/config.toml" in ~/nc110-baremetal
+ succeeded in 0ms:
+        let seq = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+        let (body, tg) = buf[12..n].split_at_mut(n - 12 - 16);
+        if !open(&se.key, &nonce(b"C2K\0", seq), &self.boot_id, body, tg) {
+            self.bad += 1;
+            return None;
+        }
+        if seq == se.last_seq && se.reply_len > 0 {
+            if se.retx >= 5 {
+                return None; // cap resends of one reply
+            }
+            se.retx += 1;
+            self.retx += 1; // retry of the last request: same bytes again (to the bound peer), nothing re-executed
+            let _ = sock.send_slice(&se.reply[..se.reply_len], from);
+            return None;
+        }
+        if seq <= se.last_seq {
+            self.replay += 1;
+            return None;
+        }
+        se.last_seq = seq;
+        se.last_t = t;
+        se.retx = 0;
+        self.last_ok = t;
+        let se = if let (None, Some(i)) = (in_sess, in_pend) {
+            let dst = (0..sess.len()).find(|&j| sess[j].is_none())
+                .unwrap_or_else(|| (0..sess.len()).min_by_key(|&j| sess[j].as_ref().map_or(i64::MIN, |x| x.last_t)).unwrap());
+            pend[i] = None;
+            sess[dst] = cand.take();
+            sess[dst].as_mut().unwrap()
+        } else {
+            se
+        };
+        self.ok += 1;
+        let mut out = [0u8; 1300];
+                _ => {
+                    let _ = core::fmt::write(&mut w, format_args!("err unknown command (ping|stats|log <off>|peek ...|rng <n>|rec <ms>|aud [off]|type <text>|say <text>|key <text>|host list/set/del|gma|mouse|lbeg|ldat|lcom|lcomlinux|reboot)"));
+                }
+            }
+            w.n
+        };
+        let pkt = &mut se.reply;
+        pkt[..8].copy_from_slice(&seq.to_le_bytes());
+        pkt[8..8 + len].copy_from_slice(&out[..len]);
+        let tg = seal(&se.key, &nonce(b"K2C\0", seq), &self.boot_id, &mut pkt[8..8 + len]);
+        pkt[8 + len..8 + len + 16].copy_from_slice(&tg);
+        se.reply_len = 8 + len + 16;
+        let _ = sock.send_slice(&se.reply[..se.reply_len], from);
+        None
+    }
+}
+
+struct Writer<'a> {
+    b: &'a mut [u8],
+    n: usize,
+}
+impl Writer<'_> {
+    fn put(&mut self, s: &[u8]) {
+        let k = s.len().min(self.b.len() - self.n);
+        self.b[self.n..self.n + k].copy_from_slice(&s[..k]);
+        self.n += k;
+    }
+}
+impl core::fmt::Write for Writer<'_> {
+//! Monotonic milliseconds from the TSC, calibrated once against PIT channel 2 (gate via port 0x61).
+use crate::port::{inb, outb, rdtsc};
+
+static mut TSC_PER_MS: u64 = 1_000_000; // fallback guess (1 GHz) if calibration fails
+static mut T0: u64 = 0;
+
+pub fn init() -> u64 {
+    unsafe {
+        // PIT ch2, mode 0, lobyte/hibyte, count for 10 ms at 1.193182 MHz.
+        const COUNT: u16 = 11932;
+        let g = inb(0x61);
+        outb(0x61, (g & 0xFD) | 0x01); // gate on, speaker off
+        outb(0x43, 0b1011_0000);
+        outb(0x42, COUNT as u8);
+        outb(0x42, (COUNT >> 8) as u8);
+        // Re-trigger: toggle gate low->high so mode 0 starts counting now.
+        let g = inb(0x61);
+        outb(0x61, g & 0xFE);
+        outb(0x61, g | 0x01);
+        let a = rdtsc();
+        let mut spins: u64 = 0;
+        while inb(0x61) & 0x20 == 0 && spins < 200_000_000 {
+            spins += 1;
+        }
+        let b = rdtsc();
+        if spins < 200_000_000 && b > a {
+            TSC_PER_MS = ((b - a) / 10).max(1);
+        }
+        T0 = rdtsc();
+        TSC_PER_MS
+    }
+}
+
+/// ms the TSC had counted when `init` ran: time since the last CPU reset (firmware + GRUB + our early boot),
+/// since a hard reset zeroes the TSC; after an in-RAM chain-load it also includes the previous kernel's run.
+pub fn since_reset_ms() -> u64 {
+    unsafe { T0 / TSC_PER_MS }
+}
+
+pub fn tsc_to_ms(t: u64) -> u64 {
+    unsafe { t / TSC_PER_MS }
+}
+
+pub fn ready() -> bool {
+    unsafe { T0 != 0 }
+}
+
+pub fn now_ms() -> i64 {
+    unsafe { ((rdtsc() - T0) / TSC_PER_MS) as i64 }
+}
+
+/// Busy-wait at least `us` microseconds (TSC, after init()).
+pub fn delay_us(us: u64) {
+    unsafe {
+        let t = rdtsc();
+        let n = us * TSC_PER_MS / 1000 + 1;
+        while rdtsc().wrapping_sub(t) < n {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// CMOS RTC hours and minutes (the NC110's RTC keeps local time: Linux there labels HKT as UTC). Waits out an update in
+/// progress (bounded), handles BCD and 12-hour formats. None if the RTC never settles.
+pub fn rtc_hm() -> Option<(u8, u8)> {
+    use crate::port::{inb, outb};
+    let rd = |r: u8| unsafe {
+        outb(0x70, r);
+        inb(0x71)
+    };
+    for _ in 0..1000 {
+        if rd(0x0A) & 0x80 == 0 {
+            let (m, h, b) = (rd(0x02), rd(0x04), rd(0x0B));
+            let bcd = |v: u8| if b & 0x04 == 0 { (v & 0x0F) + (v >> 4) * 10 } else { v };
+            let pm = h & 0x80 != 0;
+            let mut hh = bcd(h & 0x7F);
+            if b & 0x02 == 0 {
+                hh = hh % 12 + if pm { 12 } else { 0 };
+            }
+            return Some((hh, bcd(m)));
+        }
+    }
+    None
+}
+#!/bin/sh
+# q35 check of bmctl: positive path + wrong key + replay + tamper + other-boot + retry cache. Exit 1 on any failure.
+export NC110_KEY=test-keys/client.key  # q35 kernels get the test key module; the default is the agent-OS key
+K=target/attended/x86_64-unknown-none/release/nc110-kernel; P=tools/.venv/bin/python; fail=0
+qemu-system-x86_64 -machine q35 -m 128 -display none -no-reboot -global ICH9-LPC.noreboot=false -serial file:/tmp/bmctl-q35.log \
+  -kernel $K -initrd test-keys/client.key -append "bmctl nic=mmio" -netdev user,id=n0,hostfwd=udp:127.0.0.1:15515-:5515 -device rtl8139,netdev=n0 &
+Q=$!; trap 'kill $Q 2>/dev/null' EXIT
+for i in $(seq 40); do grep -q 'bmctl: listening' /tmp/bmctl-q35.log 2>/dev/null && break; sleep 0.5; done
+B="$P tools/bmctl.py --host 127.0.0.1 --port 15515"
+r=$($B ping); echo "1 ping:    $r"; case "$r" in pong*) ;; *) fail=1;; esac
+head -c 72 /dev/urandom > /tmp/bmctl-badkey.bin
+r=$($B --key /tmp/bmctl-badkey.bin ping 2>&1); echo "2 bad key: $r"; case "$r" in *"failed its check"*) ;; *) fail=1;; esac
+$P - <<'PY' || fail=1
+import hashlib, os, socket, struct, sys
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+km = open("test-keys/client.key", "rb").read(); master = hashlib.sha256(b"nc110-bmctl-v1" + km[8:40]).digest()
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.5); ep = ("127.0.0.1", 15515)
+def who():
+    nc = os.urandom(16); s.sendto(b"who" + nc, ep); w = s.recvfrom(256)[0].split()
+    return nc, bytes.fromhex(w[2].decode()), int(w[4])
+def aead_for(nc, boot, sid):
+    return ChaCha20Poly1305(hashlib.sha256(b"nc110-bmctl-v1 session" + master + boot + struct.pack("<I", sid) + nc).digest())
+nc, boot, sid = who(); a = aead_for(nc, boot, sid)
+def frame(seq, msg=b"ping", aead=a, bid=boot, sess=sid):
+    return struct.pack("<IQ", sess, seq) + aead.encrypt(b"C2K\0" + struct.pack("<Q", seq), msg, bid)
+bad = 0
+s.sendto(frame(1), ep); r1 = s.recvfrom(2048)[0]
+s.sendto(frame(1), ep); r2 = s.recvfrom(2048)[0]
+print(("ok  " if r1 == r2 else "FAIL") + " 3 retry of seq 1 -> identical cached reply"); bad |= r1 != r2
+s.sendto(frame(2), ep); s.recvfrom(2048)
+def silent(p, what):
+    s.sendto(p, ep)
+    try: s.recvfrom(2048); print(f"FAIL {what}: got a reply"); return 1
+    except socket.timeout: print(f"ok   {what}: no reply"); return 0
+bad |= silent(frame(1), "4 replay of an older accepted seq")
+t = bytearray(frame(3)); t[14] ^= 1; bad |= silent(bytes(t), "5 tampered ciphertext")
+bad |= silent(frame(4, bid=b"\0" * 16), "6 frame for another boot id")
+bad |= silent(frame(5, sess=sid + 1000), "7 unknown session")
+# 8: a replayed who reply (old boot+session) with a FRESH client nonce gives a different key: frames are rejected,
+# so a replayed reply can never make two runs share (key, nonce).
+bad |= silent(frame(6, aead=aead_for(os.urandom(16), boot, sid)), "8 key from a replayed who reply + new Nc")
+# 9: flood of who must not evict the live authenticated session
+for _ in range(40):
+    try: who()
+    except socket.timeout: pass
+s.sendto(frame(7), ep)
+try: s.recvfrom(2048); print("ok   9 live session survives a who flood")
+except socket.timeout: print("FAIL 9 live session evicted by who flood"); bad = 1
+sys.exit(bad)
+PY
+chk() { r=$($B $2); rc=$?; echo "$1: $r"; [ $rc = 0 ] || { echo "   ^ FAIL (client exit $rc)"; fail=1; }; case "$r" in $3) ;; *) echo "   ^ FAIL (want $3)"; fail=1;; esac; }
+chk "p1 mem BIOS data area" "peek mem 0x400 16"        "????????????????????????????????"
+printf '%s' "$r" | grep -Eqx '[0-9a-f]{32}' || { echo "   ^ FAIL (not 32 hex chars)"; fail=1; }
+chk "p2 mem kernel image"   "peek mem 0x100000 16"     "err refused: kernel image*"
+chk "p2b mem straddles image start" "peek mem 0xffff8 16" "err refused: kernel image*"
+chk "p3 mem LAPIC (not RAM)" "peek mem 0xfee00000 4"   "err refused: not inside*"
+chk "p3b mem 4 GiB boundary" "peek mem 0xfffffff8 16"  "err refused: not inside*"
+chk "p4 mem len too big"    "peek mem 0x400 4096"      "err len*"
+chk "p4b mem len zero"      "peek mem 0x400 0"         "err len*"
+chk "p5 mem wraps"          "peek mem 0xffffffffffffffff 16" "err overflow"
+chk "p6 nic regs 0..8"      "peek nic 0x0 8"           "12005452 00005634 "
+chk "p7 nic past window"    "peek nic 0xfc 8"          "err nic*"
+chk "p7b nic misaligned"    "peek nic 0x2 4"           "err nic*"
+chk "p8 io TCO1_CNT"        "peek io 0x668 2"          "0x*"
+chk "p8b io TCO1_CNT wrong width" "peek io 0x668 4"    "err io*"
+chk "p9 io i8042 data"      "peek io 0x60 1"           "err io*"
+chk "p9b io LV2 (C2 entry)" "peek io 0x614 1"          "err io*"
+chk "p9c io wrap"           "peek io 0xffffffffffffffff 1" "err io*"
+r=$($B stats); echo "8 stats:   $r"
+r=$($B logall | grep -c .); echo "9 log:     $r lines"; [ "$r" -gt 5 ] || fail=1
+r=$($B sleep 2); echo "9b sleep: $r"; case "$r" in "err sleep disabled"*) ;; *) fail=1;; esac
+echo "10 reboot: $($B reboot)"; sleep 2
+if kill -0 $Q 2>/dev/null; then echo "FAIL qemu still running after reboot"; fail=1; else echo "ok   qemu exited after reboot"; fi
+echo "RESULT: $([ $fail = 0 ] && echo PASS || echo FAIL)"; exit $fail
+#!/usr/bin/env python3
+"""bmctl client for the NC110 kernel's authenticated UDP control port (see src/bmctl.rs).
+
+Usage: tools/.venv/bin/python tools/bmctl.py [--host 192.168.50.120] [--key test-keys/client.key] <command...>
+  commands: ping | stats | log [offset] | logall | peek ... | reboot | rng <total> <outfile>  (raw jitter samples)
+            rec <ms> | aud | audget <out.wav>  (internal-mic clip, cmdline hda; 16 kHz mono)
+            linux <bzImage> [cmdline...]     stage an i386 Linux bzImage and boot it (32-bit protocol, no initrd):
+                                             the remote route back to Slot A Linux, e.g. root=/dev/sda2 rootwait
+            load <kernel.elf> [cmdline...]   stage over the network, verify, chain-load in RAM (nothing on /boot),
+                                             then wait for the new kernel's bmctl (new boot id) and print its ping
+The key file is the same 72-byte multiboot key module the kernel gets (magic 8 + ed25519 seed 32 + pub 32);
+master = SHA-256("nc110-bmctl-v1" + seed). Handshake: send "who" + fresh random 16-byte Nc; the reply carries boot id,
+session and check = SHA-256("nc110-bmctl-v1 who" + master + Nc + boot + session)[:16], verified here; traffic key =
+SHA-256("nc110-bmctl-v1 session" + master + boot + session_u32_le + Nc); seq counts from 1 per session. Uses the `cryptography` package's ChaCha20Poly1305,
+an implementation independent of the kernel's, so agreement is a real interop check.
+"""
+import argparse, hashlib, hmac, os, socket, struct, sys, time
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--host", default="192.168.50.120")
+ap.add_argument("--port", type=int, default=5515)
+_ak = os.path.expanduser("~/.nc110/agentos.key")  # the agent OS key (outside the repo); test key otherwise
+ap.add_argument("--key", default=os.environ.get("NC110_KEY") or (_ak if os.path.exists(_ak) else "test-keys/client.key"))
+ap.add_argument("cmd", nargs="+")
+a = ap.parse_args()
+km = open(a.key, "rb").read()
+assert len(km) == 72, "key module must be 72 bytes"
+master = hashlib.sha256(b"nc110-bmctl-v1" + km[8:40]).digest()
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+
+def rpc(raw, want=lambda d: True):
+    """Send `raw`, return the first reply from the target that `want` accepts. Stale datagrams (late answers to
+    an earlier timed-out attempt) are drained before sending and skipped while waiting, so a resend can never
+    leave the client one reply behind."""
+    host = socket.gethostbyname(a.host)
+    for _ in range(3):  # a retry of the same frame gets the kernel's cached reply, nothing runs twice
+        s.setblocking(False)
+        try:
+            while True:
+                s.recvfrom(2048)
+        except (BlockingIOError, OSError):
+            pass
+        s.settimeout(TIMEOUT[0])
+        s.sendto(raw, (a.host, a.port))
+        end = time.monotonic() + TIMEOUT[0]
+        try:
+            while time.monotonic() < end:
+                d, src = s.recvfrom(2048)
+                if src[0] == host and want(d):
+                    return d
+        except socket.timeout:
+            continue
+    sys.exit(f"no reply from {a.host}:{a.port}")
+
+
+TIMEOUT = [2.0]
+
+
+def handshake():
+    """Authenticated session setup; returns (aead, boot_id, session). Exits on a bad/forged reply."""
+    nc = os.urandom(16)
+    who = rpc(b"who" + nc, lambda d: d.startswith(b"nc110 boot ")).decode().split()
+    if len(who) != 7 or who[:2] != ["nc110", "boot"] or who[3] != "session" or who[5] != "check" or len(who[2]) != 32:
+        sys.exit(f"bad who reply: {who}")
+    bid, sess = bytes.fromhex(who[2]), int(who[4])
+    want = hashlib.sha256(b"nc110-bmctl-v1 who" + master + nc + bid + struct.pack("<I", sess)).digest()[:16]
+    if not hmac.compare_digest(want, bytes.fromhex(who[6])):
+        sys.exit("who reply failed its check (wrong key, or a forged/replayed reply)")
+    k = hashlib.sha256(b"nc110-bmctl-v1 session" + master + bid + struct.pack("<I", sess) + nc).digest()
+    return ChaCha20Poly1305(k), bid, sess
+
+
+aead, boot, sid = handshake()
+SEQ = [0]
+
+
+def call(cmd):
+    return call_raw(cmd.encode())
+
+
+def call_raw(body):
+    SEQ[0] += 1  # per-session counter from 1; a fresh session per run, so (key, nonce) never repeats
+    seq = SEQ[0]
+    ct = aead.encrypt(b"C2K\0" + struct.pack("<Q", seq), body, boot)
+    r = rpc(struct.pack("<IQ", sid, seq) + ct, lambda d: len(d) >= 24 and d[:8] == struct.pack("<Q", seq))
+    rseq = struct.unpack("<Q", r[:8])[0]
+    if rseq != seq:
+        sys.exit(f"reply seq {rseq} != {seq}")
+    return aead.decrypt(b"K2C\0" + struct.pack("<Q", seq), r[8:], boot)
+
+
+cmd = " ".join(a.cmd)
+if a.cmd[0] in ("load", "linux"):
+    img = open(a.cmd[1], "rb").read()
+    cl = " ".join(a.cmd[2:])
+    sha = os.environ.get("BMCTL_TEST_SHA") or hashlib.sha256(img).hexdigest()  # test hooks: wrong digest,
+    if os.environ.get("BMCTL_TEST_SEND"):                                      # truncated send,
+        img_send = img[: int(os.environ["BMCTL_TEST_SEND"])]
+    else:
+        img_send = img
+    r = call(f"lbeg {len(img)} {sha}").decode()
+    print(r)
+    if not r.startswith("ok"):
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = ["-C", "relocation-model=static", "-C", "link-arg=-zmax-page-size=0x1000", "--cfg", "getrandom_backend=\"custom\"",
+    # soft-float target: SIMD crypto backends make rustc/LLVM abort (SIGTRAP), force portable ones
+    "--cfg", "curve25519_dalek_backend=\"serial\"", "--cfg", "poly1305_backend=\"soft\"", "--cfg", "chacha20_force_soft", "--cfg", "aes_backend=\"soft\"", "--cfg", "sha2_backend=\"soft\""]
+
+codex
+The promotion path appears sound: authentication and replay checks happen before the pending entry is removed, and the candidate’s sequence state moves into the authenticated table. The main gaps are in validation: the flood test doesn’t assert its achieved load, and none of the three tests directly checks a forged first frame followed by a valid promotion.
+exec
+/bin/zsh -lc "nl -ba tools/dos-q35-test.py | tail -38; nl -ba tools/pin-q35-test.py | tail -22; rg -n 'Ctl::new|Ctl::|\\.step\\(' src/main.rs src/bmctl.rs src/ssh.rs; rg -n 'stack|STACK' src/boot* linker*; git diff -- src/bmctl.rs src/usb.rs" in ~/nc110-baremetal
+ succeeded in 0ms:
+    52	    return False
+    53	
+    54	
+    55	stop = threading.Event()
+    56	sent = [0]
+    57	
+    58	
+    59	def flood():
+    60	    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setblocking(False)
+    61	    while not stop.is_set():
+    62	        p = b"who" + os.urandom(16) if mode == "who" else os.urandom(28)
+    63	        try:
+    64	            s.sendto(p, ep); sent[0] += 1
+    65	        except BlockingIOError:
+    66	            pass
+    67	        if mode == "who":
+    68	            time.sleep(0.002) if sent[0] % 5 == 0 else None  # a few hundred pps of 19-byte datagrams
+    69	
+    70	
+    71	print("baseline (no flood):", legit_ping())
+    72	if mode != "none":
+    73	    threading.Thread(target=flood, daemon=True).start()
+    74	ok = tries = 0
+    75	t0 = time.time()
+    76	while time.time() - t0 < IDLE + 25 and q.poll() is None:
+    77	    tries += 1; ok += legit_ping(); time.sleep(2)
+    78	stop.set()
+    79	alive = q.poll() is None
+    80	print(f"mode={mode}: legit authenticated pings {ok}/{tries} during {time.time() - t0:.0f} s, flood packets {sent[0]}, "
+    81	      f"qemu {'still running' if alive else 'EXITED (reset) after %.0f s' % (time.time() - t_listen)}")
+    82	log = open(LOG, errors="replace").read()
+    83	for l in log.splitlines():
+    84	    if "idle" in l and "reset" in l or "hard reset" in l:
+    85	        print("serial:", l.strip())
+    86	if alive:
+    87	    q.kill()
+    88	good = alive and ok >= 0.8 * tries
+    89	print("RESULT:", "PASS" if good else "FAIL"); sys.exit(0 if good else 1)
+    16	        break
+    17	    time.sleep(0.5)
+    18	B = ["tools/.venv/bin/python", "tools/bmctl.py", "--host", "127.0.0.1",
+    19	     "--port", str(PORT), "--key", KEY]
+    20	env = dict(os.environ, NC110_KEY=KEY)
+    21	print("ping:", subprocess.run(B + ["ping"], capture_output=True, text=True, env=env).stdout.strip())
+    22	pin = "€" + "0" * 61
+    23	assert len(pin.encode()) == 64
+    24	t0 = time.time()
+    25	r = subprocess.run(B + ["host", "set", "0", "x", "1.2.3.4", "22", "u", pin], capture_output=True, text=True, env=env)
+    26	print("host set (non-ASCII pin):", (r.stdout + r.stderr).strip())
+    27	print("ping after:", (lambda r: (r.stdout + r.stderr).strip())(subprocess.run(B + ["ping"], capture_output=True, text=True, env=env)))
+    28	time.sleep(3)
+    29	print("qemu:", "EXITED (reset) %.0f s after the command" % (time.time() - t0) if q.poll() is not None else "still running")
+    30	for l in open(LOG, errors="replace").read().splitlines():
+    31	    if "PANIC" in l or "wdt:" in l:
+    32	        print("serial:", l.strip())
+    33	r2 = subprocess.run(B + ["ping"], capture_output=True, text=True, env=env).stdout
+    34	good = "pin must be 64 hex digits" in (r.stdout + r.stderr) and r2.startswith("pong") and q.poll() is None
+    35	if q.poll() is None:
+    36	    q.kill()
+    37	print("RESULT:", "PASS" if good else "FAIL"); sys.exit(0 if good else 1)
+src/bmctl.rs:206:/// What the caller must do after `Ctl::step`; the caller owns the NIC, so it does the hop/reset itself.
+src/bmctl.rs:289:    let Some(mut ctl) = Ctl::new(&dev.0, seed, info, ip, sockets.get_mut::<udp::Socket>(udp_h)) else { return };
+src/ssh.rs:170:            match bmctl::Ctl::new(&dev.0, client_seed, info, ip, sockets.get_mut::<udp::Socket>(udp_h)) {
+src/ssh.rs:243:            if let Some(a) = c.step(sockets.get_mut::<udp::Socket>(udp_h), time::now_ms()) {
+src/ssh.rs:554:        if let Some(a) = ctl.step(sockets.get_mut::<udp::Socket>(udp_h), time::now_ms()) {
+src/boot.s:33:    /* ---- Arm the TCO watchdog FIRST (safety rule 5 rehearsal). No stack, no paging. ----
+src/boot.s:122:    /* zero .bss (page tables + stack live there) */
+src/boot.s:130:    mov $stack_top, %esp
+src/boot.s:179:    mov $stack_top, %rsp
+src/boot.s:216:stack_bottom: .skip 2097152
+src/boot.s:217:stack_top:
+src/boot.s:221:   own GDT and stack inside that page. Order matters: the old kernel's page tables live in its .bss at 1 MiB, which
+src/boot.s:243:    lea tstack_top(%rip), %rsp
+src/boot.s:295:tstack_top:
+
+codex
+**MUST-FIX**
+
+None found in commit `1186a01`. Most is sound. This is a source review; I did not run QEMU or benchmark the N570.
+
+The new promotion path preserves the relevant security invariants:
+
+- **Peer binding:** [bmctl.rs:425](~/nc110-baremetal/src/bmctl.rs:425) requires `x.id == sid && x.peer == from`. Matching a SID from another UDP endpoint cannot select that pending entry.
+- **Forged frames leave pending state intact:** the temporary session is created with `cand.insert(...)`; failed `open(...)` returns before `pend[i] = None`. It neither consumes the entry nor changes its nonce, peer, timestamp, or sequence state.
+- **Replay state survives promotion:** authentication precedes `if seq <= se.last_seq`, then `se.last_seq = seq` precedes `sess[dst] = cand.take()`. Sequence zero is rejected; a duplicate first frame subsequently uses the authenticated session’s cached reply. Eviction cannot resurrect the pending session because promotion removed it.
+- **No SID wraparound:** `self.next_sess.checked_add(1)` refuses new issuance at exhaustion. Different pending records cannot reuse an issued SID within this controller’s lifetime.
+- **No new aliasing defect:** on the promotion branch, `se` borrows the local candidate. Its last use precedes `cand.take()`; on the other branch it borrows the existing session. The branch-specific borrows do not introduce overlapping live mutable access. The existing unsafe static-table access still relies on serialized callers.
+- **Both slicing fixes are correct:** `x.bytes().all(|c| c.is_ascii_hexdigit())` guarantees every subsequent two-byte string slice lands on UTF-8 boundaries.
+
+**SHOULD**
+
+1. **Make the flood test assert that a flood actually occurred.**  
+   [dos-q35-test.py:88](~/nc110-baremetal/tools/dos-q35-test.py:88) decides success using only:
+   ```python
+   good = alive and ok >= 0.8 * tries
+   ```
+   A failed flood thread or severely underloaded sender can therefore produce PASS. Also, `sleep(0.002)` every five sends nominally targets approximately **2,500 pps**, not the comment’s “a few hundred”; actual scheduling and QEMU throughput determine the load.
+
+   Use explicit rate pacing, propagate thread failures, and assert achieved load—preferably also the kernel’s `sessions_issued` increase. Run a controlled below-ceiling case separately from overload. The existing test meaningfully exercises fresh handshakes under contention, but does not establish a reproducible 380-pps or 1000-pps guarantee.
+
+2. **Add direct promotion regression cases.**  
+   None of the three named tests checks: wrong endpoint → valid original endpoint; bad tag → valid frame on the same pending SID; authenticated sequence zero → valid sequence one; duplicate first frame after promotion; or replay after authenticated-session eviction. The older `bmctl-q35-test.sh` checks retries and tampering, but its tamper checks occur after promotion. These cases would directly guard the new candidate lifecycle.
+
+3. **Qualify the pending-table availability claim.**  
+   [bmctl.rs:37](~/nc110-baremetal/src/bmctl.rs:37) says a flood “cannot push a real client's entry out within its round trip.” That is stronger than the implementation guarantees:
+   ```rust
+   min_by_key(|&j| pend[j].as_ref().map_or(i64::MIN, |x| x.t))
+   ```
+   At evenly spaced 1000 accepted requests/s, 256 entries provide roughly 256 ms of retention. A fixed-window ceiling permits bursts; a client can lose its entry much sooner. Equal millisecond timestamps also resolve by index rather than issuance order. Describe this as mitigation for the measured load and latency. If strict oldest-issued eviction matters, the nonwrapping SID is a suitable ordering key.
+
+   **`i64::MIN` itself is correct:** empty entries sort ahead of ordinary uptime timestamps. There is no subtraction or overflow in this comparison.
+
+4. **Measure before optimizing the scan.**  
+   The stated load entails **256,000 entry inspections/s** for `who` eviction. That alone is not persuasive evidence of an N570 performance problem. Forged frames matching a pending SID now additionally trigger key derivation and candidate initialization, so benchmark that path too. QEMU success does not measure target-hardware CPU headroom. I would not require a more complicated data structure without measurements.
+
+**NIT**
+
+- The pin regression is well targeted: `"€" + "0" * 61` is exactly 64 bytes and crosses the old first slice boundary; the test requires the specific error and a later pong.
+- The USB test’s `"€0"` likewise reaches the old slicing failure, with prior successful device enumeration and a subsequent pong. Tighten `r.startswith("err")` to the expected `err ep / data hex`.
+- `pin-q35-test.py` claims to test USB in its docstring but only tests the pin.
+- SID exhaustion remains fail-closed, but the higher ceiling makes theoretical exhaustion possible in about 50 days of continuous accepted issuance. This is an availability limit, not SID reuse.
+
+**8/10** — sound implementation; flood-test reproducibility and promotion-specific coverage are the main weaknesses.
+tokens used
+32,544
+**MUST-FIX**
+
+None found in commit `1186a01`. Most is sound. This is a source review; I did not run QEMU or benchmark the N570.
+
+The new promotion path preserves the relevant security invariants:
+
+- **Peer binding:** [bmctl.rs:425](~/nc110-baremetal/src/bmctl.rs:425) requires `x.id == sid && x.peer == from`. Matching a SID from another UDP endpoint cannot select that pending entry.
+- **Forged frames leave pending state intact:** the temporary session is created with `cand.insert(...)`; failed `open(...)` returns before `pend[i] = None`. It neither consumes the entry nor changes its nonce, peer, timestamp, or sequence state.
+- **Replay state survives promotion:** authentication precedes `if seq <= se.last_seq`, then `se.last_seq = seq` precedes `sess[dst] = cand.take()`. Sequence zero is rejected; a duplicate first frame subsequently uses the authenticated session’s cached reply. Eviction cannot resurrect the pending session because promotion removed it.
+- **No SID wraparound:** `self.next_sess.checked_add(1)` refuses new issuance at exhaustion. Different pending records cannot reuse an issued SID within this controller’s lifetime.
+- **No new aliasing defect:** on the promotion branch, `se` borrows the local candidate. Its last use precedes `cand.take()`; on the other branch it borrows the existing session. The branch-specific borrows do not introduce overlapping live mutable access. The existing unsafe static-table access still relies on serialized callers.
+- **Both slicing fixes are correct:** `x.bytes().all(|c| c.is_ascii_hexdigit())` guarantees every subsequent two-byte string slice lands on UTF-8 boundaries.
+
+**SHOULD**
+
+1. **Make the flood test assert that a flood actually occurred.**  
+   [dos-q35-test.py:88](~/nc110-baremetal/tools/dos-q35-test.py:88) decides success using only:
+   ```python
+   good = alive and ok >= 0.8 * tries
+   ```
+   A failed flood thread or severely underloaded sender can therefore produce PASS. Also, `sleep(0.002)` every five sends nominally targets approximately **2,500 pps**, not the comment’s “a few hundred”; actual scheduling and QEMU throughput determine the load.
+
+   Use explicit rate pacing, propagate thread failures, and assert achieved load—preferably also the kernel’s `sessions_issued` increase. Run a controlled below-ceiling case separately from overload. The existing test meaningfully exercises fresh handshakes under contention, but does not establish a reproducible 380-pps or 1000-pps guarantee.
+
+2. **Add direct promotion regression cases.**  
+   None of the three named tests checks: wrong endpoint → valid original endpoint; bad tag → valid frame on the same pending SID; authenticated sequence zero → valid sequence one; duplicate first frame after promotion; or replay after authenticated-session eviction. The older `bmctl-q35-test.sh` checks retries and tampering, but its tamper checks occur after promotion. These cases would directly guard the new candidate lifecycle.
+
+3. **Qualify the pending-table availability claim.**  
+   [bmctl.rs:37](~/nc110-baremetal/src/bmctl.rs:37) says a flood “cannot push a real client's entry out within its round trip.” That is stronger than the implementation guarantees:
+   ```rust
+   min_by_key(|&j| pend[j].as_ref().map_or(i64::MIN, |x| x.t))
+   ```
+   At evenly spaced 1000 accepted requests/s, 256 entries provide roughly 256 ms of retention. A fixed-window ceiling permits bursts; a client can lose its entry much sooner. Equal millisecond timestamps also resolve by index rather than issuance order. Describe this as mitigation for the measured load and latency. If strict oldest-issued eviction matters, the nonwrapping SID is a suitable ordering key.
+
+   **`i64::MIN` itself is correct:** empty entries sort ahead of ordinary uptime timestamps. There is no subtraction or overflow in this comparison.
+
+4. **Measure before optimizing the scan.**  
+   The stated load entails **256,000 entry inspections/s** for `who` eviction. That alone is not persuasive evidence of an N570 performance problem. Forged frames matching a pending SID now additionally trigger key derivation and candidate initialization, so benchmark that path too. QEMU success does not measure target-hardware CPU headroom. I would not require a more complicated data structure without measurements.
+
+**NIT**
+
+- The pin regression is well targeted: `"€" + "0" * 61` is exactly 64 bytes and crosses the old first slice boundary; the test requires the specific error and a later pong.
+- The USB test’s `"€0"` likewise reaches the old slicing failure, with prior successful device enumeration and a subsequent pong. Tighten `r.startswith("err")` to the expected `err ep / data hex`.
+- `pin-q35-test.py` claims to test USB in its docstring but only tests the pin.
+- SID exhaustion remains fail-closed, but the higher ceiling makes theoretical exhaustion possible in about 50 days of continuous accepted issuance. This is an availability limit, not SID reuse.
+
+**8/10** — sound implementation; flood-test reproducibility and promotion-specific coverage are the main weaknesses.

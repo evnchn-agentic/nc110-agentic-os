@@ -1,0 +1,281 @@
+Server listening on 127.0.0.1 port 2223.
+Connection from 127.0.0.1 port 57726 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 57726 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 57726 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 48910
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 57726 id 0
+Connection closed by 127.0.0.1 port 57726
+Close session: user evnchn from 127.0.0.1 port 57726 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 57726
+Connection from 127.0.0.1 port 57738 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 57738 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 57738 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 49065
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 57738 id 0
+Connection closed by 127.0.0.1 port 57738
+Close session: user evnchn from 127.0.0.1 port 57738 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 57738
+Connection from 127.0.0.1 port 57779 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 57779 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 57779 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 49593
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 57779 id 0
+Connection closed by 127.0.0.1 port 57779
+Close session: user evnchn from 127.0.0.1 port 57779 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 57779
+Connection from 127.0.0.1 port 57790 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 57790 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 57790 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 49779
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 57790 id 0
+Connection closed by 127.0.0.1 port 57790
+Close session: user evnchn from 127.0.0.1 port 57790 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 57790
+Connection from 127.0.0.1 port 57824 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 57824 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 57824 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 50381
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 57824 id 0
+Connection closed by 127.0.0.1 port 57824
+Close session: user evnchn from 127.0.0.1 port 57824 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 57824
+Connection from 127.0.0.1 port 57827 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 57827 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 57827 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 50409
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 57827 id 0
+Connection closed by 127.0.0.1 port 57827
+Close session: user evnchn from 127.0.0.1 port 57827 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 57827
+Connection from 127.0.0.1 port 57842 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 57842 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 57842 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 50573
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 57842 id 0
+Connection closed by 127.0.0.1 port 57842
+Close session: user evnchn from 127.0.0.1 port 57842 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 57842
+Connection from 127.0.0.1 port 57852 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 57852 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 57852 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 50624
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 57852 id 0
+Connection closed by 127.0.0.1 port 57852
+Close session: user evnchn from 127.0.0.1 port 57852 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 57852
+Connection from 127.0.0.1 port 57943 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 57943 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 57943 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 51383
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 57943 id 0
+Connection closed by 127.0.0.1 port 57943
+Close session: user evnchn from 127.0.0.1 port 57943 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 57943
+Connection from 127.0.0.1 port 58005 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 58005 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 58005 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 52108
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 58005 id 0
+Connection closed by 127.0.0.1 port 58005
+Close session: user evnchn from 127.0.0.1 port 58005 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 58005
+Connection from 127.0.0.1 port 58024 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 58024 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 58024 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 52395
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 58024 id 0
+Connection closed by 127.0.0.1 port 58024
+Close session: user evnchn from 127.0.0.1 port 58024 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 58024
+Connection from 127.0.0.1 port 58100 on 127.0.0.1 port 2223
+Connection closed by 127.0.0.1 port 58100 [preauth]
+srclimit_penalise: ipv4: new 127.0.0.1/32 deferred penalty of 1 seconds for penalty: connections without attempting authentication
+Connection from 127.0.0.1 port 58419 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 58419 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 58419 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 57652
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 58419 id 0
+Connection closed by 127.0.0.1 port 58419
+Close session: user evnchn from 127.0.0.1 port 58419 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 58419
+Connection from 127.0.0.1 port 58597 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 58597 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 58597 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 57917
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 58597 id 0
+Connection closed by 127.0.0.1 port 58597
+Close session: user evnchn from 127.0.0.1 port 58597 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 58597
+Connection from 127.0.0.1 port 58643 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 58643 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 58643 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 57953
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 58643 id 0
+Connection closed by 127.0.0.1 port 58643
+Close session: user evnchn from 127.0.0.1 port 58643 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 58643
+Connection from 127.0.0.1 port 58684 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 58684 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 58684 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 58006
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 58684 id 0
+Connection closed by 127.0.0.1 port 58684
+Close session: user evnchn from 127.0.0.1 port 58684 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 58684
+Connection from 127.0.0.1 port 58722 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 58722 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 58722 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 58066
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 58722 id 0
+Connection closed by 127.0.0.1 port 58722
+Close session: user evnchn from 127.0.0.1 port 58722 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 58722
+Connection from 127.0.0.1 port 58759 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 58759 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 58759 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 58104
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 58759 id 0
+Connection closed by 127.0.0.1 port 58759
+Close session: user evnchn from 127.0.0.1 port 58759 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 58759
+Connection from 127.0.0.1 port 58906 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 58906 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 58906 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 58336
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 58906 id 0
+Connection closed by 127.0.0.1 port 58906
+Close session: user evnchn from 127.0.0.1 port 58906 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 58906
+Connection from 127.0.0.1 port 59084 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 59084 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 59084 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 58625
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 59084 id 0
+Connection closed by 127.0.0.1 port 59084
+Close session: user evnchn from 127.0.0.1 port 59084 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 59084
+Connection from 127.0.0.1 port 59891 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 59891 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 59891 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 70879
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 59891 id 0
+Connection closed by 127.0.0.1 port 59891
+Close session: user evnchn from 127.0.0.1 port 59891 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 59891
+Connection from 127.0.0.1 port 59895 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 59895 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 59895 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 70936
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 59895 id 0
+Connection closed by 127.0.0.1 port 59895
+Close session: user evnchn from 127.0.0.1 port 59895 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 59895
+Connection from 127.0.0.1 port 59897 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 59897 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 59897 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 70973
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 59897 id 0
+Connection closed by 127.0.0.1 port 59897
+Close session: user evnchn from 127.0.0.1 port 59897 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 59897
+Connection from 127.0.0.1 port 59901 on 127.0.0.1 port 2223
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Postponed publickey for evnchn from 127.0.0.1 port 59901 ssh2 [preauth]
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+Accepted publickey for evnchn from 127.0.0.1 port 59901 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 71042
+Starting session: forced-command (config) 'echo nc110-m2-ok; uname -a' for evnchn from 127.0.0.1 port 59901 id 0
+Connection closed by 127.0.0.1 port 59901
+Close session: user evnchn from 127.0.0.1 port 59901 id 0
+Transferred: sent 1868, received 864 bytes
+Closing connection to 127.0.0.1 port 59901
+Received signal 15; terminating.

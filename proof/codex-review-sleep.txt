@@ -1,0 +1,18 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a15a55-accd-77d3-a268-5fc6e071cea8
+--------
+user
+Calibrated skeptic review, focused and concrete. Files: src/sleep.rs and the arm_wol function in src/nic.rs (git show HEAD), plus proof/acpi/nc110-DSDT.dsl (decompiled NC110 DSDT) and proof/acpi/nc110-FACP.aml / nc110-FACS.aml for the firmware facts. Context: bare-metal Rust kernel on a Samsung NC110 (Intel NM10/ICH7, Atom N570, RTL8105E). The operator said 'DO NOT MESS UP': this will run unattended overnight, and a hang during or after S3 that nothing can recover from means a human must power-cycle the netbook. Design: S3 where the wake never resumes this kernel: the FACS waking vector points to a 12-byte real-mode stub at 0x6000 that writes 0x02 then 0x06 to port 0xCF9 (hard reset) so the board POSTs and boots fresh through GRUB; the CMOS RTC alarm is always armed as a backstop; _PTS(3) is replicated from the DSDT by hand; WoL via magic packet. Find concrete ways this can (1) fail to wake at all (RTC alarm programming errors: BCD/binary, alarm registers, PM1_EN RTC_EN, status clearing order, the century/day alarm FADT fields; GPE/PM1 register offsets for ICH7; anything the firmware's _PTS/_GTS/_SST or the ICH7 sleep sequence needs that is missing), (2) wake into a hang (the stub: real-mode encoding, whether the firmware calls the vector in real mode at CS=vector>>4, whether 0x6000 can be clobbered by the firmware's S3 resume path, whether 0xCF9 reset from the resume context really cold-boots on ICH7; the X_Firmware_Waking_Vector and FACS version/flags handling), (3) leave the machine worse off if S3 entry silently fails (what happens after 3 s; whether SCI_EN enabling, the SMI writes or the EC trap can wedge the board or the EC), (4) break WoL arming on RTL8105E/r8169 (register offsets 0x52/0x54/0x56, Cfg9346 unlock, PME_En/PMCSR handling, D-state). Quote the code you rely on. Output MUST-FIX (concrete failure + fix), SHOULD, NIT, then 0-10. 'Most is sound' is valid.
+hook: SessionStart
+hook: SessionStart Completed
+ERROR: You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:38 AM.
+ERROR: You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:38 AM.

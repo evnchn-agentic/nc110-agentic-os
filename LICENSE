@@ -1,0 +1,11 @@
+This repository is under more than one licence; REUSE.toml maps every path to its licence, and the full texts are in
+LICENSES/.
+
+- MIT (LICENSES/MIT.txt): everything not listed below.
+- GPL-2.0-only (LICENSES/GPL-2.0-only.txt): the Ethernet and WiFi drivers ported from Linux (src/nic.rs,
+  src/nic_regs.rs, src/wifi.rs, src/iwl.rs), the notes they were written from (docs/iwl-dvm-*.md), the NIC register
+  test (tools/nic_regs_test.rs, tools/test-nic-regs.sh) and the reference copies in third_party/.
+- BSD-2-Clause (LICENSES/BSD-2-Clause.txt, tools/font/LICENSE.spleen): the Spleen font and src/font.rs generated from it.
+
+A kernel built with the GPL-2.0 drivers contains GPL-2.0 code, so that binary as a whole is distributed under GPL-2.0
+terms. Without those four source files, the rest of the kernel is MIT and BSD-2-Clause.

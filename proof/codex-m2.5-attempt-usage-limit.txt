@@ -1,0 +1,28 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a145be-e20b-7b53-ba8b-4dadce26b3c7
+--------
+user
+You are a skeptical reviewer from a different model lineage. Review commit a774948 against 81ed69c in ~/nc110-baremetal (`git diff 81ed69c a774948`). Read-only: do not modify files, do not run QEMU, do not push. You may read sources, Cargo registry deps, proof/ logs, third_party/linux-v6.12/, and run `sh tools/test-nic-regs.sh` and `python3 tools/entropy-est.py ...`.
+
+Context: bare-metal x86_64 Rust kernel (no_std) for an Acer NC110 netbook (Atom N570, NO RDRAND, NM10 chipset, RTL8101E 10ec:8136 NIC, a SATA disk holding the owner's real OS). Goal: SSH client from our own kernel. Spec rule 4: the kernel has NO disk driver and must never touch the SATA controller's ports or MMIO. M2.5 adds (1) a CPU-jitter entropy source with SP 800-90B-style health tests replacing RDRAND-only (src/rng.rs), (2) an RTL8101E MMIO driver path behind device-id match plus a PCI bridge walk (src/nic.rs, src/nic_regs.rs, src/pci.rs; it CANNOT be run in QEMU, only rtl8139 can), (3) the SSH client key loaded from a multiboot module instead of compiled in (src/mb.rs). Proof logs: proof/m25-*.
+
+Focus, in priority order:
+A. Entropy honesty. Is anything claimed in src/rng.rs comments or log lines stronger than the code/evidence supports? Are the RCT/APT implementations and cutoffs right for the claimed H=0.1 (alpha 2^-30, W=512)? Can any path hand Sunset bytes when health tests failed, the pool is unseeded, or estimation refused? Is the execution-vs-TSC race source plausible on a real in-order Atom with interrupts off, or does it degenerate (e.g. TSC is core-clock-synchronous so the count is near-deterministic)? Is credit/oversampling arithmetic honest? Is the "QEMU numbers say nothing about the N570" caveat adequate?
+B. Anything that could touch SATA or other non-NIC hardware: config-space writes, BAR handling, the UC page-table change on a 2 MiB page, MMIO window validation (RAM overlap via multiboot mmap, storage-BAR overlap bound by alignment), PCI walk termination. Also: could the 8101E path DMA into memory we do not own (ordering of bus master vs reset vs ring programming, iPXE leaving the NIC running)?
+C. RTL8101E correctness vs Linux r8169 v6.12 (vendored): register offsets, init order, XID gate, PHYAR protocol, RX/TX descriptor bits. What is the most likely way it fails on real hardware?
+D. Key module: validation, wipe, failure modes, anything still leaking the private key into the ELF or logs.
+
+Calibration: signal over volume. Tier each finding MUST-FIX (real bug, safety hole, or dishonest claim), SHOULD-FIX, NOTE. "Most of it is sound" is a valid verdict; do not pad. Cite file:line. End with a 0-10 score and the single most important fix.
+hook: SessionStart
+hook: SessionStart Completed
+ERROR: You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 3:41 AM.
+ERROR: You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 3:41 AM.

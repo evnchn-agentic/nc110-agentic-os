@@ -1,0 +1,1735 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a14d1c-3693-7023-a6bc-8553a7650d91
+--------
+user
+Calibrated adversarial review of commit HEAD (git show HEAD): entropy-assessment tooling for a bare-metal jitter RNG on an Atom N570 (src/rng.rs: raw sample = low byte of a memory-walk step count during a fixed TSC window; claimed 0.1 bit/8-bit sample). New: bmctl 'rng <n>' raw-sample command (src/bmctl.rs, src/rng.rs raw_bytes), tools/bmctl.py rng capture, tools/entropy-est.py (quick MCV + lag-1, and a wrapper around NIST SP800-90B ea_non_iid pinned at 87c104d built by tools/ea/Dockerfile; --selftest mutation cases), proof/entropy-q35-1e6.txt, and loader-q35-test.sh case n6 + a test-only idle=<s> cmdline. Attack: (1) does the wrapper parse ea_non_iid output correctly in all cases (binary alphabets, single symbol, negative zero, bitstring vs literal, -a vs default, its 1e6-sample requirement) and could it ever report a HIGHER entropy than NIST's final line; (2) are the selftest mutants meaningful (would a weak-but-not-constant source, e.g. a slowly drifting count or a 4-value cycle with noise, also be caught?), is the urandom threshold honest; (3) is 'rng <n>' safe: does sampling here perturb the health-tested pool, starve the watchdog, or let an authenticated peer learn anything about past keys (samples are fresh, not reused); (4) statistical caveats for the real-board run (sample independence vs back-to-back sampling, warm-up, the low byte only, restart tests per 90B 3.1.4 not done). Tier MUST-FIX/SHOULD-FIX/NIT, signal over volume. Do not edit. End 0-10.
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll inspect HEAD, trace the capture and estimation paths, and check the pinned NIST tool’s output semantics. I’ll keep findings focused and won’t edit files.
+exec
+/bin/zsh -lc "git show --stat HEAD; git status --short; rg --files -g AGENTS.md -g '*entropy*' -g '*q35*' -g '*rng*' -g '*bmctl*' -g Dockerfile" in ~/nc110-baremetal
+ succeeded in 0ms:
+commit 9e39eb11e9abe95e1e6d8effab18035ce9c28540
+Author: evnchn <user1@example.invalid>
+Date:   Sun Oct 18 11:44:16 2026 +0800
+
+    entropy tooling for the real board: bmctl 'rng <n>' raw jitter samples + client 'rng <total> <file>'; tools/entropy-est.py wraps NIST SP 800-90B ea_non_iid (pinned 87c104d, Docker) + quick MCV/lag-1, --selftest mutation check (constant/frozen/counter/alternation -> 0, urandom > 6); q35 1e6 capture (host noise, plumbing only); loader suite case n6: client vanishes mid-transfer -> idle reset, no kick (test-only idle=<s>)
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+ proof/entropy-q35-1e6.txt |  23 ++++++++
+ src/bmctl.rs              |  18 ++++--
+ src/rng.rs                |   8 +++
+ tools/bmctl.py            |  13 +++-
+ tools/ea/Dockerfile       |   9 +++
+ tools/entropy-est.py      | 147 +++++++++++++++++++++++++++++++++++-----------
+ tools/loader-q35-test.sh  |  15 +++++
+ 7 files changed, 193 insertions(+), 40 deletions(-)
+?? grub-test/wdt-locked-accept.iso
+?? grub-test/wdt-locked-refuse.iso
+?? proof/codex-review-entropy.txt
+src/rng.rs
+src/bmctl.rs
+tools/ea/Dockerfile
+tools/loader-q35-test.sh
+tools/entropy-est.py
+tools/bmctl.py
+tools/attended-q35.py
+tools/bmctl-q35-test.sh
+proof/attended-q35-serial.log
+proof/attended-wdtprobe-q35-serial.log
+proof/attended-ssh-q35-serial.log
+proof/codex-review-bmctl-followup2.txt
+proof/m25-entropy-est.txt
+proof/attended-q35-grub-serial.log
+proof/entropy-q35-1e6.txt
+proof/codex-review-bmctl.txt
+proof/m25-rngdump-serial.log
+proof/codex-review-entropy.txt
+proof/codex-review-bmctl-followup.txt
+
+exec
+/bin/zsh -lc 'git show HEAD --; nl -ba src/rng.rs; nl -ba tools/entropy-est.py' in ~/nc110-baremetal
+ succeeded in 0ms:
+commit 9e39eb11e9abe95e1e6d8effab18035ce9c28540
+Author: evnchn <user1@example.invalid>
+Date:   Sun Oct 18 11:44:16 2026 +0800
+
+    entropy tooling for the real board: bmctl 'rng <n>' raw jitter samples + client 'rng <total> <file>'; tools/entropy-est.py wraps NIST SP 800-90B ea_non_iid (pinned 87c104d, Docker) + quick MCV/lag-1, --selftest mutation check (constant/frozen/counter/alternation -> 0, urandom > 6); q35 1e6 capture (host noise, plumbing only); loader suite case n6: client vanishes mid-transfer -> idle reset, no kick (test-only idle=<s>)
+    
+    Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+diff --git a/proof/entropy-q35-1e6.txt b/proof/entropy-q35-1e6.txt
+new file mode 100644
+index 0000000..473dae9
+--- /dev/null
++++ b/proof/entropy-q35-1e6.txt
+@@ -0,0 +1,23 @@
++/private/tmp/claude-501/-Users-evnchn/bbbd91ed-4f87-4398-8936-b25c60d55400/scratchpad/q35-raw.bin: 1000000 samples, 256 distinct, most common 0x92 x79292
++  quick  MCV 3.644  lag-1 2.846 bits/sample
++    Most Common Value Estimate (bit string) [1-bit] 0.8866
++    Most Common Value Estimate [8-bit]       3.6441
++    Collision Test Estimate (bit string) [1-bit] 1.0000
++    Markov Test Estimate (bit string) [1-bit] 0.8240
++    Compression Test Estimate (bit string) [1-bit] 0.3049
++    T-Tuple Test Estimate (bit string) [1-bit] 0.3931
++    T-Tuple Test Estimate [8-bit]            2.8723
++    LRS Test Estimate (bit string) [1-bit]   0.4490
++    LRS Test Estimate [8-bit]                3.4305
++    Multi Most Common in Window (MultiMCW) Prediction Test Estimate (bit string) [1-bit] 0.8811
++    Multi Most Common in Window (MultiMCW) Prediction Test Estimate [8-bit] 3.1468
++    Lag Prediction Test Estimate (bit string) [1-bit] 0.4315
++    Lag Prediction Test Estimate [8-bit]     3.5748
++    Multi Markov Model with Counting (MultiMMC) Prediction Test Estimate (bit string) [1-bit] 0.4246
++    Multi Markov Model with Counting (MultiMMC) Prediction Test Estimate [8-bit] 3.2853
++    LZ78Y Prediction Test Estimate (bit string) [1-bit] 0.5256
++    LZ78Y Prediction Test Estimate [8-bit]   3.3017
++    H_original                               2.8723
++    H_bitstring                              0.3049
++  NIST   SP 800-90B non-IID min(H_original, 8 x H_bitstring) = 2.4394 bits/sample
++  RESULT min-entropy 2.4394 bits per 8-bit sample (kernel claims 0.100)
+diff --git a/src/bmctl.rs b/src/bmctl.rs
+index 43b238c..48385bf 100644
+--- a/src/bmctl.rs
++++ b/src/bmctl.rs
+@@ -30,7 +30,7 @@ use smoltcp::time::Instant;
+ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
+ 
+ const PORT: u16 = 5515;
+-const IDLE_MS: i64 = 600_000;
++const IDLE_MS: i64 = 600_000; // default; cmdline idle=<s> (5..3600) overrides it, used by the q35 stall test
+ 
+ static mut SESS: [Option<Sess>; 16] = [const { None }; 16]; // authenticated
+ static mut PEND: [Option<Sess>; 8] = [const { None }; 8]; // issued by `who`, no good frame yet
+@@ -195,6 +195,8 @@ fn peek(w: &mut Writer, nic_mmio: Option<u64>, what: &str, a: &str, b: &str) ->
+ }
+ 
+ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
++    let idle_ms = crate::mb::cmdline(info).split(' ').find_map(|w| w.strip_prefix("idle=")).and_then(|v| v.parse::<i64>().ok())
++        .filter(|v| (5..=3600).contains(v)).map_or(IDLE_MS, |v| v * 1000);
+     crate::loader::snapshot_boot_info(info);
+     let nic_mmio = match nic.bus {
+         Bus::Mmio(b) => Some(b),
+@@ -245,7 +247,7 @@ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+         return;
+     };
+     sockets.get_mut::<udp::Socket>(udp_h).bind(PORT).expect("bind");
+-    kprintln!("bmctl: listening on {}:{} boot id {} (idle reset after {} s)", ip.address(), PORT, bid, IDLE_MS / 1000);
++    kprintln!("bmctl: listening on {}:{} boot id {} (idle reset after {} s)", ip.address(), PORT, bid, idle_ms / 1000);
+     crate::udplog::dump(5);
+ 
+     let (mut last_ok, mut last_hello) = (time::now_ms(), 0i64);
+@@ -261,8 +263,8 @@ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+         crate::net::rx_budget(Some(32)); // bounded ingress per poll so the deadline checks below always run
+         iface.poll(now(), &mut dev, &mut sockets);
+         let t = time::now_ms();
+-        if t - last_ok > IDLE_MS {
+-            kprintln!("bmctl: idle {} s -> reset", IDLE_MS / 1000);
++        if t - last_ok > idle_ms {
++            kprintln!("bmctl: idle {} s -> reset", idle_ms / 1000);
+             return;
+         }
+         if jump_at.as_ref().is_some_and(|(j, _)| t > *j) {
+@@ -425,12 +427,18 @@ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+                         let _ = core::fmt::write(&mut w, format_args!("err {}", e));
+                     }
+                 }
++                "rng" => {
++                    let k: usize = it.next().and_then(|x| x.parse().ok()).unwrap_or(0).min(1200);
++                    let mut raw = [0u8; 1200];
++                    rng::raw_bytes(&mut raw[..k]);
++                    w.put(&raw[..k]);
++                }
+                 "reboot" => {
+                     let _ = core::fmt::write(&mut w, format_args!("rebooting in 500 ms"));
+                     reboot_at = Some(t + 500);
+                 }
+                 _ => {
+-                    let _ = core::fmt::write(&mut w, format_args!("err unknown command (ping|stats|log <off>|peek ...|lbeg|ldat|lcom|reboot)"));
++                    let _ = core::fmt::write(&mut w, format_args!("err unknown command (ping|stats|log <off>|peek ...|rng <n>|lbeg|ldat|lcom|reboot)"));
+                 }
+             }
+             w.n
+diff --git a/src/rng.rs b/src/rng.rs
+index 0ed2ee1..078eba8 100644
+--- a/src/rng.rs
++++ b/src/rng.rs
+@@ -428,6 +428,14 @@ pub fn fill(buf: &mut [u8]) -> Result<(), ()> {
+ }
+ 
+ /// (requests served, reseeds, raw samples taken (all health-tested), health failure latched)
++/// bmctl `rng <n>`: fresh raw 8-bit samples (low byte of each walk count), the same values the health tests and
++/// estimators see. Never used for keys. For offline SP 800-90B assessment of the real board (tools/entropy-est.py).
++pub fn raw_bytes(out: &mut [u8]) {
++    for b in out.iter_mut() {
++        *b = raw_delta() as u8;
++    }
++}
++
+ pub fn stats() -> (u32, u32, u64, bool) {
+     unsafe { (CALLS, RESEEDS, SAMPLES, FAILED) }
+ }
+diff --git a/tools/bmctl.py b/tools/bmctl.py
+index 640a8e4..a788b45 100644
+--- a/tools/bmctl.py
++++ b/tools/bmctl.py
+@@ -2,7 +2,7 @@
+ """bmctl client for the NC110 kernel's authenticated UDP control port (see src/bmctl.rs).
+ 
+ Usage: tools/.venv/bin/python tools/bmctl.py [--host 192.168.50.120] [--key test-keys/client.key] <command...>
+-  commands: ping | stats | log [offset] | logall | peek ... | reboot
++  commands: ping | stats | log [offset] | logall | peek ... | reboot | rng <total> <outfile>  (raw jitter samples)
+             load <kernel.elf> [cmdline...]   stage over the network, verify, chain-load in RAM (nothing on /boot),
+                                              then wait for the new kernel's bmctl (new boot id) and print its ping
+ The key file is the same 72-byte multiboot key module the kernel gets (magic 8 + ed25519 seed 32 + pub 32);
+@@ -108,7 +108,9 @@ if a.cmd[0] == "load":
+         r = call_raw(b"ldat" + struct.pack("<I", off) + img_send[off:off + 1000]).decode()
+         if not r.startswith("ok"):
+             sys.exit(f"ldat at {off}: {r}")
+-    print(f"staged {len(img)} B in {time.time() - t0:.1f} s")
++    print(f"staged {len(img_send)} B in {time.time() - t0:.1f} s")
++    if os.environ.get("BMCTL_TEST_ABANDON"):                                   # client dies mid-transfer
++        sys.exit("abandoned (test hook): no lcom")
+     try:
+         r = call(f"lcom {cl}".strip()).decode()
+     except SystemExit:
+@@ -131,6 +133,13 @@ if a.cmd[0] == "load":
+             print(f"new kernel up: boot {boot.hex()} after {time.time() - t0:.1f} s; {pong}")
+             sys.exit(0)
+     sys.exit("no new kernel answered (authenticated) within 60 s")
++if a.cmd[0] == "rng":
++    total, out = int(a.cmd[1]), bytearray()
++    while len(out) < total:
++        out += call(f"rng {min(1200, total - len(out))}")
++    open(a.cmd[2], "wb").write(out)
++    print(f"wrote {len(out)} raw samples to {a.cmd[2]}")
++    sys.exit(0)
+ if cmd == "logall":
+     off, out = 0, b""
+     while True:
+diff --git a/tools/ea/Dockerfile b/tools/ea/Dockerfile
+new file mode 100644
+index 0000000..fd0be3b
+--- /dev/null
++++ b/tools/ea/Dockerfile
+@@ -0,0 +1,9 @@
++# NIST SP 800-90B EntropyAssessment (reference ea_non_iid / ea_iid), pinned. Build:
++#   docker build -t nc110-ea:87c104d tools/ea
++FROM debian:bookworm-slim
++RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates git g++ make \
++    libbz2-dev libdivsufsort-dev libjsoncpp-dev libssl-dev libmpfr-dev libgmp-dev >/dev/null
++RUN git clone -q https://github.com/usnistgov/SP800-90B_EntropyAssessment.git /ea \
++ && cd /ea && git checkout -q 87c104d0ed4cbc96103e7b8b38d6f2c7e0a6b289 \
++ && cd cpp && make -j4 non_iid iid >/dev/null 2>&1 && cp ea_non_iid ea_iid /usr/local/bin/
++ENTRYPOINT []
+diff --git a/tools/entropy-est.py b/tools/entropy-est.py
+index f9d5ce0..17aee52 100644
+--- a/tools/entropy-est.py
++++ b/tools/entropy-est.py
+@@ -1,20 +1,26 @@
+ #!/usr/bin/env python3
+-"""Offline min-entropy estimates for the jitter source, from a serial log of a `rng=dump` boot.
+-
+-  python3 tools/entropy-est.py proof/m25-rngdump-serial.log      # estimates on the 8-bit raw samples
+-  python3 tools/entropy-est.py --cutoffs 0.25                     # SP 800-90B RCT/APT cutoffs for claimed H
+-
+-Estimators (all per 8-bit sample, lower = worse; take the MIN as the honest number):
+-  MCV       SP 800-90B 6.3.1 most-common-value, 99% upper bound on p_max (the one the kernel also gates on)
+-  lag-1     max over previous value a of the 99% upper bound on max_b P(b | a): catches serial correlation
+-            that MCV (an IID estimator) misses. Crude stand-in for the 90B Markov/predictor estimators.
+-  collision-free run  n / number of distinct values (sanity only)
+-This is NOT the full non-IID suite. For the real N570 run NIST's ea_non_iid (SP800-90B_EntropyAssessment) on
+-the dumped bytes; these numbers are a floor check, and QEMU/TCG numbers say nothing about real hardware.
++"""Min-entropy assessment of the NC110 jitter source (8-bit raw samples = low byte of each walk count, src/rng.rs).
++
++  tools/.venv/bin/python tools/bmctl.py rng 1000000 /tmp/raw.bin   # capture from a running kernel (real board / q35)
++  python3 tools/entropy-est.py /tmp/raw.bin                         # quick floor + NIST SP 800-90B non-IID
++  python3 tools/entropy-est.py proof/m25-rngdump-serial.log         # old `rng=dump` serial format also accepted
++  python3 tools/entropy-est.py --quick FILE                         # skip NIST (seconds instead of minutes)
++  python3 tools/entropy-est.py --cutoffs 0.25                       # SP 800-90B RCT/APT cutoffs for a claimed H
++  python3 tools/entropy-est.py --selftest                           # mutation check: constant/counter score ~0, urandom ~8
++
++Two layers, report the MIN:
++  quick   MCV (SP 800-90B 6.3.1, 99% upper bound) and lag-1: max over contexts a of the 99% upper bound of
++          max_b P(b | a), a serial-correlation check MCV misses. Same estimators the kernel gates on at startup.
++  NIST    the reference implementation, usnistgov/SP800-90B_EntropyAssessment @ 87c104d, `ea_non_iid -a`, run in
++          Docker (tools/ea/Dockerfile, image nc110-ea:87c104d). Its final line, min(H_original, 8 x H_bitstring),
++          is the SP 800-90B non-IID estimate. NIST wants >= 1,000,000 samples; fewer runs but is flagged.
++Numbers from QEMU measure the HOST (TCG's TSC moves in 1 us host steps), not the N570: q35 only tests the plumbing.
+ """
+-import math, re, sys
++import math, os, re, subprocess, sys, tempfile
+ from collections import Counter, defaultdict
+ 
++IMAGE = "nc110-ea:87c104d"
++
+ 
+ def ub(p, n):
+     return min(1.0, p + 2.576 * math.sqrt(p * (1 - p) / max(n - 1, 1)))
+@@ -30,23 +36,23 @@ def cutoffs(h, alpha_exp=30, w=512):
+     return rct, w
+ 
+ 
+-def main():
+-    if sys.argv[1] == "--cutoffs":
+-        h = float(sys.argv[2])
+-        rct, apt = cutoffs(h)
+-        print(f"H={h}: RCT cutoff {rct} (1+ceil(30/H)), APT W=512 cutoff {apt} (P(1+Bin(511,2^-H)>=C)<=2^-30)")
+-        return
+-    s = []
+-    for line in open(sys.argv[1], errors="replace"):
+-        m = re.match(r"rawjit \d+:((?: [0-9a-f]{2})+)", line.strip())
+-        if m:
+-            s += [int(x, 16) for x in m.group(1).split()]
++def load(path):
++    data = open(path, "rb").read()
++    if b"rawjit " in data[:1 << 16]:
++        s = []
++        for line in data.decode(errors="replace").splitlines():
++            m = re.match(r"rawjit \d+:((?: [0-9a-f]{2})+)", line.strip())
++            if m:
++                s += [int(x, 16) for x in m.group(1).split()]
++        return bytes(s)
++    return data
++
++
++def quick(s):
+     n = len(s)
+-    if n == 0:
+-        sys.exit("no rawjit lines")
+     c = Counter(s)
+     v, k = c.most_common(1)[0]
+-    h_mcv = -math.log2(ub(k / n, n))
++    h_mcv = max(0.0, -math.log2(ub(k / n, n)))
+     trans = defaultdict(Counter)
+     for a, b in zip(s, s[1:]):
+         trans[a][b] += 1
+@@ -55,12 +61,87 @@ def main():
+         na = sum(cb.values())
+         if na >= 20:
+             worst = max(worst, ub(cb.most_common(1)[0][1] / na, na))
+-    h_lag = -math.log2(worst) if worst else float("nan")
+-    print(f"samples {n}, distinct {len(c)}, most common {v:#04x} x{k} ({k / n:.3f})")
+-    print(f"MCV   min-entropy {h_mcv:.3f} bits/sample")
+-    print(f"lag-1 min-entropy {h_lag:.3f} bits/sample (contexts with >= 20 successors)")
+-    print(f"min of the two    {min(h_mcv, h_lag):.3f} bits/sample")
+-    print("top values:", ", ".join(f"{x:#04x}:{y}" for x, y in c.most_common(8)))
++    h_lag = max(0.0, -math.log2(worst)) if worst else float("nan")
++    return {"n": n, "distinct": len(c), "top": (v, k), "mcv": h_mcv, "lag1": h_lag}
++
++
++def nist(s):
++    with tempfile.TemporaryDirectory() as d:
++        open(os.path.join(d, "raw.bin"), "wb").write(s)
++        r = subprocess.run(["docker", "run", "--rm", "-v", f"{d}:/d", "-w", "/d", IMAGE, "ea_non_iid", "-a", "-v",
++                            "raw.bin", "8"], capture_output=True, text=True)
++    out = r.stdout + r.stderr
++    if "No entropy awarded" in out:  # NIST's own verdict for a one-symbol alphabet
++        return 0.0, {"NIST: one-symbol alphabet, no entropy awarded": 0.0}, out
++    m = re.search(r"min\(H_original, 8 X H_bitstring\):\s*(-?[0-9.]+)", out)
++    if not m:  # a <= 2-symbol alphabet is assessed as binary: then H_original alone is the per-sample figure
++        m = re.search(r"^H_original: (-?[0-9.]+)", out, re.M)
++    if not m:
++        sys.exit(f"ea_non_iid gave no final estimate (exit {r.returncode}):\n{out[-1500:]}")
++    per = {f"{k} [{b}-bit]": float(v) for k, v, b in re.findall(r"^\t(.+?Estimate(?: \(bit string\))?) = (-?[0-9.]+) / (\d) bit", out, re.M)}
++    for k in ("H_original", "H_bitstring"):
++        mm = re.search(rf"^{k}: (-?[0-9.]+)", out, re.M)
++        if mm:
++            per[k] = float(mm.group(1))
++    return max(0.0, float(m.group(1))), per, out
++
++
++def report(path, s, use_nist=True):
++    q = quick(s)
++    v, k = q["top"]
++    print(f"{path}: {q['n']} samples, {q['distinct']} distinct, most common {v:#04x} x{k}")
++    print(f"  quick  MCV {q['mcv']:.3f}  lag-1 {q['lag1']:.3f} bits/sample")
++    h = min(q["mcv"], q["lag1"]) if not math.isnan(q["lag1"]) else q["mcv"]
++    if use_nist:
++        if q["n"] < 1_000_000:
++            print(f"  NOTE   {q['n']} < 1,000,000 samples: NIST runs, but SP 800-90B wants at least 1e6")
++        hn, per, _ = nist(s)
++        for name, val in per.items():
++            print(f"    {name.strip():<40} {val:.4f}")
++        print(f"  NIST   SP 800-90B non-IID min(H_original, 8 x H_bitstring) = {hn:.4f} bits/sample")
++        h = min(h, hn)
++    print(f"  RESULT min-entropy {h:.4f} bits per 8-bit sample (kernel claims 0.100)")
++    return h
++
++
++def selftest():
++    """Mutation check: a source with no noise must score ~0, real randomness ~8, or the estimator is broken."""
++    n = 200_000
++    cases = [
++        ("constant timer (raw_delta returns the same count)", bytes([0x5a]) * n, lambda h: h < 0.05),
++        ("TSC frozen (raw_delta returns 0)", bytes(n), lambda h: h < 0.05),
++        ("deterministic counter (i mod 256)", bytes(i % 256 for i in range(n)), lambda h: h < 0.5),
++        ("two-value alternation", bytes((0x40, 0x41) * (n // 2)), lambda h: h < 0.5),
++        # Full entropy is 8, but the estimators are conservative: NIST's bitstring estimates give ~6.6-7.0 on 1e6
++        # urandom bytes, and the quick lag-1 (max over 256 contexts x 256 values) ~6.3. The point of this case is
++        # that a good source lands far above the 0.1 claim, not that it scores 8.
++        ("os.urandom (1e6 bytes)", os.urandom(1_000_000), lambda h: h > 6.0),
++    ]
++    bad = 0
++    for name, data, ok in cases:
++        print(f"== {name}")
++        h = report(name, data)
++        verdict = ok(h)
++        print(f"  {'ok  ' if verdict else 'FAIL'} expectation\n")
++        bad |= not verdict
++    print("SELFTEST:", "PASS" if not bad else "FAIL")
++    sys.exit(bad)
++
++
++def main():
++    a = sys.argv[1:]
++    if not a:
++        sys.exit(__doc__)
++    if a[0] == "--cutoffs":
++        h = float(a[1])
++        rct, apt = cutoffs(h)
++        print(f"H={h}: RCT cutoff {rct} (1+ceil(30/H)), APT W=512 cutoff {apt} (P(1+Bin(511,2^-H)>=C)<=2^-30)")
++        return
++    if a[0] == "--selftest":
++        selftest()
++    use_nist = a[0] != "--quick"
++    path = a[-1]
++    report(path, load(path), use_nist)
+ 
+ 
+ main()
+diff --git a/tools/loader-q35-test.sh b/tools/loader-q35-test.sh
+index 8187944..a59093d 100755
+--- a/tools/loader-q35-test.sh
++++ b/tools/loader-q35-test.sh
+@@ -28,4 +28,19 @@ for g in 2 3; do
+   case "$r" in "new kernel up"*) [ "$l" = 1 ] && [ "$k" = 1 ] && echo "ok   hop to gen=$g: $r" || { echo "FAIL hop gen=$g log=$l key=$k"; fail=1; };;
+   *) echo "FAIL hop gen=$g: $r"; fail=1;; esac
+ done
++kill $Q 2>/dev/null; wait $Q 2>/dev/null
++# n6: the client stages half an image and vanishes (no lcom). The kernel must reset by itself: idle timeout
++# (idle=10 here, 600 s by default) -> final log -> 60 s of petting -> 0xCF9. With -no-reboot QEMU then exits.
++qemu-system-x86_64 -machine q35 -m 128 -display none -no-reboot -global ICH9-LPC.noreboot=false -serial file:/tmp/loader-q35-stall.log \
++  -kernel $K -initrd test-keys/client.key -append "bmctl idle=10" -netdev user,id=n0,hostfwd=udp:127.0.0.1:15515-:5515 -device rtl8139,netdev=n0 &
++Q=$!
++for i in $(seq 40); do grep -q 'bmctl: listening' /tmp/loader-q35-stall.log 2>/dev/null && break; sleep 0.5; done
++until $B ping >/dev/null 2>&1; do sleep 1; done
++t0=$(date +%s); BMCTL_TEST_SEND=300000 BMCTL_TEST_ABANDON=1 $B load $K bmctl x >/dev/null 2>&1
++for i in $(seq 120); do kill -0 $Q 2>/dev/null || break; sleep 1; done
++dt=$(( $(date +%s) - t0 ))
++if kill -0 $Q 2>/dev/null; then echo "FAIL n6 stalled transfer: still running after ${dt} s"; fail=1
++elif grep -q 'bmctl: idle 10 s -> reset' /tmp/loader-q35-stall.log && grep -q 'hard reset via 0xCF9' /tmp/loader-q35-stall.log; then
++  echo "ok   n6 client vanished mid-transfer: idle reset + 0xCF9 after ${dt} s, no kick"
++else echo "FAIL n6: exited after ${dt} s without the idle/0xCF9 lines"; fail=1; fi
+ echo "RESULT: $([ $fail = 0 ] && echo PASS || echo FAIL)"; exit $fail
+     1	//! Entropy for Sunset (getrandom custom backend). M2.5: CPU-jitter source first, RDRAND only as an extra.
+     2	//!
+     3	//! The NC110's Atom N570 has NO RDRAND. The noise source races execution against the TSC: count strided
+     4	//! walk steps (2 MiB buffer) completed while the TSC advances by a fixed window (see `raw_delta`).
+     5	//! Interrupts are off, so all jitter comes from the microarchitecture (cache/DRAM/bus timing) or, in QEMU,
+     6	//! from the HOST: TCG's TSC moves in 1000-tick (1 us host clock) steps and the count reflects host speed
+     7	//! noise, so QEMU numbers say nothing about the N570. In-order Atoms are the known weak case
+     8	//! for jitter sources; the claim below must be re-measured on the real board (cmdline `rng=dump`).
+     9	//!
+    10	//! H_CLAIM = 0.1 bit per 8-bit raw sample (low byte of each count). Chosen BELOW the worst QEMU estimate
+    11	//! (lag-1 0.198, tools/entropy-est.py on proof/m25-rngdump-serial.log), not derived from hardware.
+    12	//! SP 800-90B-style health tests, false-positive rate alpha = 2^-30, cutoffs from H_CLAIM:
+    13	//!   Repetition Count Test (4.4.1): cutoff 1 + ceil(30 / 0.1) = 301.
+    14	//!   Adaptive Proportion Test (4.4.2): W = 512, cutoff 507 = smallest C with P(1 + Bin(511, 2^-0.1) >= C)
+    15	//!   <= 2^-30 (computed: tools/entropy-est.py --cutoffs 0.1). At this H the APT is weak by construction.
+    16	//! Startup: 4096 samples must pass both tests AND both in-kernel estimates (MCV, SP 800-90B 6.3.1, and a
+    17	//! lag-1 conditional most-common-value bound that catches serial correlation) must be >= H_CLAIM, else refuse.
+    18	//! Continuous: every sample is tested; one failure latches FAILED and every later request errors.
+    19	//!
+    20	//! Conditioning: SHA-256 (the pinned soft `sha2`) over the full 64-bit counts. Credit 0.1 bit/sample, 10240
+    21	//! samples per key = 1024 credited bits vs 320 needed (256 + 64, 90B 3.1.5.1.2), ~3.2x oversampling as in
+    22	//! jitterentropy. Output is a hash ratchet (out = H(key|"out"|ctr), then key = H(key|"next")), reseeded from
+    23	//! 10240 fresh samples every 8 requests. It is an extractor + ratchet, NOT a certified SP 800-90A DRBG.
+    24	use crate::port::rdtsc;
+    25	use crate::{kprint, kprintln};
+    26	use core::arch::x86_64::{__cpuid, _rdrand64_step};
+    27	use sha2::{Digest, Sha256};
+    28	
+    29	const H_CLAIM_MILLI: u32 = 100; // 0.1 bit per 8-bit sample, claimed (see header)
+    30	const RCT_CUTOFF: u32 = 301;
+    31	const APT_W: u32 = 512;
+    32	const APT_CUTOFF: u32 = 507;
+    33	const STARTUP_N: usize = 4096; // estimated + health tested, and part of the seed
+    34	const BLOCK_N: usize = 10240; // samples per key (seed: STARTUP_N + the rest)
+    35	const RESEED_EVERY: u32 = 8;
+    36	
+    37	pub fn has_rdrand() -> bool {
+    38	    let r = __cpuid(1);
+    39	    r.ecx & (1 << 30) != 0
+    40	}
+    41	
+    42	#[target_feature(enable = "rdrand")]
+    43	unsafe fn rdrand64() -> Option<u64> {
+    44	    let mut v = 0u64;
+    45	    for _ in 0..32 {
+    46	        if _rdrand64_step(&mut v) == 1 {
+    47	            return Some(v);
+    48	        }
+    49	    }
+    50	    None
+    51	}
+    52	
+    53	/// 32 bytes from RDRAND, or Err if it keeps failing (CF=0) or looks stuck (same value twice in a row).
+    54	fn rdrand32() -> Result<[u8; 32], ()> {
+    55	    let mut out = [0u8; 32];
+    56	    let mut last = None;
+    57	    for c in out.chunks_mut(8) {
+    58	        let v = unsafe { rdrand64() }.ok_or(())?;
+    59	        if last == Some(v) {
+    60	            return Err(());
+    61	        }
+    62	        last = Some(v);
+    63	        c.copy_from_slice(&v.to_le_bytes());
+    64	    }
+    65	    Ok(out)
+    66	}
+    67	
+    68	// ---------------- noise source ----------------
+    69	
+    70	/// 2 MiB: 4x the N570's 512 KiB L2, so the walk misses to DRAM (memory-controller/refresh timing is the
+    71	/// jitter jitterentropy relies on). A 256 KiB walk would sit in L2 on the N570 (M2.5 self-review).
+    72	const WALK_SZ: usize = 2 * 1024 * 1024;
+    73	static mut WALK: [u8; WALK_SZ] = [0; WALK_SZ];
+    74	static mut WALK_POS: usize = 0;
+    75	
+    76	#[cfg(not(feature = "badjitter"))]
+    77	#[inline(always)]
+    78	fn tsc() -> u64 {
+    79	    rdtsc()
+    80	}
+    81	/// Negative control: a broken timer (constant TSC). Every delta is 0, the RCT must fire and SSH must refuse.
+    82	#[cfg(feature = "badjitter")]
+    83	#[inline(always)]
+    84	fn tsc() -> u64 {
+    85	    let _ = rdtsc();
+    86	    0x4e43_3131
+    87	}
+    88	
+    89	static mut WINDOW: u64 = 0;
+    90	
+    91	#[inline(always)]
+    92	fn touch(pos: &mut usize) {
+    93	    unsafe {
+    94	        let p = core::ptr::addr_of_mut!(WALK) as *mut u8;
+    95	        *pos = (*pos + 4160) % WALK_SZ;
+    96	        let v = core::ptr::read_volatile(p.add(*pos));
+    97	        core::ptr::write_volatile(p.add(*pos), v.wrapping_add(1));
+    98	    }
+    99	}
+   100	
+   101	/// TSC granularity: smallest nonzero step between back-to-back reads (QEMU/TCG: 1000; real CPUs: tens).
+   102	/// None = the timer never moved (broken/constant): no jitter source at all.
+   103	fn tsc_granularity() -> Option<u64> {
+   104	    let mut g = u64::MAX;
+   105	    let mut last = tsc();
+   106	    for _ in 0..100_000 {
+   107	        let t = tsc();
+   108	        let d = t.wrapping_sub(last);
+   109	        if d != 0 && d < g {
+   110	            g = d;
+   111	        }
+   112	        last = t;
+   113	    }
+   114	    if g == u64::MAX { None } else { Some(g) }
+   115	}
+   116	
+   117	/// One raw sample = how many walk steps (strided over 2 MiB) complete while the TSC advances by WINDOW
+   118	/// ticks (max(64 x granularity, 32768)), starting on a TSC edge. It races two clocks: execution speed (cache, bus, and in
+   119	/// QEMU the host's scheduling/caches) against the timer. A first attempt timed a FIXED walk instead; under
+   120	/// TCG the TSC moves in 1000-tick steps, so the delta was nearly constant and both the RCT and the in-kernel
+   121	/// estimate refused (proof/m25-short-walk-serial.log, proof/m25-fixedwalk-serial.log).
+   122	/// If no TSC edge is seen the raw reading is 0 (a dead timer reads as a constant, so the RCT fires).
+   123	fn raw_delta() -> u64 {
+   124	    let w = unsafe { WINDOW };
+   125	    let t0 = tsc();
+   126	    let mut start = t0;
+   127	    let mut spins = 0u32;
+   128	    while start == t0 {
+   129	        start = tsc();
+   130	        spins += 1;
+   131	        if spins > 1 << 16 {
+   132	            return 0;
+   133	        }
+   134	    }
+   135	    let mut pos = unsafe { WALK_POS };
+   136	    let mut n = 0u64;
+   137	    while tsc().wrapping_sub(start) < w && n < 1 << 20 {
+   138	        touch(&mut pos);
+   139	        n += 1;
+   140	    }
+   141	    unsafe { WALK_POS = pos };
+   142	    n
+   143	}
+   144	
+   145	// ---------------- health tests (SP 800-90B 4.4) ----------------
+   146	
+   147	struct Health {
+   148	    rct_last: u8,
+   149	    rct_n: u32,
+   150	    apt_first: u8,
+   151	    apt_n: u32,
+   152	    apt_i: u32,
+   153	    started: bool,
+   154	}
+   155	
+   156	impl Health {
+   157	    const fn new() -> Self {
+   158	        Self { rct_last: 0, rct_n: 0, apt_first: 0, apt_n: 0, apt_i: 0, started: false }
+   159	    }
+   160	    /// Err(name) when a test fires.
+   161	    fn feed(&mut self, s: u8) -> Result<(), &'static str> {
+   162	        if self.started && s == self.rct_last {
+   163	            self.rct_n += 1;
+   164	            if self.rct_n >= RCT_CUTOFF {
+   165	                return Err("repetition count");
+   166	            }
+   167	        } else {
+   168	            self.rct_last = s;
+   169	            self.rct_n = 1;
+   170	        }
+   171	        if !self.started || self.apt_i == APT_W {
+   172	            self.apt_first = s;
+   173	            self.apt_n = 1;
+   174	            self.apt_i = 1;
+   175	        } else {
+   176	            self.apt_i += 1;
+   177	            if s == self.apt_first {
+   178	                self.apt_n += 1;
+   179	                if self.apt_n >= APT_CUTOFF {
+   180	                    return Err("adaptive proportion");
+   181	                }
+   182	            }
+   183	        }
+   184	        self.started = true;
+   185	        Ok(())
+   186	    }
+   187	}
+   188	
+   189	// ---------------- pool ----------------
+   190	
+   191	static mut HEALTH: Health = Health::new();
+   192	static mut KEY: [u8; 32] = [0; 32];
+   193	static mut CTR: u64 = 0;
+   194	static mut CALLS: u32 = 0;
+   195	static mut RESEEDS: u32 = 0;
+   196	static mut SAMPLES: u64 = 0;
+   197	static mut SEEDED: bool = false;
+   198	static mut FAILED: bool = false;
+   199	static mut USE_RDRAND: bool = false;
+   200	static mut LOWB: [u8; STARTUP_N] = [0; STARTUP_N];
+   201	
+   202	/// Collect `n` samples through the continuous health tests into `h`. Latches FAILED on any failure.
+   203	fn gather(h: &mut Sha256, n: usize, keep_low: bool) -> Result<(), &'static str> {
+   204	    for i in 0..n {
+   205	        let d = raw_delta();
+   206	        let s = d as u8;
+   207	        unsafe { SAMPLES += 1 };
+   208	        if let Err(e) = unsafe { (*core::ptr::addr_of_mut!(HEALTH)).feed(s) } {
+   209	            unsafe { FAILED = true };
+   210	            return Err(e);
+   211	        }
+   212	        if keep_low {
+   213	            unsafe { LOWB[i] = s };
+   214	        }
+   215	        h.update(d.to_le_bytes());
+   216	    }
+   217	    Ok(())
+   218	}
+   219	
+   220	fn sqrt(x: f64) -> f64 {
+   221	    if x <= 0.0 {
+   222	        return 0.0;
+   223	    }
+   224	    let mut g = if x > 1.0 { x } else { 1.0 };
+   225	    for _ in 0..60 {
+   226	        g = 0.5 * (g + x / g);
+   227	    }
+   228	    g
+   229	}
+   230	
+   231	fn log2(x: f64) -> f64 {
+   232	    let b = x.to_bits();
+   233	    let e = ((b >> 52) & 0x7ff) as i64 - 1023;
+   234	    let m = f64::from_bits((b & 0x000f_ffff_ffff_ffff) | (1023u64 << 52)); // [1, 2)
+   235	    let y = (m - 1.0) / (m + 1.0);
+   236	    let (mut s, mut t) = (0.0, y);
+   237	    let mut k = 1.0;
+   238	    while k < 60.0 {
+   239	        s += t / k;
+   240	        t *= y * y;
+   241	        k += 2.0;
+   242	    }
+   243	    e as f64 + 2.0 * s / core::f64::consts::LN_2
+   244	}
+   245	
+   246	static mut TRANS: [[u16; 256]; 256] = [[0; 256]; 256];
+   247	
+   248	/// Lag-1 bound: max over previous values a (>= 20 successors) of the 99% upper bound on max_b P(b | a).
+   249	/// Not a 90B estimator; a cheap guard against the serial correlation MCV (an IID estimate) cannot see.
+   250	fn lag1_milli(samples: &[u8]) -> u32 {
+   251	    let t = unsafe { &mut *core::ptr::addr_of_mut!(TRANS) };
+   252	    for row in t.iter_mut() {
+   253	        row.fill(0);
+   254	    }
+   255	    for w in samples.windows(2) {
+   256	        t[w[0] as usize][w[1] as usize] += 1;
+   257	    }
+   258	    let mut worst = 0.0f64;
+   259	    for row in t.iter() {
+   260	        let n: u32 = row.iter().map(|&x| x as u32).sum();
+   261	        if n >= 20 {
+   262	            let p = *row.iter().max().unwrap() as f64 / n as f64;
+   263	            let pu = (p + 2.576 * sqrt(p * (1.0 - p) / (n as f64 - 1.0))).min(1.0);
+   264	            if pu > worst {
+   265	                worst = pu;
+   266	            }
+   267	        }
+   268	    }
+   269	    if worst == 0.0 {
+   270	        return 8000;
+   271	    }
+   272	    (-log2(worst) * 1000.0) as u32
+   273	}
+   274	
+   275	/// SP 800-90B 6.3.1 most-common-value estimate, in milli-bits per 8-bit sample.
+   276	fn mcv_milli(samples: &[u8]) -> (u32, u32, u32) {
+   277	    let mut c = [0u32; 256];
+   278	    for &s in samples {
+   279	        c[s as usize] += 1;
+   280	    }
+   281	    let max = *c.iter().max().unwrap();
+   282	    let distinct = c.iter().filter(|&&x| x > 0).count() as u32;
+   283	    let n = samples.len() as f64;
+   284	    let p = max as f64 / n;
+   285	    let pu = (p + 2.576 * sqrt(p * (1.0 - p) / (n - 1.0))).min(1.0);
+   286	    ((-log2(pu) * 1000.0) as u32, max, distinct)
+   287	}
+   288	
+   289	/// `rng=dump`: print a SEPARATE batch of STARTUP_N raw samples (never used for keys) for offline estimation
+   290	/// (tools/entropy-est.py, or NIST SP800-90B ea_non_iid). Printed before the health tests so a failing source
+   291	/// can still be measured. Full deltas for the first 64, then the 8-bit samples.
+   292	fn dump_raw() {
+   293	    kprint!("rawdelta:");
+   294	    for _ in 0..64 {
+   295	        kprint!(" {}", raw_delta());
+   296	    }
+   297	    kprintln!("");
+   298	    let mut line = [0u8; 64];
+   299	    for i in 0..STARTUP_N / 64 {
+   300	        for b in line.iter_mut() {
+   301	            *b = raw_delta() as u8;
+   302	        }
+   303	        kprint!("rawjit {:04}:", i * 64);
+   304	        for b in line {
+   305	            kprint!(" {:02x}", b);
+   306	        }
+   307	        kprintln!("");
+   308	    }
+   309	}
+   310	
+   311	/// Startup: health-test STARTUP_N samples, estimate min-entropy, seed the key. Err = do not run SSH.
+   312	pub fn init(dump: bool) -> Result<(), ()> {
+   313	    unsafe {
+   314	        if SEEDED {
+   315	            return Ok(());
+   316	        }
+   317	        if FAILED {
+   318	            return Err(());
+   319	        }
+   320	    }
+   321	    // A dead timer is not refused here: the samples then all read 0 and the health tests (the one authority
+   322	    // on the source) must refuse. That is the path the `badjitter` negative control exercises.
+   323	    let g = match tsc_granularity() {
+   324	        Some(g) => g,
+   325	        None => {
+   326	            kprintln!("rng: TSC never advanced in 100000 reads (dead timer?)");
+   327	            1
+   328	        }
+   329	    };
+   330	    // 64 timer steps, but never under 32768 ticks (~20 us on the N570): on a cycle-exact TSC, 64 x granularity
+   331	    // would be a window of a few DRAM accesses and the count close to constant.
+   332	    let w = (64 * g).max(32768);
+   333	    unsafe { WINDOW = w };
+   334	    kprintln!("rng: TSC granularity {} ticks, sample window {} ticks", g, w);
+   335	    if dump {
+   336	        dump_raw();
+   337	    }
+   338	    let mut h = Sha256::new();
+   339	    h.update(b"nc110-m2.5 seed");
+   340	    let t0 = rdtsc();
+   341	    if let Err(e) = gather(&mut h, STARTUP_N, true) {
+   342	        kprintln!("rng: jitter startup health test FAILED ({}) -> refusing to run SSH", e);
+   343	        return Err(());
+   344	    }
+   345	    let cycles = rdtsc().wrapping_sub(t0);
+   346	    let low = unsafe { &*core::ptr::addr_of!(LOWB) };
+   347	    let (hm, max, distinct) = mcv_milli(low);
+   348	    let hl = lag1_milli(low);
+   349	    kprintln!(
+   350	        "rng: jitter startup {} samples passed RCT(cut {}) + APT(W {}, cut {}); {} TSC ticks/sample",
+   351	        STARTUP_N, RCT_CUTOFF, APT_W, APT_CUTOFF, cycles / STARTUP_N as u64
+   352	    );
+   353	    kprintln!(
+   354	        "rng: min-entropy per 8-bit sample: MCV {}.{:03} (max {}/{}, {} distinct), lag-1 {}.{:03}; claimed {}.{:03}",
+   355	        hm / 1000, hm % 1000, max, STARTUP_N, distinct, hl / 1000, hl % 1000, H_CLAIM_MILLI / 1000, H_CLAIM_MILLI % 1000
+   356	    );
+   357	    if hm.min(hl) < H_CLAIM_MILLI {
+   358	        unsafe { FAILED = true };
+   359	        kprintln!("rng: estimate below the claimed 0.1 bit/sample -> refusing to run SSH");
+   360	        return Err(());
+   361	    }
+   362	    if let Err(e) = gather(&mut h, BLOCK_N - STARTUP_N, false) {
+   363	        kprintln!("rng: jitter health test FAILED while seeding ({}) -> refusing to run SSH", e);
+   364	        return Err(());
+   365	    }
+   366	    if has_rdrand() {
+   367	        match rdrand32() {
+   368	            Ok(r) => {
+   369	                h.update(r);
+   370	                unsafe { USE_RDRAND = true };
+   371	                kprintln!("rng: RDRAND present, mixed in (jitter alone already passed)");
+   372	            }
+   373	            Err(()) => {
+   374	                unsafe { FAILED = true };
+   375	                kprintln!("rng: RDRAND present but failing -> refusing to run SSH");
+   376	                return Err(());
+   377	            }
+   378	        }
+   379	    } else {
+   380	        kprintln!("rng: no RDRAND (as on the Atom N570): jitter is the only source");
+   381	    }
+   382	    unsafe {
+   383	        KEY = h.finalize().into();
+   384	        SEEDED = true;
+   385	    }
+   386	    Ok(())
+   387	}
+   388	
+   389	/// Fill `buf` from the ratchet. Errors if not seeded, if a health test ever failed, or if a reseed fails.
+   390	pub fn fill(buf: &mut [u8]) -> Result<(), ()> {
+   391	    unsafe {
+   392	        if !SEEDED || FAILED {
+   393	            return Err(());
+   394	        }
+   395	        CALLS += 1;
+   396	        if CALLS % RESEED_EVERY == 0 {
+   397	            let mut h = Sha256::new();
+   398	            h.update(b"reseed");
+   399	            h.update(KEY);
+   400	            if gather(&mut h, BLOCK_N, false).is_err() {
+   401	                return Err(());
+   402	            }
+   403	            RESEEDS += 1;
+   404	            KEY = h.finalize().into();
+   405	        }
+   406	        if USE_RDRAND {
+   407	            let r = rdrand32().map_err(|_| FAILED = true)?;
+   408	            let mut h = Sha256::new();
+   409	            h.update(b"rdrand");
+   410	            h.update(KEY);
+   411	            h.update(r);
+   412	            KEY = h.finalize().into();
+   413	        }
+   414	        for chunk in buf.chunks_mut(32) {
+   415	            let mut h = Sha256::new();
+   416	            h.update(b"out");
+   417	            h.update(KEY);
+   418	            h.update(CTR.to_le_bytes());
+   419	            CTR += 1;
+   420	            chunk.copy_from_slice(&h.finalize()[..chunk.len()]);
+   421	        }
+   422	        let mut h = Sha256::new();
+   423	        h.update(b"next");
+   424	        h.update(KEY);
+   425	        KEY = h.finalize().into();
+   426	    }
+   427	    Ok(())
+   428	}
+   429	
+   430	/// (requests served, reseeds, raw samples taken (all health-tested), health failure latched)
+   431	/// bmctl `rng <n>`: fresh raw 8-bit samples (low byte of each walk count), the same values the health tests and
+   432	/// estimators see. Never used for keys. For offline SP 800-90B assessment of the real board (tools/entropy-est.py).
+   433	pub fn raw_bytes(out: &mut [u8]) {
+   434	    for b in out.iter_mut() {
+   435	        *b = raw_delta() as u8;
+   436	    }
+   437	}
+   438	
+   439	pub fn stats() -> (u32, u32, u64, bool) {
+   440	    unsafe { (CALLS, RESEEDS, SAMPLES, FAILED) }
+   441	}
+   442	
+   443	#[no_mangle]
+   444	unsafe extern "Rust" fn __getrandom_v03_custom(dest: *mut u8, len: usize) -> Result<(), getrandom::Error> {
+   445	    core::ptr::write_bytes(dest, 0, len);
+   446	    let buf = core::slice::from_raw_parts_mut(dest, len);
+   447	    fill(buf).map_err(|_| getrandom::Error::UNSUPPORTED)
+   448	}
+     1	#!/usr/bin/env python3
+     2	"""Min-entropy assessment of the NC110 jitter source (8-bit raw samples = low byte of each walk count, src/rng.rs).
+     3	
+     4	  tools/.venv/bin/python tools/bmctl.py rng 1000000 /tmp/raw.bin   # capture from a running kernel (real board / q35)
+     5	  python3 tools/entropy-est.py /tmp/raw.bin                         # quick floor + NIST SP 800-90B non-IID
+     6	  python3 tools/entropy-est.py proof/m25-rngdump-serial.log         # old `rng=dump` serial format also accepted
+     7	  python3 tools/entropy-est.py --quick FILE                         # skip NIST (seconds instead of minutes)
+     8	  python3 tools/entropy-est.py --cutoffs 0.25                       # SP 800-90B RCT/APT cutoffs for a claimed H
+     9	  python3 tools/entropy-est.py --selftest                           # mutation check: constant/counter score ~0, urandom ~8
+    10	
+    11	Two layers, report the MIN:
+    12	  quick   MCV (SP 800-90B 6.3.1, 99% upper bound) and lag-1: max over contexts a of the 99% upper bound of
+    13	          max_b P(b | a), a serial-correlation check MCV misses. Same estimators the kernel gates on at startup.
+    14	  NIST    the reference implementation, usnistgov/SP800-90B_EntropyAssessment @ 87c104d, `ea_non_iid -a`, run in
+    15	          Docker (tools/ea/Dockerfile, image nc110-ea:87c104d). Its final line, min(H_original, 8 x H_bitstring),
+    16	          is the SP 800-90B non-IID estimate. NIST wants >= 1,000,000 samples; fewer runs but is flagged.
+    17	Numbers from QEMU measure the HOST (TCG's TSC moves in 1 us host steps), not the N570: q35 only tests the plumbing.
+    18	"""
+    19	import math, os, re, subprocess, sys, tempfile
+    20	from collections import Counter, defaultdict
+    21	
+    22	IMAGE = "nc110-ea:87c104d"
+    23	
+    24	
+    25	def ub(p, n):
+    26	    return min(1.0, p + 2.576 * math.sqrt(p * (1 - p) / max(n - 1, 1)))
+    27	
+    28	
+    29	def cutoffs(h, alpha_exp=30, w=512):
+    30	    rct = 1 + math.ceil(alpha_exp / h)
+    31	    p = 2 ** -h
+    32	    pm = [math.comb(w - 1, k) * p ** k * (1 - p) ** (w - 1 - k) for k in range(w)]
+    33	    for c in range(1, w + 1):
+    34	        if sum(pm[c - 1:]) <= 2 ** -alpha_exp:
+    35	            return rct, c
+    36	    return rct, w
+    37	
+    38	
+    39	def load(path):
+    40	    data = open(path, "rb").read()
+    41	    if b"rawjit " in data[:1 << 16]:
+    42	        s = []
+    43	        for line in data.decode(errors="replace").splitlines():
+    44	            m = re.match(r"rawjit \d+:((?: [0-9a-f]{2})+)", line.strip())
+    45	            if m:
+    46	                s += [int(x, 16) for x in m.group(1).split()]
+    47	        return bytes(s)
+    48	    return data
+    49	
+    50	
+    51	def quick(s):
+    52	    n = len(s)
+    53	    c = Counter(s)
+    54	    v, k = c.most_common(1)[0]
+    55	    h_mcv = max(0.0, -math.log2(ub(k / n, n)))
+    56	    trans = defaultdict(Counter)
+    57	    for a, b in zip(s, s[1:]):
+    58	        trans[a][b] += 1
+    59	    worst = 0.0
+    60	    for a, cb in trans.items():
+    61	        na = sum(cb.values())
+    62	        if na >= 20:
+    63	            worst = max(worst, ub(cb.most_common(1)[0][1] / na, na))
+    64	    h_lag = max(0.0, -math.log2(worst)) if worst else float("nan")
+    65	    return {"n": n, "distinct": len(c), "top": (v, k), "mcv": h_mcv, "lag1": h_lag}
+    66	
+    67	
+    68	def nist(s):
+    69	    with tempfile.TemporaryDirectory() as d:
+    70	        open(os.path.join(d, "raw.bin"), "wb").write(s)
+    71	        r = subprocess.run(["docker", "run", "--rm", "-v", f"{d}:/d", "-w", "/d", IMAGE, "ea_non_iid", "-a", "-v",
+    72	                            "raw.bin", "8"], capture_output=True, text=True)
+    73	    out = r.stdout + r.stderr
+    74	    if "No entropy awarded" in out:  # NIST's own verdict for a one-symbol alphabet
+    75	        return 0.0, {"NIST: one-symbol alphabet, no entropy awarded": 0.0}, out
+    76	    m = re.search(r"min\(H_original, 8 X H_bitstring\):\s*(-?[0-9.]+)", out)
+    77	    if not m:  # a <= 2-symbol alphabet is assessed as binary: then H_original alone is the per-sample figure
+    78	        m = re.search(r"^H_original: (-?[0-9.]+)", out, re.M)
+    79	    if not m:
+    80	        sys.exit(f"ea_non_iid gave no final estimate (exit {r.returncode}):\n{out[-1500:]}")
+    81	    per = {f"{k} [{b}-bit]": float(v) for k, v, b in re.findall(r"^\t(.+?Estimate(?: \(bit string\))?) = (-?[0-9.]+) / (\d) bit", out, re.M)}
+    82	    for k in ("H_original", "H_bitstring"):
+    83	        mm = re.search(rf"^{k}: (-?[0-9.]+)", out, re.M)
+    84	        if mm:
+    85	            per[k] = float(mm.group(1))
+    86	    return max(0.0, float(m.group(1))), per, out
+    87	
+    88	
+    89	def report(path, s, use_nist=True):
+    90	    q = quick(s)
+    91	    v, k = q["top"]
+    92	    print(f"{path}: {q['n']} samples, {q['distinct']} distinct, most common {v:#04x} x{k}")
+    93	    print(f"  quick  MCV {q['mcv']:.3f}  lag-1 {q['lag1']:.3f} bits/sample")
+    94	    h = min(q["mcv"], q["lag1"]) if not math.isnan(q["lag1"]) else q["mcv"]
+    95	    if use_nist:
+    96	        if q["n"] < 1_000_000:
+    97	            print(f"  NOTE   {q['n']} < 1,000,000 samples: NIST runs, but SP 800-90B wants at least 1e6")
+    98	        hn, per, _ = nist(s)
+    99	        for name, val in per.items():
+   100	            print(f"    {name.strip():<40} {val:.4f}")
+   101	        print(f"  NIST   SP 800-90B non-IID min(H_original, 8 x H_bitstring) = {hn:.4f} bits/sample")
+   102	        h = min(h, hn)
+   103	    print(f"  RESULT min-entropy {h:.4f} bits per 8-bit sample (kernel claims 0.100)")
+   104	    return h
+   105	
+   106	
+   107	def selftest():
+   108	    """Mutation check: a source with no noise must score ~0, real randomness ~8, or the estimator is broken."""
+   109	    n = 200_000
+   110	    cases = [
+   111	        ("constant timer (raw_delta returns the same count)", bytes([0x5a]) * n, lambda h: h < 0.05),
+   112	        ("TSC frozen (raw_delta returns 0)", bytes(n), lambda h: h < 0.05),
+   113	        ("deterministic counter (i mod 256)", bytes(i % 256 for i in range(n)), lambda h: h < 0.5),
+   114	        ("two-value alternation", bytes((0x40, 0x41) * (n // 2)), lambda h: h < 0.5),
+   115	        # Full entropy is 8, but the estimators are conservative: NIST's bitstring estimates give ~6.6-7.0 on 1e6
+   116	        # urandom bytes, and the quick lag-1 (max over 256 contexts x 256 values) ~6.3. The point of this case is
+   117	        # that a good source lands far above the 0.1 claim, not that it scores 8.
+   118	        ("os.urandom (1e6 bytes)", os.urandom(1_000_000), lambda h: h > 6.0),
+   119	    ]
+   120	    bad = 0
+   121	    for name, data, ok in cases:
+   122	        print(f"== {name}")
+   123	        h = report(name, data)
+   124	        verdict = ok(h)
+   125	        print(f"  {'ok  ' if verdict else 'FAIL'} expectation\n")
+   126	        bad |= not verdict
+   127	    print("SELFTEST:", "PASS" if not bad else "FAIL")
+   128	    sys.exit(bad)
+   129	
+   130	
+   131	def main():
+   132	    a = sys.argv[1:]
+   133	    if not a:
+   134	        sys.exit(__doc__)
+   135	    if a[0] == "--cutoffs":
+   136	        h = float(a[1])
+   137	        rct, apt = cutoffs(h)
+   138	        print(f"H={h}: RCT cutoff {rct} (1+ceil(30/H)), APT W=512 cutoff {apt} (P(1+Bin(511,2^-H)>=C)<=2^-30)")
+   139	        return
+   140	    if a[0] == "--selftest":
+   141	        selftest()
+   142	    use_nist = a[0] != "--quick"
+   143	    path = a[-1]
+   144	    report(path, load(path), use_nist)
+   145	
+   146	
+   147	main()
+
+web search: 
+web search: https://raw.githubusercontent.com/usnistgov/SP800-90B_EntropyAssessment/87c104d0ed4cbc96103e7b8b38d6f2c7e0a6b289/cpp/non_iid_main.cpp
+exec
+/bin/zsh -lc "curl -fsSL https://raw.githubusercontent.com/usnistgov/SP800-90B_EntropyAssessment/87c104d0ed4cbc96103e7b8b38d6f2c7e0a6b289/cpp/non_iid_main.cpp | rg -n -C 5 'H_original|H_bitstring|printf|alph_size|1000000|all_bits'" in ~/nc110-baremetal
+ exited 1 in 0ms:
+curl: (6) Could not resolve host: raw.githubusercontent.com
+
+web search: 
+web search: https://raw.githubusercontent.com/usnistgov/SP800-90B_EntropyAssessment/87c104d0ed4cbc96103e7b8b38d6f2c7e0a6b289/cpp/non_iid_main.cpp
+exec
+/bin/zsh -lc "docker image ls nc110-ea --format '{{.Repository}}:{{.Tag}}'" in ~/nc110-baremetal
+ succeeded in 0ms:
+nc110-ea:87c104d
+
+codex
+The raw command bypasses the pool and health-test state, but advances the shared memory walk. I’m checking two remaining risks: whether the parser can fall back to the wrong estimate, and whether the selftest would notice that mistake.
+exec
+/bin/zsh -lc "docker run --rm nc110-ea:87c104d sh -c \"grep -n -E 'H_original|H_bitstring|alph_size|1000000|all_bits|printf|No entropy' /ea/cpp/non_iid_main.cpp\"" in ~/nc110-baremetal
+ succeeded in 171ms:
+23:    printf("Usage is: ea_non_iid [-i|-c] [-a|-t] [-v] [-q] [-l <index>,<samples> ] <file_name> [bits_per_symbol]\n\n");
+24:    printf("\t <file_name>: Must be relative path to a binary file with at least 1 million entries (samples).\n");
+25:    printf("\t [bits_per_symbol]: Must be between 1-8, inclusive. By default this value is inferred from the data.\n");
+26:    printf("\t [-i|-c]: '-i' for initial entropy estimate, '-c' for conditioned sequential dataset entropy estimate. The initial entropy estimate is the default.\n");
+27:    printf("\t [-a|-t]: '-a' produces the 'H_bitstring' assessment using all read bits, '-t' truncates the bitstring used to produce the `H_bitstring` assessment to %d bits. Test all data by default.\n", MIN_SIZE);
+28:    printf("\t Note: When testing binary data, no `H_bitstring` assessment is produced, so the `-a` and `-t` options produce the same results for the initial assessment of binary data.\n");
+29:    printf("\t -v: Optional verbosity flag for more output. Can be used multiple times.\n");
+30:    printf("\t -q: Quiet mode, less output to screen. This will override any verbose flags.\n");
+31:    printf("\t -l <index>,<samples>\tRead the <index> substring of length <samples>.\n");
+32:    printf("\n");
+33:    printf("\t Samples are assumed to be packed into 8-bit values, where the least significant 'bits_per_symbol'\n");
+34:    printf("\t bits constitute the symbol.\n");
+35:    printf("\n");
+36:    printf("\t -i: Initial Entropy Estimate (Section 3.1.3)\n");
+37:    printf("\n");
+38:    printf("\t\t Computes the initial entropy estimate H_I as described in Section 3.1.3\n");
+39:    printf("\t\t (not accounting for H_submitter) using the entropy estimators specified in\n");
+40:    printf("\t\t Section 6.3.  If 'bits_per_symbol' is greater than 1, the samples are also\n");
+41:    printf("\t\t converted to bitstrings and assessed to create H_bitstring; for multi-bit symbols,\n");
+42:    printf("\t\t two entropy estimates are computed: H_original and H_bitstring.\n");
+43:    printf("\t\t Returns min(H_original, bits_per_symbol X H_bitstring). The initial entropy\n");
+44:    printf("\t\t estimate H_I = min(H_submitter, H_original, bits_per_symbol X H_bitstring).\n");
+45:    printf("\n");
+46:    printf("\t -c: Conditioned Sequential Dataset Entropy Estimate (Section 3.1.5.2)\n");
+47:    printf("\n");
+48:    printf("\t\t Computes the entropy estimate per bit h' for the conditioned sequential dataset if the\n");
+49:    printf("\t\t conditioning function is non-vetted. The samples are converted to a bitstring.\n");
+50:    printf("\t\t Returns h' = min(H_bitstring).\n");
+51:    printf("\n");
+52:    printf("\t -o: Set Output Type to JSON\n");
+53:    printf("\n");
+54:    printf("\t\t Changes the output format to JSON and sets the file location for the output file.\n");
+55:    printf("\n");
+56:    printf("\t --version: Prints tool version information");
+57:    printf("\n");
+63:    bool initial_entropy, all_bits;
+67:    double H_original, H_bitstring, ret_min_entropy;
+89:    all_bits = true;
+108:                all_bits = true;
+111:                all_bits = false;
+166:        printf("Incorrect usage.\n");
+199:            printf("Invalid bits per symbol.\n");
+207:        if (subsetSize == 0) printf("Opening file: '%s' (SHA-256 hash %s)\n", file_path, hash);
+208:        else printf("Opening file: '%s' (SHA-256 hash %s), reading block %ld of size %ld\n", file_path, hash, subsetIndex, subsetSize);
+218:        printf("Error reading file.\n");
+222:    if (verbose > 1) printf("Loaded %ld samples of %d distinct %d-bit-wide symbols\n", data.len, data.alph_size, data.word_size);
+224:    if (data.alph_size <= 1) {
+226:        printf("Symbol alphabet consists of 1 symbol. No entropy awarded...\n");
+229:        testRun.errorMsg = "Symbol alphabet consists of 1 symbol. No entropy awarded...";
+242:    if (!all_bits && (data.blen > MIN_SIZE)) data.blen = MIN_SIZE;
+244:    if ((verbose > 1) && ((data.alph_size > 2) || !initial_entropy)) printf("Number of Binary Symbols: %ld\n", data.blen);
+245:    if (data.len < MIN_SIZE) printf("\n*** Warning: data contains less than %d samples ***\n\n", MIN_SIZE);
+247:        if (data.alph_size < (1 << data.word_size)) printf("\nSymbols have been translated.\n");
+252:    H_original = data.word_size;
+253:    H_bitstring = 1.0;
+256:        printf("\nRunning non-IID tests...\n\n");
+257:        printf("Running Most Common Value Estimate...\n");
+263:    if (((data.alph_size > 2) || !initial_entropy)) {
+265:        if (verbose == 2) printf("\tMost Common Value Estimate (bit string) = %f / 1 bit(s)\n", ret_min_entropy);
+267:        H_bitstring = min(ret_min_entropy, H_bitstring);
+271:        ret_min_entropy = most_common(data.symbols, data.len, data.alph_size, verbose, "Literal", tc631);
+272:        if (verbose == 2) printf("\tMost Common Value Estimate = %f / %d bit(s)\n", ret_min_entropy, data.word_size);
+274:        H_original = min(ret_min_entropy, H_original);
+283:    if ((verbose == 1) || (verbose == 2)) printf("\nRunning Entropic Statistic Estimates (bit strings only)...\n");
+285:    if (((data.alph_size > 2) || !initial_entropy)) {
+287:        if (verbose == 2) printf("\tCollision Test Estimate (bit string) = %f / 1 bit(s)\n", ret_min_entropy);
+289:        H_bitstring = min(ret_min_entropy, H_bitstring);
+292:    if (initial_entropy && (data.alph_size == 2)) {
+294:        if (verbose == 2) printf("\tCollision Test Estimate = %f / 1 bit(s)\n", ret_min_entropy);
+296:        H_original = min(ret_min_entropy, H_original);
+305:    if (((data.alph_size > 2) || !initial_entropy)) {
+307:        if (verbose == 2) printf("\tMarkov Test Estimate (bit string) = %f / 1 bit(s)\n", ret_min_entropy);
+309:        H_bitstring = min(ret_min_entropy, H_bitstring);
+312:    if (initial_entropy && (data.alph_size == 2)) {
+314:        if (verbose == 2) printf("\tMarkov Test Estimate = %f / 1 bit(s)\n", ret_min_entropy);
+316:        H_original = min(ret_min_entropy, H_original);
+325:    if (((data.alph_size > 2) || !initial_entropy)) {
+328:            if (verbose == 2) printf("\tCompression Test Estimate (bit string) = %f / 1 bit(s)\n", ret_min_entropy);
+330:            H_bitstring = min(ret_min_entropy, H_bitstring);
+334:    if (initial_entropy && (data.alph_size == 2)) {
+337:            if (verbose == 2) printf("\tCompression Test Estimate = %f / 1 bit(s)\n", ret_min_entropy);
+339:            H_original = min(ret_min_entropy, H_original);
+349:    if ((verbose == 1) || (verbose == 2)) printf("\nRunning Tuple Estimates...\n");
+351:    if (((data.alph_size > 2) || !initial_entropy)) {
+354:            if (verbose == 2) printf("\tT-Tuple Test Estimate (bit string) = %f / 1 bit(s)\n", bin_t_tuple_res);
+356:            H_bitstring = min(bin_t_tuple_res, H_bitstring);
+361:        SAalgs(data.symbols, data.len, data.alph_size, t_tuple_res, lrs_res, verbose, "Literal");
+363:            if (verbose == 2) printf("\tT-Tuple Test Estimate = %f / %d bit(s)\n", t_tuple_res, data.word_size);
+365:            H_original = min(t_tuple_res, H_original);
+375:    if ((((data.alph_size > 2) || !initial_entropy)) && (bin_lrs_res >= 0.0)) {
+376:        if (verbose == 2) printf("\tLRS Test Estimate (bit string) = %f / 1 bit(s)\n", bin_lrs_res);
+378:        H_bitstring = min(bin_lrs_res, H_bitstring);
+382:        if (verbose == 2) printf("\tLRS Test Estimate = %f / %d bit(s)\n", lrs_res, data.word_size);
+384:        H_original = min(lrs_res, H_original);
+393:    if ((verbose == 1) || (verbose == 2)) printf("\nRunning Predictor Estimates...\n");
+395:    if (((data.alph_size > 2) || !initial_entropy)) {
+398:            if (verbose == 2) printf("\tMulti Most Common in Window (MultiMCW) Prediction Test Estimate (bit string) = %f / 1 bit(s)\n", ret_min_entropy);
+400:            H_bitstring = min(ret_min_entropy, H_bitstring);
+405:        ret_min_entropy = multi_mcw_test(data.symbols, data.len, data.alph_size, verbose, "Literal");
+407:            if (verbose == 2) printf("\tMulti Most Common in Window (MultiMCW) Prediction Test Estimate = %f / %d bit(s)\n", ret_min_entropy, data.word_size);
+409:            H_original = min(ret_min_entropy, H_original);
+419:    if (((data.alph_size > 2) || !initial_entropy)) {
+422:            if (verbose == 2) printf("\tLag Prediction Test Estimate (bit string) = %f / 1 bit(s)\n", ret_min_entropy);
+424:            H_bitstring = min(ret_min_entropy, H_bitstring);
+429:        ret_min_entropy = lag_test(data.symbols, data.len, data.alph_size, verbose, "Literal");
+431:            if (verbose == 2) printf("\tLag Prediction Test Estimate = %f / %d bit(s)\n", ret_min_entropy, data.word_size);
+433:            H_original = min(ret_min_entropy, H_original);
+443:    if (((data.alph_size > 2) || !initial_entropy)) {
+446:            if (verbose == 2) printf("\tMulti Markov Model with Counting (MultiMMC) Prediction Test Estimate (bit string) = %f / 1 bit(s)\n", ret_min_entropy);
+448:            H_bitstring = min(ret_min_entropy, H_bitstring);
+453:        ret_min_entropy = multi_mmc_test(data.symbols, data.len, data.alph_size, verbose, "Literal");
+455:            if (verbose == 2) printf("\tMulti Markov Model with Counting (MultiMMC) Prediction Test Estimate = %f / %d bit(s)\n", ret_min_entropy, data.word_size);
+457:            H_original = min(ret_min_entropy, H_original);
+467:    if (((data.alph_size > 2) || !initial_entropy)) {
+470:            if (verbose == 2) printf("\tLZ78Y Prediction Test Estimate (bit string) = %f / 1 bit(s)\n", ret_min_entropy);
+472:            H_bitstring = min(ret_min_entropy, H_bitstring);
+477:        ret_min_entropy = LZ78Y_test(data.symbols, data.len, data.alph_size, verbose, "Literal");
+479:            if (verbose == 2) printf("\tLZ78Y Prediction Test Estimate = %f / %d bit(s)\n", ret_min_entropy, data.word_size);
+481:            H_original = min(ret_min_entropy, H_original);
+491:    if ((data.alph_size > 2) || !initial_entropy) {
+492:        h_assessed = min(h_assessed, H_bitstring * data.word_size);
+496:        h_assessed = min(h_assessed, H_original);
+501:            printf("\nH_original: %f\n", H_original);
+502:            if (data.alph_size > 2) {
+503:                printf("H_bitstring: %f\n", H_bitstring);
+504:                printf("min(H_original, %d X H_bitstring): %f\n", data.word_size, min(H_original, data.word_size * H_bitstring));
+507:            printf("\nh': %f\n", H_bitstring);
+510:        if ((data.alph_size > 2) || !initial_entropy) {
+511:            printf("H_bitstring = %.17g\n", H_bitstring);
+512:            printf("H_bitstring Per Symbol = %.17g\n", H_bitstring * data.word_size);
+516:            printf("H_original = %.17g\n", H_original);
+519:        printf("Assessed min entropy: %.17g\n", h_assessed);
+524:    if ((data.alph_size > 2) || !initial_entropy) {
+525:        tcOverall.h_bitstring = H_bitstring;
+529:        tcOverall.h_original = H_original;
+
+exec
+/bin/zsh -lc "docker run --rm nc110-ea:87c104d sh -c \"sed -n '80,125p' /ea/cpp/non_iid_main.cpp; sed -n '215,255p' /ea/cpp/non_iid_main.cpp; sed -n '485,525p' /ea/cpp/non_iid_main.cpp; grep -n -E 'word_size =|word_size=' /ea/cpp/shared/utils.h\"" in ~/nc110-baremetal
+ succeeded in 165ms:
+    string commandline = recreateCommandLine(argc, argv);
+
+    NonIidTestRun testRun;
+    testRun.timestamp = timestamp;
+    testRun.commandline = commandline;
+
+    data.word_size = 0;
+
+    initial_entropy = true;
+    all_bits = true;
+
+    for (int i = 0; i < argc; i++) {
+        std::string Str = std::string(argv[i]);
+        if ("--version" == Str) {
+            printVersion("noniid");
+            exit(0);
+        }
+    }
+
+    while ((opt = getopt(argc, argv, "icatvql:o:")) != -1) {
+        switch (opt) {
+            case 'i':
+                initial_entropy = true;
+                break;
+            case 'c':
+                initial_entropy = false;
+                break;
+            case 'a':
+                all_bits = true;
+                break;
+            case 't':
+                all_bits = false;
+                break;
+            case 'v':
+                verbose++;
+                break;
+            case 'q':
+                quietMode = true;
+                break;
+            case 'l':
+                inint = strtoull(optarg, &nextOption, 0);
+                if ((inint > ULONG_MAX) || (errno == EINVAL) || (nextOption == NULL) || (*nextOption != ',')) {
+                    testRun.errorLevel = -1;
+                    testRun.errorMsg = "Error on index/samples.";
+
+                    if (jsonOutput) {
+            output << testRun.GetAsJson();
+            output.close();
+        }
+        printf("Error reading file.\n");
+        print_usage();
+    }
+
+    if (verbose > 1) printf("Loaded %ld samples of %d distinct %d-bit-wide symbols\n", data.len, data.alph_size, data.word_size);
+
+    if (data.alph_size <= 1) {
+
+        printf("Symbol alphabet consists of 1 symbol. No entropy awarded...\n");
+
+        testRun.errorLevel = -1;
+        testRun.errorMsg = "Symbol alphabet consists of 1 symbol. No entropy awarded...";
+
+        if (jsonOutput) {
+            ofstream output;
+            output.open(outputfilename);
+            output << testRun.GetAsJson();
+            output.close();
+        }
+
+        free_data(&data);
+        exit(-1);
+    }
+
+    if (!all_bits && (data.blen > MIN_SIZE)) data.blen = MIN_SIZE;
+
+    if ((verbose > 1) && ((data.alph_size > 2) || !initial_entropy)) printf("Number of Binary Symbols: %ld\n", data.blen);
+    if (data.len < MIN_SIZE) printf("\n*** Warning: data contains less than %d samples ***\n\n", MIN_SIZE);
+    if (verbose > 1) {
+        if (data.alph_size < (1 << data.word_size)) printf("\nSymbols have been translated.\n");
+    }
+
+    // The maximum min-entropy is -log2(1/2^word_size) = word_size
+    // The maximum bit string min-entropy is 1.0
+    H_original = data.word_size;
+    H_bitstring = 1.0;
+
+    if ((verbose == 1) || (verbose == 2)) {
+    tc6310.testCaseNumber = "LZ78Y Test";
+    testRun.testCases.push_back(tc6310);
+
+    double h_assessed;
+    h_assessed = data.word_size;
+
+    if ((data.alph_size > 2) || !initial_entropy) {
+        h_assessed = min(h_assessed, H_bitstring * data.word_size);
+    }
+
+    if (initial_entropy) {
+        h_assessed = min(h_assessed, H_original);
+    }
+
+    if ((verbose == 1) || (verbose == 2)) {
+        if (initial_entropy) {
+            printf("\nH_original: %f\n", H_original);
+            if (data.alph_size > 2) {
+                printf("H_bitstring: %f\n", H_bitstring);
+                printf("min(H_original, %d X H_bitstring): %f\n", data.word_size, min(H_original, data.word_size * H_bitstring));
+            }
+        } else {
+            printf("\nh': %f\n", H_bitstring);
+        }
+    } else if (verbose > 2) {
+        if ((data.alph_size > 2) || !initial_entropy) {
+            printf("H_bitstring = %.17g\n", H_bitstring);
+            printf("H_bitstring Per Symbol = %.17g\n", H_bitstring * data.word_size);
+        }
+
+        if (initial_entropy) {
+            printf("H_original = %.17g\n", H_original);
+        }
+
+        printf("Assessed min entropy: %.17g\n", h_assessed);
+    }
+
+    NonIidTestCase tcOverall;
+
+    if ((data.alph_size > 2) || !initial_entropy) {
+        tcOverall.h_bitstring = H_bitstring;
+265:	if(dp->word_size == 0) {
+277:		dp->word_size = i;
+327:	if(dp->word_size == 1) dp->bsymbols = dp->symbols;
+430:	if(dp->word_size == 0) {
+443:		dp->word_size = i;
+494:	if(dp->word_size == 1) dp->bsymbols = dp->symbols;
+
+web search: 
+web search: '1000' in https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-90B.pdf
+exec
+/bin/zsh -lc 'python3 tools/entropy-est.py --selftest' in ~/nc110-baremetal
+exec
+/bin/zsh -lc "python3 - <<'PY'
+from pathlib import Path
+import random, os
+ns={}
+exec(compile(Path('tools/entropy-est.py').read_text().rsplit('\\nmain()',1)[0], 'entropy-est.py','exec'),ns)
+n=200000
+r=random.Random(17)
+for name,s in [('slow drift',bytes((i//1000)%256 for i in range(n))),('4 cycle 1% replacement',bytes(r.randrange(4) if r.random()<.01 else i%4 for i in range(n))),('urandom',os.urandom(1000000))]: print(name,ns['quick'](s))
+for s in [bytes([90])*n,bytes(n),bytes(i%256 for i in range(n)),bytes([64,65])*(n//2)]:
+ q=ns['quick'](s); print('mutant quick', min(q['mcv'],q['lag1']))
+PY" in ~/nc110-baremetal
+ succeeded in 121ms:
+slow drift {'n': 200000, 'distinct': 200, 'top': (0, 1000), 'mcv': 7.531147291090761, 'lag1': 0.0}
+4 cycle 1% replacement {'n': 200000, 'distinct': 4, 'top': (2, 50027), 'mcv': 1.984904087216487, 'lag1': 0.01842777957954842}
+urandom {'n': 1000000, 'distinct': 256, 'top': (145, 4118), 'mcv': 7.867174220769339, 'lag1': 6.330156764081533}
+mutant quick 0.0
+mutant quick 0.0
+mutant quick 0.0
+mutant quick 0.0
+
+ succeeded in 13899ms:
+== constant timer (raw_delta returns the same count)
+constant timer (raw_delta returns the same count): 200000 samples, 1 distinct, most common 0x5a x200000
+  quick  MCV 0.000  lag-1 0.000 bits/sample
+  NOTE   200000 < 1,000,000 samples: NIST runs, but SP 800-90B wants at least 1e6
+    NIST: one-symbol alphabet, no entropy awarded 0.0000
+  NIST   SP 800-90B non-IID min(H_original, 8 x H_bitstring) = 0.0000 bits/sample
+  RESULT min-entropy 0.0000 bits per 8-bit sample (kernel claims 0.100)
+  ok   expectation
+
+== TSC frozen (raw_delta returns 0)
+TSC frozen (raw_delta returns 0): 200000 samples, 1 distinct, most common 0x00 x200000
+  quick  MCV 0.000  lag-1 0.000 bits/sample
+  NOTE   200000 < 1,000,000 samples: NIST runs, but SP 800-90B wants at least 1e6
+    NIST: one-symbol alphabet, no entropy awarded 0.0000
+  NIST   SP 800-90B non-IID min(H_original, 8 x H_bitstring) = 0.0000 bits/sample
+  RESULT min-entropy 0.0000 bits per 8-bit sample (kernel claims 0.100)
+  ok   expectation
+
+== deterministic counter (i mod 256)
+deterministic counter (i mod 256): 200000 samples, 256 distinct, most common 0x00 x782
+  quick  MCV 7.872  lag-1 0.000 bits/sample
+  NOTE   200000 < 1,000,000 samples: NIST runs, but SP 800-90B wants at least 1e6
+    Most Common Value Estimate (bit string) [1-bit] 0.9970
+    Most Common Value Estimate [8-bit]       7.8717
+    Collision Test Estimate (bit string) [1-bit] 1.0000
+    Markov Test Estimate (bit string) [1-bit] 0.9998
+    Compression Test Estimate (bit string) [1-bit] 0.6811
+    T-Tuple Test Estimate (bit string) [1-bit] 0.0000
+    T-Tuple Test Estimate [8-bit]            -0.0000
+    LRS Test Estimate (bit string) [1-bit]   0.0000
+    LRS Test Estimate [8-bit]                -0.0000
+    Multi Most Common in Window (MultiMCW) Prediction Test Estimate (bit string) [1-bit] 0.8225
+    Multi Most Common in Window (MultiMCW) Prediction Test Estimate [8-bit] 8.0000
+    Lag Prediction Test Estimate (bit string) [1-bit] 0.3840
+    Lag Prediction Test Estimate [8-bit]     8.0000
+    Multi Markov Model with Counting (MultiMMC) Prediction Test Estimate (bit string) [1-bit] 0.0066
+    Multi Markov Model with Counting (MultiMMC) Prediction Test Estimate [8-bit] 0.0000
+    LZ78Y Prediction Test Estimate (bit string) [1-bit] 1.0000
+    LZ78Y Prediction Test Estimate [8-bit]   0.0000
+    H_original                               -0.0000
+    H_bitstring                              0.0000
+  NIST   SP 800-90B non-IID min(H_original, 8 x H_bitstring) = 0.0000 bits/sample
+  RESULT min-entropy 0.0000 bits per 8-bit sample (kernel claims 0.100)
+  ok   expectation
+
+== two-value alternation
+two-value alternation: 200000 samples, 2 distinct, most common 0x40 x100000
+  quick  MCV 0.992  lag-1 0.000 bits/sample
+  NOTE   200000 < 1,000,000 samples: NIST runs, but SP 800-90B wants at least 1e6
+    Most Common Value Estimate [8-bit]       0.9917
+    Collision Test Estimate [1-bit]          1.0000
+    Markov Test Estimate [1-bit]             0.0078
+    Compression Test Estimate [1-bit]        -0.0000
+    T-Tuple Test Estimate [8-bit]            -0.0000
+    LRS Test Estimate [8-bit]                -0.0000
+    Multi Most Common in Window (MultiMCW) Prediction Test Estimate [8-bit] 1.0000
+    Lag Prediction Test Estimate [8-bit]     -0.0000
+    Multi Markov Model with Counting (MultiMMC) Prediction Test Estimate [8-bit] -0.0000
+    LZ78Y Prediction Test Estimate [8-bit]   -0.0000
+    H_original                               -0.0000
+  NIST   SP 800-90B non-IID min(H_original, 8 x H_bitstring) = 0.0000 bits/sample
+  RESULT min-entropy 0.0000 bits per 8-bit sample (kernel claims 0.100)
+  ok   expectation
+
+== os.urandom (1e6 bytes)
+os.urandom (1e6 bytes): 1000000 samples, 256 distinct, most common 0xbc x4083
+  quick  MCV 7.879  lag-1 6.353 bits/sample
+    Most Common Value Estimate (bit string) [1-bit] 0.9983
+    Most Common Value Estimate [8-bit]       7.8793
+    Collision Test Estimate (bit string) [1-bit] 0.9518
+    Markov Test Estimate (bit string) [1-bit] 0.9994
+    Compression Test Estimate (bit string) [1-bit] 0.9002
+    T-Tuple Test Estimate (bit string) [1-bit] 0.9459
+    T-Tuple Test Estimate [8-bit]            7.8793
+    LRS Test Estimate (bit string) [1-bit]   0.9734
+    LRS Test Estimate [8-bit]                7.7188
+    Multi Most Common in Window (MultiMCW) Prediction Test Estimate (bit string) [1-bit] 0.9987
+    Multi Most Common in Window (MultiMCW) Prediction Test Estimate [8-bit] 7.9153
+    Lag Prediction Test Estimate (bit string) [1-bit] 0.9994
+    Lag Prediction Test Estimate [8-bit]     7.9775
+    Multi Markov Model with Counting (MultiMMC) Prediction Test Estimate (bit string) [1-bit] 0.9998
+    Multi Markov Model with Counting (MultiMMC) Prediction Test Estimate [8-bit] 7.9369
+    LZ78Y Prediction Test Estimate (bit string) [1-bit] 0.9995
+    LZ78Y Prediction Test Estimate [8-bit]   7.9376
+    H_original                               7.7188
+    H_bitstring                              0.9002
+  NIST   SP 800-90B non-IID min(H_original, 8 x H_bitstring) = 7.2014 bits/sample
+  RESULT min-entropy 6.3530 bits per 8-bit sample (kernel claims 0.100)
+  ok   expectation
+
+SELFTEST: PASS
+
+codex
+The pinned tool’s output matches the parser’s normal paths, including binary alphabets and negative zero. The real selftest passes, but all four bad-source cases already score zero in the quick estimator, so they cannot detect an inflated NIST result. Additional quick checks caught a slowly drifting count and a four-value cycle with 1% random replacement, scoring 0 and 0.0184 bits/sample respectively.
+exec
+/bin/zsh -lc "python3 - <<'PY'
+from pathlib import Path
+import contextlib, io
+ns={}
+exec(compile(Path('tools/entropy-est.py').read_text().rsplit('\\nmain()',1)[0], 'entropy-est.py','exec'),ns)
+ns['nist']=lambda s:(8.0,{},'BROKEN: always eight')
+out=io.StringIO()
+with contextlib.redirect_stdout(out):
+ try: ns['selftest']()
+ except SystemExit as e: status=e.code
+print('Selftest with NIST replaced by constant 8:', status, out.getvalue().splitlines()[-1])
+PY" in ~/nc110-baremetal
+ succeeded in 108ms:
+Selftest with NIST replaced by constant 8: 0 SELFTEST: PASS
+
+exec
+/bin/zsh -lc "nl -ba tools/bmctl.py | tail -30; nl -ba tools/loader-q35-test.sh | tail -25; sed -n '195,245p' src/bmctl.rs; sed -n '130,183p' src/wdt.rs; rg -n 'rng::init|bmctl::run' src/main.rs" in ~/nc110-baremetal
+ succeeded in 0ms:
+   124	        time.sleep(1)
+   125	        try:
+   126	            TIMEOUT[0] = 1.0
+   127	            aead, boot, sid = handshake()
+   128	            SEQ[0] = 0
+   129	            pong = call("ping").decode() if boot != old else None
+   130	        except (OSError, ValueError, SystemExit):  # rpc() and handshake() signal failure with SystemExit
+   131	            continue
+   132	        if pong:
+   133	            print(f"new kernel up: boot {boot.hex()} after {time.time() - t0:.1f} s; {pong}")
+   134	            sys.exit(0)
+   135	    sys.exit("no new kernel answered (authenticated) within 60 s")
+   136	if a.cmd[0] == "rng":
+   137	    total, out = int(a.cmd[1]), bytearray()
+   138	    while len(out) < total:
+   139	        out += call(f"rng {min(1200, total - len(out))}")
+   140	    open(a.cmd[2], "wb").write(out)
+   141	    print(f"wrote {len(out)} raw samples to {a.cmd[2]}")
+   142	    sys.exit(0)
+   143	if cmd == "logall":
+   144	    off, out = 0, b""
+   145	    while True:
+   146	        chunk = call(f"log {off}")
+   147	        if not chunk:
+   148	            break
+   149	        out += chunk
+   150	        off += len(chunk)
+   151	    sys.stdout.write(out.decode(errors="replace"))
+   152	else:
+   153	    print(call(cmd).decode(errors="replace"))
+    22	neg "n3 no kludge flag"   "X=1" "$T/nokludge.elf" "lacks the address kludge"
+    23	neg "n4 bss into staging" "X=1" "$T/overlap.elf" "target range"
+    24	neg "n5 out-of-order"     "BMCTL_TEST_SWAP=1" "$K" "out of order"
+    25	for g in 2 3; do
+    26	  r=$($B load $K bmctl gen=$g 2>&1 | tail -1); l=$($B logall | grep -c "cmdline: bmctl gen=$g")
+    27	  k=$($B logall | grep -c 'keymod: client key from module 0 at 0x9000')
+    28	  case "$r" in "new kernel up"*) [ "$l" = 1 ] && [ "$k" = 1 ] && echo "ok   hop to gen=$g: $r" || { echo "FAIL hop gen=$g log=$l key=$k"; fail=1; };;
+    29	  *) echo "FAIL hop gen=$g: $r"; fail=1;; esac
+    30	done
+    31	kill $Q 2>/dev/null; wait $Q 2>/dev/null
+    32	# n6: the client stages half an image and vanishes (no lcom). The kernel must reset by itself: idle timeout
+    33	# (idle=10 here, 600 s by default) -> final log -> 60 s of petting -> 0xCF9. With -no-reboot QEMU then exits.
+    34	qemu-system-x86_64 -machine q35 -m 128 -display none -no-reboot -global ICH9-LPC.noreboot=false -serial file:/tmp/loader-q35-stall.log \
+    35	  -kernel $K -initrd test-keys/client.key -append "bmctl idle=10" -netdev user,id=n0,hostfwd=udp:127.0.0.1:15515-:5515 -device rtl8139,netdev=n0 &
+    36	Q=$!
+    37	for i in $(seq 40); do grep -q 'bmctl: listening' /tmp/loader-q35-stall.log 2>/dev/null && break; sleep 0.5; done
+    38	until $B ping >/dev/null 2>&1; do sleep 1; done
+    39	t0=$(date +%s); BMCTL_TEST_SEND=300000 BMCTL_TEST_ABANDON=1 $B load $K bmctl x >/dev/null 2>&1
+    40	for i in $(seq 120); do kill -0 $Q 2>/dev/null || break; sleep 1; done
+    41	dt=$(( $(date +%s) - t0 ))
+    42	if kill -0 $Q 2>/dev/null; then echo "FAIL n6 stalled transfer: still running after ${dt} s"; fail=1
+    43	elif grep -q 'bmctl: idle 10 s -> reset' /tmp/loader-q35-stall.log && grep -q 'hard reset via 0xCF9' /tmp/loader-q35-stall.log; then
+    44	  echo "ok   n6 client vanished mid-transfer: idle reset + 0xCF9 after ${dt} s, no kick"
+    45	else echo "FAIL n6: exited after ${dt} s without the idle/0xCF9 lines"; fail=1; fi
+    46	echo "RESULT: $([ $fail = 0 ] && echo PASS || echo FAIL)"; exit $fail
+}
+
+pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
+    let idle_ms = crate::mb::cmdline(info).split(' ').find_map(|w| w.strip_prefix("idle=")).and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| (5..=3600).contains(v)).map_or(IDLE_MS, |v| v * 1000);
+    crate::loader::snapshot_boot_info(info);
+    let nic_mmio = match nic.bus {
+        Bus::Mmio(b) => Some(b),
+        Bus::Pio(_) => None,
+    };
+    if rng::init(false).is_err() {
+        return;
+    }
+    let key = derive_key(&seed);
+    let mut boot_id = [0u8; 16];
+    let mut rs = [0u8; 8];
+    if rng::fill(&mut boot_id).is_err() || rng::fill(&mut rs).is_err() {
+        kprintln!("bmctl: entropy failed -> not starting");
+        return;
+    }
+    let mut bid = heapless::String::<64>::new();
+    hex(&boot_id, &mut bid);
+    let mac = nic.mac;
+    let mut dev = Nic(nic);
+    let mut cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    cfg.random_seed = u64::from_le_bytes(rs);
+    let mut iface = Interface::new(cfg, &mut dev, now());
+    let mut sockets = SocketSet::new(unsafe { &mut *core::ptr::addr_of_mut!(SOCKS) }[..].as_mut());
+    let dhcp_h = sockets.add(dhcpv4::Socket::new());
+    let udp_h = sockets.add(udp::Socket::new(
+        udp::PacketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(RX_META) }[..].as_mut(), unsafe { &mut *core::ptr::addr_of_mut!(RX_BUF) }[..].as_mut()),
+        udp::PacketBuffer::new(unsafe { &mut *core::ptr::addr_of_mut!(TX_META) }[..].as_mut(), unsafe { &mut *core::ptr::addr_of_mut!(TX_BUF) }[..].as_mut()),
+    ));
+    let t0 = time::now_ms();
+    let mut ip = None;
+    while ip.is_none() && time::now_ms() - t0 < 15_000 {
+        wdt::pet();
+        crate::net::rx_budget(Some(32));
+        iface.poll(now(), &mut dev, &mut sockets);
+        if let Some(dhcpv4::Event::Configured(c)) = sockets.get_mut::<dhcpv4::Socket>(dhcp_h).poll() {
+            iface.update_ip_addrs(|a| {
+                a.clear();
+                let _ = a.push(IpCidr::Ipv4(c.address));
+            });
+            if let Some(gw) = c.router {
+                let _ = iface.routes_mut().add_default_ipv4_route(gw);
+            }
+            ip = Some(c.address);
+        }
+    }
+    let Some(ip) = ip else {
+    loop {
+        unsafe { core::arch::asm!("cli; hlt") };
+    }
+}
+
+/// Attended `wdt=probe`: arm the NM10 TCO ourselves without touching locked bits (SMI_EN.TCO_EN stays as the
+/// BIOS left it): clear GCS.NO_REBOOT (the BIOS leaves it SET on the NC110), clear stale status, TMR=50 ticks
+/// (30 s per stage, reset ~60 s after the last pet), reload, un-halt. Returns true if the readback says armed.
+pub fn arm_probe() -> bool {
+    let lpc = pci::read32(pci::b0(31, 0), 0);
+    let rcba_raw = pci::read32(pci::b0(31, 0), 0xF0);
+    if !(lpc == 0x27BC_8086 || lpc == 0x2918_8086) || pmbase() == 0 || rcba_raw & 1 == 0 {
+        kprintln!("wdt: probe arm: prerequisites fail (LPC {:#010x}, PMBASE {:#x}, RCBA {:#x})", lpc, pmbase(), rcba_raw);
+        return false;
+    }
+    let b = base();
+    let rcba = rcba_raw & 0xFFFF_C000;
+    let gcs_p = (rcba + 0x3410) as *mut u32;
+    unsafe {
+        let g0 = read_volatile(gcs_p);
+        let (cnt0, tmr0, rld0) = (inw(b + 8), inw(b + 0x12) & 0x3FF, inw(b) & 0x3FF);
+        kprintln!("wdt: inherited: GCS {:#x} NO_REBOOT={} TCO1_CNT={:#06x} HLT={} TMR={} RLD={} ({})", g0, (g0 >> 5) & 1, cnt0,
+            (cnt0 >> 11) & 1, tmr0, rld0, if g0 & 0x20 == 0 && cnt0 & 0x800 == 0 { "inherited enabled: NO_REBOOT clear, timer running" } else { "inherited not enabled" });
+        core::ptr::write_volatile(gcs_p, g0 & !0x20);
+        outw(b + 4, 0x0008); // TCO1_STS.TIMEOUT (RW1C)
+        outw(b + 6, 0x0002); // TCO2_STS.SECOND_TO_STS
+        outw(b + 6, 0x0004); // TCO2_STS.BOOT_STS
+        outw(b + 0x12, (inw(b + 0x12) & !0x3FF) | 50);
+        outw(b, 1);
+        outw(b + 8, inw(b + 8) & !0x0800); // un-halt; bit 12 (lock) written back as read
+        let (g1, cnt, tmr, c0) = (read_volatile(gcs_p), inw(b + 8), inw(b + 0x12) & 0x3FF, inw(b) & 0x3FF);
+        delay_ms(1300);
+        let c1 = inw(b) & 0x3FF;
+        let ok = g1 & 0x20 == 0 && cnt & 0x0800 == 0 && tmr == 50 && c1 != c0;
+        kprintln!("wdt: probe arm: GCS {:#x} -> {:#x} TCO1_CNT={:#06x} TMR={} RLD {}->{} SMI_EN={:#x} => {}",
+            g0, g1, cnt, tmr, c0, c1, inl(pmbase() + 0x30), if ok { "ARMED" } else { "NOT ARMED" });
+        ok
+    }
+}
+
+pub fn pet() {
+    unsafe { outw(base(), 1) };
+}
+
+/// ACPI PM timer (PMBASE+0x08, 3.579545 MHz, 24-bit) based delay; same block on ICH9 and NM10.
+fn pm_timer() -> u32 {
+    unsafe { inl(pmbase() + 8) & 0x00FF_FFFF }
+}
+
+pub fn delay_ms(ms: u32) {
+    let need = ms as u64 * 3_579_545 / 1000;
+    let mut last = pm_timer();
+    let mut acc = 0u64;
+    while acc < need {
+95:                        bmctl::run(n, seed, info);
+
+codex
+Reviewed `9e39eb1`; no edits. **No MUST-FIX found for merging this as assessment tooling.** It does not yet substantiate the N570’s 0.1-bit claim.
+
+I inspected the pinned estimator source inside the existing Docker image and ran the actual `--selftest`: **PASS**.
+
+**SHOULD-FIX**
+
+1. **The selftest cannot detect an inflated NIST estimate.** [entropy-est.py:107](~/nc110-baremetal/tools/entropy-est.py:107) tests the combined minimum, and every negative fixture already scores exactly zero through the quick estimators. I replaced `nist()` in memory with an unconditional **8 bits/sample**: the entire selftest still passed.
+
+   Assert NIST results separately, add explicit parser fixtures, and include a predictable sequence whose lag-1 estimate stays positive. Counter/alternation thresholds of `<0.5` also permit results above the kernel’s `0.1` claim.
+
+   The proposed weak-source examples are not automatically missed: my quick checks scored a count incrementing every 1,000 samples at **0**, and a four-value cycle with 1% random replacement at **0.0184**. These are useful additional fixtures, but still would not expose the masking problem.
+
+2. **Capture accepts arbitrary authenticated response bodies as samples.** [bmctl.py:136](~/nc110-baremetal/tools/bmctl.py:136) never checks the returned length. Against an older kernel, repeated `err unknown command ...` responses become a purported raw capture; an empty response causes an endless loop, and oversized responses overshoot the requested total.
+
+   Require exactly the requested byte count before appending, and validate arguments. Authentication establishes who returned the bytes, not that they are RNG samples.
+
+3. **Parser fallback should fail closed on incomplete executions.** [entropy-est.py:73](~/nc110-baremetal/tools/entropy-est.py:73) ignores the exit status and accepts `H_original` whenever the combined final line is absent—even for a known multivalued input. An incomplete run containing `H_original` can therefore become a successful assessment without the potentially lower bitstring result.
+
+   Keep the explicit single-symbol exception; otherwise require successful completion and require the combined line when `len(set(s)) > 2`. This is robustness against incomplete output, **not a demonstrated overestimate on a completed run of the pinned executable**.
+
+**Parser verdict**
+
+For the actual invocation and complete pinned output, the interpretation is correct:
+
+- Two-symbol alphabets use `H_original` directly, even when symbols occupy byte values such as `0x40/0x41`; no ×8 inflation.
+- Single-symbol input produces “No entropy awarded” and exits unsuccessfully; mapping that specific verdict to zero is correct.
+- `-0.000000` parses and normalizes correctly.
+- Multivalued data uses the printed `min(H_original, 8 X H_bitstring)`, rather than mixing per-bit and per-symbol estimates.
+- `-a` already matches this revision’s default; `-t` would truncate the bitstring assessment.
+- Fewer than one million samples generate a warning rather than rejection. The wrapper accurately reports that limitation.
+
+The combined numeric result cannot exceed the successfully parsed final estimate. Four-decimal display rounding can round upward slightly; that is presentation, not entropy inflation.
+
+The urandom threshold is honest as a smoke test: this run produced **NIST 7.2014**, quick lag-1 **6.3530**, combined **6.3530**. Requiring `>6` is reasonable; neither that result nor the comment’s approximate range is a calibration guarantee.
+
+**Raw-command safety**
+
+[raw_bytes](~/nc110-baremetal/src/rng.rs:433) does not read or update `KEY`, the ratchet counter, health-test state, or credited sample count. Samples are fresh and are not subsequently fed into the key pool. Retries return the cached response, avoiding duplicate sampling or duplicate appends.
+
+It **does** advance shared `WALK_POS`, modify `WALK`, and affect cache/DRAM state. Thus it perturbs subsequent physical sampling, although it does not contaminate the pool with disclosed samples. I found no direct past-key disclosure path. Freshness alone cannot rule out correlations with earlier samples from an inadequately characterized source.
+
+The 1,200-sample cap implies roughly **24 ms** at the documented ~20 μs window, with watchdog petting between requests. No normal-operation starvation issue found. The sampling loops have iteration bounds, but these are not a measured worst-case time guarantee under timer faults.
+
+**Real-board assessment requirements**
+
+Back-to-back sampling is appropriate for the non-IID track; independence must not be assumed. However, this capture omits the health/hash work performed between production samples and introduces network processing every 1,200 samples. Measure whether that changes the distribution, and retain burst boundaries and capture conditions.
+
+Capture cold-start and warmed operation separately. This command becomes available only after successful initialization, so it misses failing starts and cannot by itself characterize the samples already consumed for boot seeding. Low-byte assessment matches the credited symbol; hashing full counts does not justify crediting additional entropy.
+
+A million-sample sequential run does not replace restart testing: §3.1.4 requires **1,000 restarts × 1,000 samples**, with row/column assessment. The standard permits concatenated sequential blocks of at least 1,000 samples; this client’s million-byte capture ends with a 400-byte burst, so adjust collection if relying on that provision. [SP 800-90B](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-90B.pdf)
+
+**NIT:** [n6:39](~/nc110-baremetal/tools/loader-q35-test.sh:39) does not establish that staging succeeded before abandonment. A failed load followed by ordinary idle reset can pass. Assert the abandonment marker; bound the preceding ping loop too. `idle=` is also available in production builds, despite its test-only purpose.
+
+**7/10** — useful tooling with correct normal-path NIST interpretation; validation and capture integrity need tightening.
+tokens used
+52,371
+Reviewed `9e39eb1`; no edits. **No MUST-FIX found for merging this as assessment tooling.** It does not yet substantiate the N570’s 0.1-bit claim.
+
+I inspected the pinned estimator source inside the existing Docker image and ran the actual `--selftest`: **PASS**.
+
+**SHOULD-FIX**
+
+1. **The selftest cannot detect an inflated NIST estimate.** [entropy-est.py:107](~/nc110-baremetal/tools/entropy-est.py:107) tests the combined minimum, and every negative fixture already scores exactly zero through the quick estimators. I replaced `nist()` in memory with an unconditional **8 bits/sample**: the entire selftest still passed.
+
+   Assert NIST results separately, add explicit parser fixtures, and include a predictable sequence whose lag-1 estimate stays positive. Counter/alternation thresholds of `<0.5` also permit results above the kernel’s `0.1` claim.
+
+   The proposed weak-source examples are not automatically missed: my quick checks scored a count incrementing every 1,000 samples at **0**, and a four-value cycle with 1% random replacement at **0.0184**. These are useful additional fixtures, but still would not expose the masking problem.
+
+2. **Capture accepts arbitrary authenticated response bodies as samples.** [bmctl.py:136](~/nc110-baremetal/tools/bmctl.py:136) never checks the returned length. Against an older kernel, repeated `err unknown command ...` responses become a purported raw capture; an empty response causes an endless loop, and oversized responses overshoot the requested total.
+
+   Require exactly the requested byte count before appending, and validate arguments. Authentication establishes who returned the bytes, not that they are RNG samples.
+
+3. **Parser fallback should fail closed on incomplete executions.** [entropy-est.py:73](~/nc110-baremetal/tools/entropy-est.py:73) ignores the exit status and accepts `H_original` whenever the combined final line is absent—even for a known multivalued input. An incomplete run containing `H_original` can therefore become a successful assessment without the potentially lower bitstring result.
+
+   Keep the explicit single-symbol exception; otherwise require successful completion and require the combined line when `len(set(s)) > 2`. This is robustness against incomplete output, **not a demonstrated overestimate on a completed run of the pinned executable**.
+
+**Parser verdict**
+
+For the actual invocation and complete pinned output, the interpretation is correct:
+
+- Two-symbol alphabets use `H_original` directly, even when symbols occupy byte values such as `0x40/0x41`; no ×8 inflation.
+- Single-symbol input produces “No entropy awarded” and exits unsuccessfully; mapping that specific verdict to zero is correct.
+- `-0.000000` parses and normalizes correctly.
+- Multivalued data uses the printed `min(H_original, 8 X H_bitstring)`, rather than mixing per-bit and per-symbol estimates.
+- `-a` already matches this revision’s default; `-t` would truncate the bitstring assessment.
+- Fewer than one million samples generate a warning rather than rejection. The wrapper accurately reports that limitation.
+
+The combined numeric result cannot exceed the successfully parsed final estimate. Four-decimal display rounding can round upward slightly; that is presentation, not entropy inflation.
+
+The urandom threshold is honest as a smoke test: this run produced **NIST 7.2014**, quick lag-1 **6.3530**, combined **6.3530**. Requiring `>6` is reasonable; neither that result nor the comment’s approximate range is a calibration guarantee.
+
+**Raw-command safety**
+
+[raw_bytes](~/nc110-baremetal/src/rng.rs:433) does not read or update `KEY`, the ratchet counter, health-test state, or credited sample count. Samples are fresh and are not subsequently fed into the key pool. Retries return the cached response, avoiding duplicate sampling or duplicate appends.
+
+It **does** advance shared `WALK_POS`, modify `WALK`, and affect cache/DRAM state. Thus it perturbs subsequent physical sampling, although it does not contaminate the pool with disclosed samples. I found no direct past-key disclosure path. Freshness alone cannot rule out correlations with earlier samples from an inadequately characterized source.
+
+The 1,200-sample cap implies roughly **24 ms** at the documented ~20 μs window, with watchdog petting between requests. No normal-operation starvation issue found. The sampling loops have iteration bounds, but these are not a measured worst-case time guarantee under timer faults.
+
+**Real-board assessment requirements**
+
+Back-to-back sampling is appropriate for the non-IID track; independence must not be assumed. However, this capture omits the health/hash work performed between production samples and introduces network processing every 1,200 samples. Measure whether that changes the distribution, and retain burst boundaries and capture conditions.
+
+Capture cold-start and warmed operation separately. This command becomes available only after successful initialization, so it misses failing starts and cannot by itself characterize the samples already consumed for boot seeding. Low-byte assessment matches the credited symbol; hashing full counts does not justify crediting additional entropy.
+
+A million-sample sequential run does not replace restart testing: §3.1.4 requires **1,000 restarts × 1,000 samples**, with row/column assessment. The standard permits concatenated sequential blocks of at least 1,000 samples; this client’s million-byte capture ends with a 400-byte burst, so adjust collection if relying on that provision. [SP 800-90B](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-90B.pdf)
+
+**NIT:** [n6:39](~/nc110-baremetal/tools/loader-q35-test.sh:39) does not establish that staging succeeded before abandonment. A failed load followed by ordinary idle reset can pass. Assert the abandonment marker; bound the preceding ping loop too. `idle=` is also available in production builds, despite its test-only purpose.
+
+**7/10** — useful tooling with correct normal-path NIST interpretation; validation and capture integrity need tightening.

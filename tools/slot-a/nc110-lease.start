@@ -1,0 +1,31 @@
+#!/bin/sh
+# /etc/local.d/nc110-lease.start on Slot A (installed by tools/nc110-install-agentos.sh --lease-service). Active ONLY
+# when the kernel cmdline carries nc110.lease=<s> (agent routes: the agent OS's Linux hop and GRUB's recovery boot); a
+# manual boot from the Shift menu is untouched. It holds /dev/watchdog and feeds it while an agent keeps renewing
+# /dev/shm/nc110-lease (touch it). Renewal = mtime CHANGE, aged on /proc/uptime, so wall-clock jumps cannot extend it.
+# Expiry is TERMINAL and does not depend on a userspace shutdown (iTCO stops the watchdog on reboot, so a hung shutdown
+# would need hands): sync, remount / read-only (best effort), then never feed again -> the TCO resets the board
+# (~60 s) into GRUB's default, the agent OS. If this loop dies, the fd closes uncleanly (no magic 'V') and the TCO
+# also resets. Remove this file to disable.
+L=$(sed -n 's/.*nc110\.lease=\([0-9][0-9]*\).*/\1/p' /proc/cmdline)
+[ -n "$L" ] || exit 0
+F=/dev/shm/nc110-lease
+touch "$F" || exit 0
+setsid sh -c '
+  up() { cut -d. -f1 /proc/uptime; }
+  exec 3>/dev/watchdog || { logger -t nc110-lease "cannot open /dev/watchdog"; exit 1; }
+  last_m=$(stat -c %Y '"$F"') || exit 1
+  last_u=$(up)
+  while :; do
+    if m=$(stat -c %Y '"$F"' 2>/dev/null) && [ "$m" != "$last_m" ]; then
+      last_m=$m; last_u=$(up)
+    fi
+    if [ $(( $(up) - last_u )) -ge '"$L"' ]; then
+      logger -t nc110-lease "lease expired after '"$L"' s: sync, / read-only, stop feeding -> TCO reset into the agent OS" &
+      sync; mount -o remount,ro / 2>/dev/null; sync
+      while :; do sleep 3600; done
+    fi
+    printf 1 >&3 || exit 1
+    sleep 10
+  done' </dev/null >/dev/null 2>&1 &
+exit 0

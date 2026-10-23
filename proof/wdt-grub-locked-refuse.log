@@ -1,0 +1,56 @@
+[  0.000s] host: qemu-system-x86_64 -machine q35 -m 128 -display none -vga std -global ICH9-LPC.noreboot=false -action watchdog=reset -serial file:~/nc110-baremetal/proof/.wdt-grub-locked-refuse.serial -qmp unix:~/nc110-baremetal/proof/.qmp.sock,server,wait=off -cdrom grub-test/wdt-locked-refuse.iso -boot d
+[  0.383s] serial: [H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  0.383s] serial: 
+[  0.383s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=2021
+[  0.383s] serial: 
+grub: mode locked-refuse
+[  0.581s] serial: 
+wdt: selftest OK (21 regexp cases + test -o)
+[  0.581s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  0.581s] serial: 
+wdt: before: GCS=20 TCO1_CNT=1800 TCO2_STS=0 (6 = last reset was the watchdog)
+[  0.581s] serial: 
+wdt: TCO_LOCK set, NOT arming (lock_mode=refuse)
+[  0.581s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[  3.604s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  4.230s] serial: 
+[H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  4.230s] serial: 
+[  4.409s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=21
+[  4.409s] serial: 
+grub: mode locked-refuse
+[  4.409s] serial: 
+wdt: selftest OK (21 regexp cases + test -o)
+[  4.409s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  4.502s] serial: 
+wdt: before: GCS=20 TCO1_CNT=1800 TCO2_STS=0 (6 = last reset was the watchdog)
+[  4.502s] serial: 
+wdt: TCO_LOCK set, NOT arming (lock_mode=refuse)
+[  4.502s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[  7.584s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  8.251s] serial: 
+[H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  8.251s] serial: 
+[  8.448s] serial: 
+q35: TCO_EN clear attempt under TCO_LOCK -> SMI_EN=21
+[  8.448s] serial: 
+grub: mode locked-refuse
+[  8.448s] serial: 
+wdt: selftest OK (21 regexp cases + test -o)
+[  8.448s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  8.647s] serial: 
+wdt: before: GCS=20 TCO1_CNT=1800 TCO2_STS=0 (6 = last reset was the watchdog)
+[  8.647s] serial: 
+wdt: TCO_LOCK set, NOT arming (lock_mode=refuse)
+[  8.647s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[ 11.617s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[ 12.121s] host: stop: banners=0 want=1 elapsed=12.1s
+[ 12.131s] host: VERDICT expect=refuse: PASS (3 refusals, 3 GRUB reboots, 0 kernel boots, 0 WATCHDOG)

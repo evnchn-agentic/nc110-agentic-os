@@ -1,0 +1,71 @@
+r8169_main.c: OK
+8139cp.c: OK
+
+running 5 tests
+test a_wrong_value_is_caught ... ok
+test rtl8101e_matches_r8169_v6_12 ... ok   mac0                 ours=0x00000000 linux=0x00000000  r8169_main.c:173 MAC0
+ok   tx_ring              ours=0x00000020 linux=0x00000020  r8169_main.c:178 TxDescStartAddrLow
+ok   chip_cmd             ours=0x00000037 linux=0x00000037  r8169_main.c:184 ChipCmd
+ok   tx_poll              ours=0x00000038 linux=0x00000038  r8169_main.c:185 TxPoll
+ok   intr_mask            ours=0x0000003c linux=0x0000003c  r8169_main.c:186 IntrMask
+ok   intr_status          ours=0x0000003e linux=0x0000003e  r8169_main.c:187 IntrStatus
+ok   tx_config            ours=0x00000040 linux=0x00000040  r8169_main.c:189 TxConfig
+ok   rx_config            ours=0x00000044 linux=0x00000044  r8169_main.c:193 RxConfig
+ok   cfg9346              ours=0x00000050 linux=0x00000050  r8169_main.c:205 Cfg9346
+ok   phyar                ours=0x00000060 linux=0x00000060  r8169_main.c:214 PHYAR
+ok   phystatus            ours=0x0000006c linux=0x0000006c  r8169_main.c:215 PHYstatus
+ok   rx_max_size          ours=0x000000da linux=0x000000da  r8169_main.c:216 RxMaxSize
+ok   cplus_cmd            ours=0x000000e0 linux=0x000000e0  r8169_main.c:217 CPlusCmd
+ok   intr_mitigate        ours=0x000000e2 linux=0x000000e2  r8169_main.c:218 IntrMitigate
+ok   rx_ring              ours=0x000000e4 linux=0x000000e4  r8169_main.c:228 RxDescAddrLow
+ok   max_tx_packet_size   ours=0x000000ec linux=0x000000ec  r8169_main.c:234 MaxTxPacketSize
+ok   npq                  ours=0x00000040 linux=0x00000040  r8169_main.c:387 NPQ
+ok   cmd_reset            ours=0x00000010 linux=0x00000010  r8169_main.c:380 CmdReset
+ok   cmd_rx_enb           ours=0x00000008 linux=0x00000008  r8169_main.c:381 CmdRxEnb
+ok   cmd_tx_enb           ours=0x00000004 linux=0x00000004  r8169_main.c:382 CmdTxEnb
+ok   desc_own             ours=0x80000000 linux=0x80000000  r8169_main.c:484 DescOwn
+ok   ring_end             ours=0x40000000 linux=0x40000000  r8169_main.c:485 RingEnd
+ok   first_frag           ours=0x20000000 linux=0x20000000  r8169_main.c:486 FirstFrag
+ok   last_frag            ours=0x10000000 linux=0x10000000  r8169_main.c:487 LastFrag
+ok   rx_err (RxRES)       ours=0x00200000 linux=0x00200000  r8169_main.c:374 RxRES
+ok   rx_len_mask          ours=0x00003fff linux=0x00003fff  r8169_main.c:4630 pkt_size
+ok   CFG9346_UNLOCK       ours=0x000000c0 linux=0x000000c0  r8169_main.c:392 Cfg9346_Unlock
+ok   CFG9346_LOCK         ours=0x00000000 linux=0x00000000  r8169_main.c:391 Cfg9346_Lock
+ok   CPCMD_RXVLAN         ours=0x00000040 linux=0x00000040  r8169_main.c:455 RxVlan
+ok   CPCMD_RXCHKSUM       ours=0x00000020 linux=0x00000020  r8169_main.c:456 RxChkSum
+ok   TX_PACKET_MAX        ours=0x0000003f linux=0x0000003f  r8169_main.c:236 TxPacketMax
+ok   TX_DMA_BURST         ours=0x00000007 linux=0x00000007  r8169_main.c:61 TX_DMA_BURST
+ok   INTER_FRAME_GAP      ours=0x00000003 linux=0x00000003  r8169_main.c:62 InterFrameGap
+ok   RX_FIFO_THRESH       ours=0x0000e000 linux=0x0000e000  r8169_main.c:198 RX_FIFO_THRESH
+ok   RX_DMA_BURST         ours=0x00000700 linux=0x00000700  r8169_main.c:203 RX_DMA_BURST
+ok   RX128_INT_EN         ours=0x00008000 linux=0x00008000  r8169_main.c:194 RX128_INT_EN
+ok   ACCEPT_BROADCAST     ours=0x00000008 linux=0x00000008  r8169_main.c:398 AcceptBroadcast
+ok   ACCEPT_MY_PHYS       ours=0x00000002 linux=0x00000002  r8169_main.c:400 AcceptMyPhys
+ok   PHYAR_FLAG           ours=0x80000000 linux=0x80000000  r8169_main.c:1151 PHYAR
+ok   LINK_STATUS          ours=0x00000002 linux=0x00000002  r8169_main.c:469 LinkStatus
+ok
+test rtl8139cp_matches_8139cp_v6_12 ... ok   mac0                 ours=0x00000000 linux=0x00000000  8139cp.c:138 MAC0
+ok   tx_ring              ours=0x00000020 linux=0x00000020  8139cp.c:141 TxRingAddr
+ok   chip_cmd             ours=0x00000037 linux=0x00000037  8139cp.c:143 Cmd
+ok   intr_mask            ours=0x0000003c linux=0x0000003c  8139cp.c:144 IntrMask
+ok   intr_status          ours=0x0000003e linux=0x0000003e  8139cp.c:145 IntrStatus
+ok   tx_config            ours=0x00000040 linux=0x00000040  8139cp.c:146 TxConfig
+ok   rx_config            ours=0x00000044 linux=0x00000044  8139cp.c:148 RxConfig
+ok   cfg9346              ours=0x00000050 linux=0x00000050  8139cp.c:150 Cfg9346
+ok   tx_poll              ours=0x000000d9 linux=0x000000d9  8139cp.c:162 TxPoll
+ok   rx_max_size          ours=0x000000da linux=0x000000da  8139cp.c:163 RxMaxSize
+ok   cplus_cmd            ours=0x000000e0 linux=0x000000e0  8139cp.c:164 CpCmd
+ok   rx_ring              ours=0x000000e4 linux=0x000000e4  8139cp.c:166 RxRingAddr
+ok   desc_own             ours=0x80000000 linux=0x80000000  8139cp.c:172 DescOwn
+ok   ring_end             ours=0x40000000 linux=0x40000000  8139cp.c:173 RingEnd
+ok   first_frag           ours=0x20000000 linux=0x20000000  8139cp.c:174 FirstFrag
+ok   last_frag            ours=0x10000000 linux=0x10000000  8139cp.c:175 LastFrag
+ok   rx_err (RxError)     ours=0x00100000 linux=0x00100000  8139cp.c:180 RxError
+ok   npq (NormalTxPoll)   ours=0x00000040 linux=0x00000040  8139cp.c:189 NormalTxPoll
+ok   rx_len_mask          ours=0x00001fff linux=0x00001fff  8139cp.c:487 len
+ok
+test storage_guard ... ok
+test the_deltas_m0_listed_are_real ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+

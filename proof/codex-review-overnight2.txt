@@ -1,0 +1,1434 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a14adf-ef25-7a50-9daa-3b82dd6ae8e7
+--------
+user
+Calibrated adversarial review of commits 8f75737..HEAD (git log --oneline 8f75737..HEAD; git diff 8f75737 HEAD -- src tools grub-test/nc110-grubarm-func.cfg). Context: a bare-metal Rust kernel iterating unattended overnight on a REAL Samsung NC110 (NM10 TCO with TCO_LOCK=1, RTL8105E). New: (1) rtl_hw_start_8105e_1/2 port in src/nic.rs (compare against third_party/linux-v6.12/r8169_main.c:1255-1277, 2886-2915, 3619-3650; check EPHYAR protocol, register offsets 0xF0/0xD3/0xD0/0x54, the Cfg9346 unlock window, error paths leaving bus mastering off), (2) GRUB-side arming: grub-test/nc110-grubarm-func.cfg appended to the live grub.cfg (lock_mode=accept, its gate justification), and GRUBARM/GRUBSLEEP/WAIT_N in tools/nc110-boot.sh (now GRUBARM on by default; does the generated entry ever boot our kernel unarmed? quoting of the ARM block; any path leaving next_entry set), (3) wdt.rs inherited-state log. On hardware: GRUBSLEEP reset ~120 s after arming; k18 kernel inherited GCS 0x440 NO_REBOOT=0 TMR=100. Tier MUST-FIX/SHOULD-FIX/NIT, signal over volume, 'most is sound' valid. Do not edit. End 0-10.
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll inspect the commits, compare the NIC sequence with the Linux reference, and trace the GRUB arming and cleanup paths. I won’t edit files.
+exec
+/bin/zsh -lc 'git log --oneline 8f75737..HEAD; git diff 8f75737 HEAD -- src tools grub-test/nc110-grubarm-func.cfg' in ~/nc110-baremetal
+ succeeded in 0ms:
+c4f649e nc110-boot.sh: GRUB arming on by default (k18: kernel inherited GCS 0x440 NO_REBOOT=0 TMR=100 from GRUB)
+607c989 wdt: log the inherited TCO state before arming (shows whether GRUB armed it)
+110e603 nc110-boot.sh: WAIT_N for long tests (GRUBSLEEP)
+1349375 nc110-boot.sh GRUBARM/GRUBSLEEP options; keep the hand-made k2-k5 entry files
+64deac4 GRUB-side TCO arming for the NC110 (nc110_tco_consts with lock_mode=accept; gate met by k5/k6/k9) + nc110-boot.sh GRUBARM/GRUBSLEEP; q35 rehearsal of the entry shape: GRUB sleep ended by the watchdog 5.1 s after arming (TMR=5)
+f097db3 nic=no8105e A/B switch
+d870adf nic: rtl_hw_start_8105e_1/2 for VER_29/30 (FuncEvent, MCU EN_NDP|EN_OOB_RESET, DLLPR PFM_EN, ephy table, L2/L3 off, VER_30 ephy 0x1e bit 15)
+diff --git a/grub-test/nc110-grubarm-func.cfg b/grub-test/nc110-grubarm-func.cfg
+new file mode 100644
+index 0000000..3f10ac3
+--- /dev/null
++++ b/grub-test/nc110-grubarm-func.cfg
+@@ -0,0 +1,25 @@
++# Appended once to the NC110 grub.cfg (2026-10-18). Defines the GRUB-side TCO arming used by nc110-bm-* entries
++# made with GRUBARM=1. lock_mode=accept: the NC110 BIOS sets TCO_LOCK=1/TCO_EN=1; the gate in m1-nc110-entry.cfg
++# ("only after a reset at ~2x heartbeat on THIS board") is met by k5/k6/k9 on 2026-10-17: the same register state
++# (NO_REBOOT cleared, TCO_EN left set, TMR programmed, timer running) reset the board unaided 60 s after a hang.
++function nc110_tco_consts {
++  insmod iorw
++  insmod memrw
++  insmod setpci
++  insmod regexp
++  search --no-floppy --fs-uuid --set=root c0954bc7-86a0-440c-8401-2c3e95549743
++  source /baremetal/tco-arm.cfg
++  set lpc_expect=27bc8086
++  set pmbase_expect=1001
++  set rcba_expect=fed1c001
++  set gcs_addr=0xfed1f410
++  set smi_en=0x1030
++  set tco_rld=0x1060
++  set tco1_sts=0x1064
++  set tco2_sts=0x1066
++  set tco1_cnt=0x1068
++  set tco_tmr=0x1072
++  set tmr_val=0x64
++  set tmr_re='^([0-9a-f]*[048c])?64$'
++  set lock_mode=accept
++}
+diff --git a/src/main.rs b/src/main.rs
+index 4499c37..e66d700 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -67,6 +67,9 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
+ 
+     match nic::probe(cmdline.contains("nic=mmio")) {
+         Ok(mut n) => {
++            if cmdline.contains("nic=no8105e") {
++                n.skip_8105e(); // A/B switch for the rtl_hw_start_8105e tweaks
++            }
+             kprintln!("nic: {} at {} {} mac={}", n.name(), n.bdf, n.bus, dhcp::Mac(n.mac));
+             match n.init() {
+                 Ok(()) if cfg!(feature = "attended") => {
+diff --git a/src/nic.rs b/src/nic.rs
+index b7d3efc..f3b3d41 100644
+--- a/src/nic.rs
++++ b/src/nic.rs
+@@ -102,6 +102,7 @@ pub struct Rtl {
+     pub mac: [u8; 6],
+     rx_next: usize,
+     rx_cfg: u32,
++    ver: u8, // r8169 RTL_GIGA_MAC_VER_xx (0 = rtl8139 C+)
+ }
+ 
+ const PCI_CMD_IO: u32 = 1 << 0;
+@@ -168,7 +169,7 @@ fn mmio_window(b: Bdf) -> Result<u64, &'static str> {
+ 
+ /// Subset of rtl8169_get_mac_version (r8169_main.c:2318-2325, first match wins): the 8101E/8102E/8103E
+ /// versions whose init this file implements, plus the 8105E (VER_29/30) found in the real NC110 (same generic path;
+-/// its rtl_hw_start_8105e_* ephy/FuncEvent/MCU tweaks are NOT done). Anything else (8106E, 8402, ...) is refused.
++/// plus rtl_hw_start_8105e_*, see hw_start_8105e). Anything else (8106E, 8402, ...) is refused.
+ fn xid_version(xid: u32) -> Option<u8> {
+     const T: [(u32, u32, u8); 10] = [
+         (0x7cf, 0x409, 29), // RTL8105E (r8169_main.c:2316-2317); the real NC110 is XID 0x40a -> VER_30
+@@ -213,7 +214,7 @@ fn probe_8139cp(b: Bdf, mmio: bool) -> Result<Rtl, &'static str> {
+     for (i, m) in mac.iter_mut().enumerate() {
+         *m = unsafe { bus.r8(R::RTL8139CP.mac0 + i as u16) };
+     }
+-    Ok(Rtl { bus, regs: &R::RTL8139CP, bdf: b, mac, rx_next: 0, rx_cfg: 0x0000_E70A })
++    Ok(Rtl { bus, regs: &R::RTL8139CP, bdf: b, mac, rx_next: 0, rx_cfg: 0x0000_E70A, ver: 0 })
+ }
+ 
+ fn probe_8101e(b: Bdf) -> Result<Rtl, &'static str> {
+@@ -241,7 +242,7 @@ fn probe_8101e(b: Bdf) -> Result<Rtl, &'static str> {
+     for (i, x) in mac.iter_mut().enumerate() {
+         *x = unsafe { bus.r8(r.mac0 + i as u16) };
+     }
+-    Ok(Rtl { bus, regs: r, bdf: b, mac, rx_next: 0, rx_cfg: rx_cfg | R::ACCEPT_BROADCAST | R::ACCEPT_MY_PHYS })
++    Ok(Rtl { bus, regs: r, bdf: b, mac, rx_next: 0, rx_cfg: rx_cfg | R::ACCEPT_BROADCAST | R::ACCEPT_MY_PHYS, ver })
+ }
+ 
+ impl Rtl {
+@@ -276,6 +277,61 @@ impl Rtl {
+         Err("PHYAR read timeout")
+     }
+ 
++    pub fn skip_8105e(&mut self) {
++        if self.ver == 29 || self.ver == 30 {
++            kprintln!("nic: nic=no8105e: skipping rtl_hw_start_8105e (generic 810x path only)");
++            self.ver += 100;
++        }
++    }
++
++    /// rtl_ephy_write / rtl_ephy_read (r8169_main.c:1261-1277): EPHYAR 0x80, flag bit 31, reg 20:16, data 15:0.
++    fn ephy_write(&self, reg: u32, val: u16) -> Result<(), &'static str> {
++        unsafe { self.bus.w32(0x80, 0x8000_0000 | val as u32 | (reg & 0x1F) << 16) };
++        for _ in 0..100 {
++            time::delay_us(10);
++            if unsafe { self.bus.r32(0x80) } & 0x8000_0000 == 0 {
++                time::delay_us(10);
++                return Ok(());
++            }
++        }
++        Err("EPHYAR write timeout")
++    }
++
++    fn ephy_read(&self, reg: u32) -> Result<u16, &'static str> {
++        unsafe { self.bus.w32(0x80, (reg & 0x1F) << 16) };
++        for _ in 0..100 {
++            time::delay_us(10);
++            let v = unsafe { self.bus.r32(0x80) };
++            if v & 0x8000_0000 != 0 {
++                return Ok(v as u16);
++            }
++        }
++        Err("EPHYAR read timeout")
++    }
++
++    /// rtl_hw_start_8105e_1 / _2 (r8169_main.c:3619-3650), VER_29/30 only. Called with Cfg9346 unlocked.
++    fn hw_start_8105e(&self) -> Result<(), &'static str> {
++        const E: [(u32, u16, u16); 8] =
++            [(0x07, 0, 0x4000), (0x19, 0, 0x0200), (0x19, 0, 0x0020), (0x1e, 0, 0x2000), (0x03, 0, 0x0001), (0x19, 0, 0x0100), (0x19, 0, 0x0004), (0x0a, 0, 0x0020)];
++        unsafe {
++            let fe = self.bus.r32(0xF0); // FuncEvent: force LAN exit from ASPM if Rx/Tx not idle; no early tally
++            self.bus.w32(0xF0, (fe | 0x0000_2800) & !0x0001_0000);
++            self.bus.w8(0xD3, self.bus.r8(0xD3) | (1 << 3) | (1 << 2)); // MCU: EN_NDP | EN_OOB_RESET
++            self.bus.w8(0xD0, self.bus.r8(0xD0) | (1 << 6)); // DLLPR: PFM_EN
++        }
++        for (reg, mask, bits) in E {
++            let w = (self.ephy_read(reg)? & !mask) | bits;
++            self.ephy_write(reg, w)?;
++        }
++        unsafe { self.bus.w8(0x54, self.bus.r8(0x54) & !(1 << 1)) }; // Config3: clear Rdy_to_L23 (l2l3 disable)
++        if self.ver == 30 {
++            let w = self.ephy_read(0x1e)? | 0x8000;
++            self.ephy_write(0x1e, w)?;
++        }
++        kprintln!("nic: rtl_hw_start_8105e_{} applied (FuncEvent, MCU, DLLPR, 8 ephy writes, L2/L3 off)", self.ver - 28);
++        Ok(())
++    }
++
+     fn reset(&self) -> Result<(), &'static str> {
+         let r = self.regs;
+         unsafe {
+@@ -354,6 +410,14 @@ impl Rtl {
+             self.bus.w16(r.intr_mitigate, 0);
+             self.bus.w16(r.rx_max_size, BUFSZ as u16); // Linux uses 16 KiB buffers; ours are 1536 B
+             self.program_rings();
++        }
++        if self.ver == 29 || self.ver == 30 {
++            if let Err(e) = self.hw_start_8105e() {
++                unsafe { self.bus.w8(r.cfg9346, R::CFG9346_LOCK) };
++                return Err(e); // bus mastering is still off here
++            }
++        }
++        unsafe {
+             self.bus.w8(r.cfg9346, R::CFG9346_LOCK);
+             self.bus.w16(r.intr_mask, 0);
+             self.bus.w16(r.intr_status, 0xFFFF);
+diff --git a/src/wdt.rs b/src/wdt.rs
+index 1a1522d..50f3df0 100644
+--- a/src/wdt.rs
++++ b/src/wdt.rs
+@@ -147,6 +147,9 @@ pub fn arm_probe() -> bool {
+     let gcs_p = (rcba + 0x3410) as *mut u32;
+     unsafe {
+         let g0 = read_volatile(gcs_p);
++        let (cnt0, tmr0, rld0) = (inw(b + 8), inw(b + 0x12) & 0x3FF, inw(b) & 0x3FF);
++        kprintln!("wdt: inherited: GCS {:#x} NO_REBOOT={} TCO1_CNT={:#06x} HLT={} TMR={} RLD={} ({})", g0, (g0 >> 5) & 1, cnt0,
++            (cnt0 >> 11) & 1, tmr0, rld0, if g0 & 0x20 == 0 && cnt0 & 0x800 == 0 { "already armed, by GRUB" } else { "not armed before us" });
+         core::ptr::write_volatile(gcs_p, g0 & !0x20);
+         outw(b + 4, 0x0008); // TCO1_STS.TIMEOUT (RW1C)
+         outw(b + 6, 0x0002); // TCO2_STS.SECOND_TO_STS
+diff --git a/tools/nc110-boot.sh b/tools/nc110-boot.sh
+index 7990c64..fbaf5f4 100755
+--- a/tools/nc110-boot.sh
++++ b/tools/nc110-boot.sh
+@@ -2,6 +2,9 @@
+ # One attended/overnight iteration on the real NC110 (evnchn's go: 2026-10-17 21:08 "continue over the night").
+ # Usage: [MODULE=test-keys/client.key] tools/nc110-boot.sh <tag> [kernel cmdline]   (kernel built beforehand)
+ # MODULE: a THROWAWAY test client key only (never a homelab key); copied to /baremetal/nc110-test-client.key.
++# GRUBARM=1: GRUB arms the TCO first (nc110_tco_consts + tco_arm, see grub-test/nc110-grubarm-func.cfg, which must
++#   already be in grub.cfg); a refused arm reboots after 10 s. GRUBSLEEP=1 (with GRUBARM): no kernel, GRUB sleeps
++#   600 s unpetted then reboots: back in ~150 s = the GRUB-armed watchdog reset it, ~620 s = it did not.
+ # Formula rules: backup grub.cfg, NEW file /baremetal/k-attended-<sha8>.elf, NEW menuentry appended, original
+ # prefix verified byte-identical, live grub-script-check, one-shot via next_entry only, saved_entry stays 0.
+ # Then: reboot from Slot A, wait (<= 6 min) for a NEW boot_id, print what arrived on UDP 5514 since the reboot.
+@@ -28,7 +31,19 @@ grep -qx nc110 <<<"$st" && grep -qx /dev/sda2 <<<"$st" && grep -qx saved_entry=0
+   || { echo "not in Slot A default state: STOP"; echo "$st"; exit 2; }
+ B0=$(tail -1 <<<"$st")
+ S "grep -q '^menuentry \"$E\"' /boot/grub/grub.cfg" && { echo "entry $E already exists: pick a new tag"; exit 2; }
+-ENTRY="menuentry \"$E\" {
++ARM=""
++GRUBARM=${GRUBARM-1}   # default ON since 2026-10-18 01:18 (k18); GRUBARM= turns it off
++[ -n "${GRUBARM:-}" ] && ARM='
++  terminal_output console
++  nc110_tco_consts
++  tco_arm
++  if [ "$wdt_ok" != "yes" ]; then echo "nc110-bm: GRUB did NOT arm the TCO, rebooting"; sleep 10; reboot; fi
++  echo "nc110-bm: GRUB armed the TCO (~120 s to reset if nobody pets)"'
++[ -n "${GRUBSLEEP:-}" ] && [ -n "$ARM" ] && ARM="$ARM"'
++  echo "nc110-bm: GRUBSLEEP: sleeping 600 s unpetted, then reboot"
++  sleep 600
++  reboot'
++ENTRY="menuentry \"$E\" {$ARM
+   insmod ext2
+   search --no-floppy --fs-uuid --set=root c0954bc7-86a0-440c-8401-2c3e95549743
+   terminal_output console
+@@ -61,7 +76,7 @@ S "grub-editenv /boot/grub/grubenv set next_entry='$E' && grub-editenv /boot/gru
+   || { echo "could not set next_entry: STOP"; clear_next; exit 2; }
+ S "(sleep 1; reboot) >/dev/null 2>&1 &"
+ T0=$(date +%s); echo "reboot at $(date +%T)"; sleep 30
+-for n in $(seq 66); do
++for n in $(seq ${WAIT_N:-66}); do
+   r=$(S 'cat /proc/sys/kernel/random/boot_id; grub-editenv /boot/grub/grubenv list; cut -d" " -f1 /proc/uptime' 2>/dev/null)
+   if [ -n "$r" ] && [ "$(head -1 <<<"$r")" = "$B0" ] && [ "$n" -ge 6 ]; then   # still the old boot 60 s later
+     echo "reboot did not happen: clearing next_entry, STOP"; clear_next; exit 2
+@@ -72,5 +87,5 @@ for n in $(seq 66); do
+       tail -c +$((mark + 1)) "$LOG" | grep -a -v '^--- ' | awk '!seen[$0]++' | sed 's/^nc110 [0-9] [0-9/]* //'; exit 0; }
+   sleep 5
+ done
+-echo "NOT BACK within 6 min of $(date -d @$T0 +%T 2>/dev/null || echo reboot): STOP, do not retry, needs a power cycle"
++echo "NOT BACK within $(( ${WAIT_N:-66} * 5 / 60 + 1 )) min of $(date -d @$T0 +%T 2>/dev/null || echo reboot): STOP, do not retry, needs a power cycle"
+ tail -c +$((mark + 1)) "$LOG" | grep -a -v '^--- ' | awk '!seen[$0]++'; exit 3
+
+exec
+/bin/zsh -lc "rg --files -g AGENTS.md -g '*grubarm*' -g '*wdt*'" in ~/nc110-baremetal
+ succeeded in 0ms:
+src/wdt.rs
+run-wdt.py
+tools/wdt-mutants.sh
+tools/step1-linux-wdt.sh
+proof/attended-wdtprobe-q35-serial.log
+proof/m25-wdt-hang-regression.log
+proof/wdt-grub-badrcba.log
+proof/wdt-hang.log
+proof/wdt-refuse.serial.log
+proof/wdt-grub-locked-accept.trace.txt
+proof/wdt-pos.log
+proof/wdt-neg.log
+proof/wdt-mut-no-tmr.log
+proof/wdt-grub-locked-accept.log
+proof/wdt-mut-no-unhalt.log
+proof/wdt-mut-no-arm.log
+proof/wdt-grub.log
+proof/wdt-mut-no-noreboot.log
+proof/wdt-mut-accept-default.log
+proof/wdt-grub-locked-refuse.log
+grub-test/wdt.iso
+grub-test/wdt-locked-accept.iso
+grub-test/nc110-grubarm-func.cfg
+grub-test/wdt-locked-refuse.iso
+grub-test/wdt-badrcba.iso
+
+exec
+/bin/zsh -lc "cat tools/nc110-boot.sh; cat grub-test/tco-arm.cfg; cat grub-test/m1-nc110-entry.cfg; sed -n '180,460p' src/nic.rs; sed -n '85,205p' src/wdt.rs" in ~/nc110-baremetal
+ succeeded in 0ms:
+#!/usr/bin/env bash
+# One attended/overnight iteration on the real NC110 (evnchn's go: 2026-10-17 21:08 "continue over the night").
+# Usage: [MODULE=test-keys/client.key] tools/nc110-boot.sh <tag> [kernel cmdline]   (kernel built beforehand)
+# MODULE: a THROWAWAY test client key only (never a homelab key); copied to /baremetal/nc110-test-client.key.
+# GRUBARM=1: GRUB arms the TCO first (nc110_tco_consts + tco_arm, see grub-test/nc110-grubarm-func.cfg, which must
+#   already be in grub.cfg); a refused arm reboots after 10 s. GRUBSLEEP=1 (with GRUBARM): no kernel, GRUB sleeps
+#   600 s unpetted then reboots: back in ~150 s = the GRUB-armed watchdog reset it, ~620 s = it did not.
+# Formula rules: backup grub.cfg, NEW file /baremetal/k-attended-<sha8>.elf, NEW menuentry appended, original
+# prefix verified byte-identical, live grub-script-check, one-shot via next_entry only, saved_entry stays 0.
+# Then: reboot from Slot A, wait (<= 6 min) for a NEW boot_id, print what arrived on UDP 5514 since the reboot.
+# Exit 3 = not back: STOP, do not retry; the operator must power-cycle.
+set -u
+TAG=$1; CL=${2:-}
+TEST_KEY_SHA=2d330230f2f6432d9fa93733edce80448d6793631ebd6348046a285d71862b85   # test-keys/client.key, the throwaway key; nothing else may be copied
+[[ $TAG =~ ^[a-z0-9-]{1,40}$ ]] || { echo "tag must be [a-z0-9-]"; exit 2; }
+[[ $CL =~ ^[a-z0-9=:.\ -]{0,80}$ ]] || { echo "cmdline must be [a-z0-9=:. -]"; exit 2; }
+K=target/attended/x86_64-unknown-none/release/nc110-kernel
+LOG=$HOME/party/nc110-m1/udplog.txt
+H=$(shasum -a 256 "$K" | cut -c1-8); KN=k-attended-$H.elf; E="nc110-bm-$TAG"
+clear_next() {  # unset next_entry and PROVE it is gone; exit 5 if that cannot be shown
+  S "grub-editenv /boot/grub/grubenv unset next_entry; sync; grub-editenv /boot/grub/grubenv list" | grep -q 'next_entry=.' \
+    && { echo "next_entry STILL SET after unset: the experiment stays scheduled, needs a human"; exit 5; }
+  S "grub-editenv /boot/grub/grubenv list" >/dev/null || { echo "cannot read grubenv back: unresolved"; exit 5; }
+}
+S() { ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o LogLevel=ERROR -i "$HOME/.ssh/id_ed25519_homelab" root@192.168.50.118 "$@"; }
+pgrep -f udplisten.py >/dev/null || { echo "UDP listener not running: STOP"; exit 2; }
+st=$(S 'hostname; awk "\$2==\"/\"{print \$1}" /proc/mounts; grub-editenv /boot/grub/grubenv list; cat /proc/sys/kernel/random/boot_id') \
+  || { echo "netbook unreachable: STOP"; exit 2; }
+grep -qx nc110 <<<"$st" && grep -qx /dev/sda2 <<<"$st" && grep -qx saved_entry=0 <<<"$st" && ! grep -q 'next_entry=.' <<<"$st" \
+  || { echo "not in Slot A default state: STOP"; echo "$st"; exit 2; }
+B0=$(tail -1 <<<"$st")
+S "grep -q '^menuentry \"$E\"' /boot/grub/grub.cfg" && { echo "entry $E already exists: pick a new tag"; exit 2; }
+ARM=""
+GRUBARM=${GRUBARM-1}   # default ON since 2026-10-18 01:18 (k18); GRUBARM= turns it off
+[ -n "${GRUBARM:-}" ] && ARM='
+  terminal_output console
+  nc110_tco_consts
+  tco_arm
+  if [ "$wdt_ok" != "yes" ]; then echo "nc110-bm: GRUB did NOT arm the TCO, rebooting"; sleep 10; reboot; fi
+  echo "nc110-bm: GRUB armed the TCO (~120 s to reset if nobody pets)"'
+[ -n "${GRUBSLEEP:-}" ] && [ -n "$ARM" ] && ARM="$ARM"'
+  echo "nc110-bm: GRUBSLEEP: sleeping 600 s unpetted, then reboot"
+  sleep 600
+  reboot'
+ENTRY="menuentry \"$E\" {$ARM
+  insmod ext2
+  search --no-floppy --fs-uuid --set=root c0954bc7-86a0-440c-8401-2c3e95549743
+  terminal_output console
+  set gfxpayload=text
+  insmod multiboot
+  echo \"nc110-bm: loading /baremetal/$KN $CL\"
+  multiboot /baremetal/$KN $CL${MODULE:+
+  module /baremetal/nc110-test-client.key}
+  boot
+}"
+T=$(date -u +%Y%m%dT%H%M%SZ); BK=/boot/grub/grub.cfg.bak-nc110bm-$T
+S "cp -p /boot/grub/grub.cfg $BK" || exit 2
+S "[ -e /boot/baremetal/$KN ]" || scp -q -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o LogLevel=ERROR -i "$HOME/.ssh/id_ed25519_homelab" "$K" "root@192.168.50.118:/boot/baremetal/$KN" || exit 2
+if [ -n "${MODULE:-}" ]; then
+  [ "$(shasum -a 256 "$MODULE" | cut -c1-64)" = "$TEST_KEY_SHA" ] || { echo "MODULE is not the throwaway test key"; exit 2; }
+  scp -q -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+    -i "$HOME/.ssh/id_ed25519_homelab" "$MODULE" root@192.168.50.118:/boot/baremetal/nc110-test-client.key || exit 2
+fi
+printf '%s\n' "$ENTRY" | S "cat >> /boot/grub/grub.cfg" || { echo "append failed, restoring"; S "cp -p $BK /boot/grub/grub.cfg; sync"; exit 2; }
+ESHA=$(printf '%s\n' "$ENTRY" | shasum -a 256 | cut -c1-64); ELEN=$(printf '%s\n' "$ENTRY" | wc -c | tr -d ' ')
+v=$(S "sync; sha256sum /boot/baremetal/$KN | cut -c1-64; head -c \$(stat -c %s $BK) /boot/grub/grub.cfg | sha256sum | cut -c1-64; sha256sum $BK | cut -c1-64; tail -c $ELEN /boot/grub/grub.cfg | sha256sum | cut -c1-64; echo \$(( \$(stat -c %s /boot/grub/grub.cfg) - \$(stat -c %s $BK) )); grub-script-check /boot/grub/grub.cfg && echo check-ok")
+mapfile -t vv <<<"$v"
+[ "${vv[0]}" = "$(shasum -a 256 "$K" | cut -c1-64)" ] && [ "${vv[1]}" = "${vv[2]}" ] && [ "${vv[3]}" = "$ESHA" ] \
+  && [ "${vv[4]}" = "$ELEN" ] && [ "${vv[5]:-}" = check-ok ] || {
+  echo "verify FAILED, restoring backup"; S "cp -p $BK /boot/grub/grub.cfg; sync"; exit 2; }
+echo "installed $E -> $KN '$CL'"
+mark=$(wc -c <"$LOG")
+S "grub-editenv /boot/grub/grubenv set next_entry='$E' && grub-editenv /boot/grub/grubenv list | grep -qx 'next_entry=$E' && sync" \
+  || { echo "could not set next_entry: STOP"; clear_next; exit 2; }
+S "(sleep 1; reboot) >/dev/null 2>&1 &"
+T0=$(date +%s); echo "reboot at $(date +%T)"; sleep 30
+for n in $(seq ${WAIT_N:-66}); do
+  r=$(S 'cat /proc/sys/kernel/random/boot_id; grub-editenv /boot/grub/grubenv list; cut -d" " -f1 /proc/uptime' 2>/dev/null)
+  if [ -n "$r" ] && [ "$(head -1 <<<"$r")" = "$B0" ] && [ "$n" -ge 6 ]; then   # still the old boot 60 s later
+    echo "reboot did not happen: clearing next_entry, STOP"; clear_next; exit 2
+  fi
+  [ -n "$r" ] && [ "$(head -1 <<<"$r")" != "$B0" ] && {
+      grep -qx saved_entry=0 <<<"$r" && ! grep -q 'next_entry=.' <<<"$r" || { echo "BACK BUT grubenv not default: STOP"; echo "$r"; exit 4; }
+      echo "back after $(( $(date +%s) - T0 )) s, uptime $(tail -1 <<<"$r") s, grubenv default"
+      tail -c +$((mark + 1)) "$LOG" | grep -a -v '^--- ' | awk '!seen[$0]++' | sed 's/^nc110 [0-9] [0-9/]* //'; exit 0; }
+  sleep 5
+done
+echo "NOT BACK within $(( ${WAIT_N:-66} * 5 / 60 + 1 )) min of $(date -d @$T0 +%T 2>/dev/null || echo reboot): STOP, do not retry, needs a power cycle"
+tail -c +$((mark + 1)) "$LOG" | grep -a -v '^--- ' | awk '!seen[$0]++'; exit 3
+# Shared iTCO v2 arm + verify for GRUB 2 (needs insmod iorw memrw setpci regexp). Used verbatim by the QEMU
+# rehearsal (grub-test/iso/boot/grub/grub.cfg) and the proposed NC110 entry (grub-test/m1-nc110-entry.cfg).
+# Caller sets: lpc_expect pmbase_expect rcba_expect gcs_addr smi_en tco_rld tco1_sts tco2_sts tco1_cnt tco_tmr
+#              tmr_val tmr_re. GRUB prints values as %x (lowercase, no 0x, no padding); bit tests are regexps.
+# Optional caller override: lock_mode (default refuse, set below). Callers source this file FIRST, then set it.
+#   Policy is consumed per call: tco_arm resets lock_mode to refuse first thing, so set it before EACH call.
+#   refuse : TCO_LOCK set -> do not arm (the original M1 design: it needs SMI_EN.TCO_EN cleared).
+#   accept : TCO_LOCK set -> arm anyway, preserving TCO_LOCK and never writing SMI_EN: TCO_EN is not checked, so the
+#            first timeout raises an SMI to the firmware and the reset relies on the second timeout. Only valid
+#            once a hardware test showed this firmware's SMI handler does NOT swallow the timeout (NC110 step 1).
+#            Linux iTCO_wdt does the same on v2 by default (turn_SMI_watchdog_clear_off=1 < version 2).
+set lock_mode=refuse
+# tco_arm sets wdt_ok=yes ONLY if every live predicate holds. The caller must boot only inside that branch.
+
+# Bit predicates on %x strings:
+#   GCS bit 5 (NO_REBOOT) clear      : nibble 1 in {0,1,4,5,8,9,c,d}
+#   TCO1_CNT bit 11 (TMR_HLT) clear  : nibble 2 < 8
+#   TCO1_CNT bit 12 (TCO_LOCK) clear : nibble 3 even
+#   SMI_EN bit 13 (TCO_EN) clear     : nibble 3 in {0,1,4,5,8,9,c,d}
+set re_noreboot_clear='^([0-9a-f]|[0-9a-f]*[014589cd][0-9a-f])$'
+set re_hlt_clear='^([0-9a-f]{1,2}|[0-7][0-9a-f]{2}|[0-9a-f]*[0-9a-f][0-7][0-9a-f]{2})$'
+set re_lock_clear='^([0-9a-f]{1,3}|[0-9a-f]*[02468ace][0-9a-f]{3})$'
+set re_tcoen_clear='^([0-9a-f]{1,3}|[0-9a-f]*[014589cd][0-9a-f]{3})$'
+set re_hex16='^[0-9a-f]{1,4}$'
+
+function tco_re_check {
+  # $1 = regexp, $2 = value, $3 = expected (yes/no). Sets re_bad=yes on a wrong answer.
+  if regexp "$1" "$2"; then set got=yes; else set got=no; fi
+  if [ "$got" != "$3" ]; then echo "wdt: selftest FAILED: $2 vs $1 gave $got"; set re_bad=yes; fi
+}
+
+function tco_selftest {
+  # Proves THIS GRUB's regexp/test behave as the predicates assume, before they guard anything.
+  set re_bad=no
+  tco_re_check "$re_noreboot_clear" "0" yes
+  tco_re_check "$re_noreboot_clear" "fed1f401" yes
+  tco_re_check "$re_noreboot_clear" "20" no
+  tco_re_check "$re_noreboot_clear" "fed1f421" no
+  tco_re_check "$re_hlt_clear" "0" yes
+  tco_re_check "$re_hlt_clear" "1200" yes
+  tco_re_check "$re_hlt_clear" "800" no
+  tco_re_check "$re_hlt_clear" "1a00" no
+  tco_re_check "$re_lock_clear" "800" yes
+  tco_re_check "$re_lock_clear" "2000" yes
+  tco_re_check "$re_lock_clear" "1000" no
+  tco_re_check "$re_lock_clear" "3800" no
+  tco_re_check "$re_tcoen_clear" "21" yes
+  tco_re_check "$re_tcoen_clear" "1021" yes
+  tco_re_check "$re_tcoen_clear" "2021" no
+  tco_re_check "$re_tcoen_clear" "f021" no
+  tco_re_check "$re_hex16" "1000" yes
+  tco_re_check "$re_hex16" "unset" no
+  tco_re_check "$re_hex16" "11000" no
+  tco_re_check '^5$' "5" yes
+  tco_re_check '^5$' "4005" no
+  if [ "a" != "a" -o "b" != "c" ]; then set got=yes; else set got=no; fi
+  if [ "$got" != "yes" ]; then echo "wdt: selftest FAILED: test -o"; set re_bad=yes; fi
+  if [ "$re_bad" = "no" ]; then echo "wdt: selftest OK (21 regexp cases + test -o)"; fi
+}
+
+function tco_arm {
+  set wdt_ok=no
+  set tco_mode="$lock_mode"
+  set lock_mode=refuse
+  tco_selftest
+  if [ "$re_bad" != "no" ]; then echo "wdt: GRUB predicates untrustworthy, NOT arming"; return 1; fi
+  set lpcid=unset; set pmbase=unset; set rcba=unset
+  setpci -s 00:1f.0 -v lpcid 0.l
+  setpci -s 00:1f.0 -v pmbase 40.l
+  setpci -s 00:1f.0 -v rcba f0.l
+  echo "wdt: lpcid=$lpcid pmbase=$pmbase rcba=$rcba"
+  if [ "$lpcid" != "$lpc_expect" -o "$pmbase" != "$pmbase_expect" -o "$rcba" != "$rcba_expect" ]; then
+    echo "wdt: chipset mismatch, NOT arming"; return 1
+  fi
+  set cntpre=unset; set sts2pre=unset; set gcspre=unset
+  inw -v cntpre $tco1_cnt
+  inw -v sts2pre $tco2_sts
+  read_dword -v gcspre $gcs_addr
+  echo "wdt: before: GCS=$gcspre TCO1_CNT=$cntpre TCO2_STS=$sts2pre (6 = last reset was the watchdog)"
+  if regexp "$re_hex16" "$cntpre"; then true; else echo "wdt: TCO1_CNT read invalid ($cntpre), NOT arming"; return 1; fi
+  if regexp "$re_lock_clear" "$cntpre"; then set tco_locked=no; else set tco_locked=yes; fi
+  if [ "$tco_locked" = "yes" ]; then
+    if [ "$tco_mode" != "accept" ]; then echo "wdt: TCO_LOCK set, NOT arming (lock_mode=$tco_mode)"; return 1; fi
+    echo "wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to firmware SMI, reset on 2nd"
+  fi
+  write_dword $gcs_addr 0 0x20       # GCS: clear NO_REBOOT (bit 5), masked RMW
+  if [ "$tco_locked" = "no" ]; then
+    outl $smi_en 0 0x2000            # SMI_EN: clear TCO_EN (bit 13), masked RMW; locked: never written
+  fi
+  outw $tco1_sts 0x0008              # TCO1_STS: clear TIMEOUT (RW1C)
+  outw $tco2_sts 0x0002              # TCO2_STS: clear SECOND_TO_STS first ...
+  outw $tco2_sts 0x0004              # ... then BOOT_STS (Intel order)
+  outw $tco_tmr $tmr_val 0x03ff      # TCO_TMR: ticks of 0.6 s in bits 9:0 only
+  outw $tco_rld 1                    # TCO_RLD: reload
+  outw $tco1_cnt 0 0x0800            # TCO1_CNT: clear TCO_TMR_HLT (bit 11), masked RMW; bit 12 TCO_LOCK written back as read
+  set gcs=unset; set cnt=unset; set tmr=unset; set smien=unset; set c0=unset; set c1=unset
+  read_dword -v gcs $gcs_addr
+  inw -v cnt $tco1_cnt
+  inw -v tmr $tco_tmr
+  inl -v smien $smi_en
+  inw -v c0 $tco_rld
+  sleep 1
+  inw -v c1 $tco_rld
+  echo "wdt: after: GCS=$gcs TCO1_CNT=$cnt TCO_TMR=$tmr SMI_EN=$smien count $c0 -> $c1 locked=$tco_locked mode=$tco_mode"
+  if regexp "$re_noreboot_clear" "$gcs"; then true; else echo "wdt: NO_REBOOT still set"; return 1; fi
+  if regexp "$re_hlt_clear" "$cnt"; then true; else echo "wdt: timer still halted"; return 1; fi
+  if [ "$tco_locked" = "no" ]; then
+    if regexp "$re_tcoen_clear" "$smien"; then true; else echo "wdt: SMI_EN.TCO_EN still set"; return 1; fi
+  fi
+  if regexp "$tmr_re" "$tmr"; then true; else echo "wdt: TCO_TMR not $tmr_val"; return 1; fi
+  if [ "$c0" = "$c1" -o "$c0" = "unset" -o "$c1" = "unset" ]; then echo "wdt: counter not moving"; return 1; fi
+  set wdt_ok=yes
+}
+# PROPOSED M1 entries for the NC110 (NM10 8086:27bc, iTCO v2). UNTESTED ON HARDWARE.
+# The shared arm+verify body (tco-arm.cfg) is the one QEMU-tested on q35 (proof/wdt-grub.log); only the
+# constants below differ. Copy tco-arm.cfg to /baremetal/tco-arm.cfg (paths are relative to the GRUB root; spec uses /baremetal/). Add these as NEW entries with NEW
+# names (spec rule 3) and boot each ONLY via next_entry from Slot A (rule 2). Run the steps in order; stop on any surprise.
+# Before step 1, read in Slot A (read-only) and confirm the three guard strings:
+#   sudo setpci -s 00:1f.0 0.l 40.l f0.l   -> expect 27bc8086 / 00001001 / fed1c001 (GRUB prints 1001, no padding)
+#   and that TCO1_CNT (0x1068) has bit 12 TCO_LOCK = 0 (else the entry refuses, by design).
+#   2026-10-17: the NC110 BIOS 01VG.M013 sets TCO_LOCK=1 with TCO_EN=1 (~/party/nc110-m1/M1-RESULT.md), so these
+#   entries refuse as written. The lock_mode line in nc110_tco_consts stays commented out until the Linux-side
+#   test (pane brief step 1) shows a reset at ~2x the heartbeat. Rehearsed on q35: proof/wdt-grub-locked-*.log.
+
+# Step 0: prove the one-shot itself. Arms nothing, runs none of our code, reboots. Pass = Slot A comes back
+# by itself and grubenv next_entry is empty afterwards.
+menuentry "nc110-bm-step0-oneshot-probe" {
+  echo "step0: one-shot probe, nothing armed, rebooting in 10 s"
+  sleep 10
+  reboot
+}
+
+function nc110_tco_consts {
+  insmod iorw
+  insmod memrw
+  insmod setpci
+  insmod regexp
+  source /baremetal/tco-arm.cfg
+  set lpc_expect=27bc8086
+  set pmbase_expect=1001
+  set rcba_expect=fed1c001
+  set gcs_addr=0xfed1f410
+  set smi_en=0x1030
+  set tco_rld=0x1060
+  set tco1_sts=0x1064
+  set tco2_sts=0x1066
+  set tco1_cnt=0x1068
+  set tco_tmr=0x1072
+  set tmr_val=0x64
+  set tmr_re='^([0-9a-f]*[048c])?64$'
+  # set lock_mode=accept   # ONLY after step 1 reset at ~2x heartbeat on THIS board (firmware SMI does not swallow)
+}
+
+# Step 1: the watchdog proof proper. Pinned grub-armed kernel (cargo --features grub-armed, record its sha256),
+# deliberate hang. TMR 0x64 = 100 x 0.6 s = 60 s per stage, so reset ~120 s after arming. Pass = "HANG now"
+# on screen, reset within ~150 s, Slot A back unaided, then (Linux) TCO2_STS at 0x1066 reads SECOND_TO_STS|BOOT_STS
+# if firmware has not cleared it.
+menuentry "nc110-bm-step1-wdt-hang" {
+  terminal_output console
+  set gfxpayload=text
+  nc110_tco_consts
+  tco_arm
+  if [ "$wdt_ok" = "yes" ]; then
+    echo "wdt: armed and verified, ~120 s to reset; loading k-wdt-hang.elf"
+    sleep 3
+    insmod multiboot
+    multiboot /baremetal/k-wdt-hang.elf wdt=hang
+    boot
+  else
+    echo "wdt: NOT armed, refusing to boot our code, rebooting to Slot A"
+    sleep 10
+    reboot
+  fi
+}
+
+# Step 2 (only after step 1 passed): iPXE + DHCP + syslog to .179. iPXE does not pet, so the board returns
+# to Slot A ~120 s after arming whatever iPXE does. Pin ipxe.lkrn (sha256) and its embedded script.
+menuentry "nc110-bm-step2-ipxe" {
+  terminal_output console
+  set gfxpayload=text
+  nc110_tco_consts
+  tco_arm
+  if [ "$wdt_ok" = "yes" ]; then
+    echo "wdt: armed and verified, loading iPXE"
+    sleep 3
+    linux16 /baremetal/ipxe.lkrn
+    boot
+  else
+    echo "wdt: NOT armed, refusing to boot iPXE, rebooting to Slot A"
+    sleep 10
+    reboot
+  fi
+}
+
+# FUTURE (after M1 passes; NOT part of M1, do not add yet): our SSH kernel on the NC110. The client key is a
+# 72-byte multiboot module on /boot (format in src/mb.rs, built by tools/extract-keys.py), so it can be rotated
+# without rebuilding the ELF; the kernel wipes it from RAM after loading. Which key, and which node accepts it,
+# is the operator's decision (spec: "Decisions the operator owes"). Shape, tested on QEMU pc with GRUB 2.06
+# (grub-test/keymod-iso, proof/m25-grub-keymod-serial.log):
+#   menuentry "nc110-bm-m2-ssh" {
+#     terminal_output console
+#     set gfxpayload=text
+#     nc110_tco_consts
+#     tco_arm
+#     if [ "$wdt_ok" = "yes" ]; then
+#       insmod multiboot
+#       multiboot /baremetal/k-ssh.elf rng=dump
+#       module /baremetal/nc110-client.key
+#       boot
+#     else
+#       reboot
+#     fi
+#   }
+        (0x7cf, 0x248, 7),
+        (0x7cf, 0x240, 14), // RTL8401: listed only so it is NOT mistaken for VER_09 below
+        (0x7c8, 0x348, 9),
+        (0x7c8, 0x248, 9),
+        (0x7c8, 0x340, 10),
+    ];
+    T.iter().find(|&&(m, v, _)| xid & m == v).map(|t| t.2).filter(|&v| v != 14)
+}
+
+pub fn probe(prefer_mmio: bool) -> Result<Rtl, &'static str> {
+    if let Some(b) = pci::find(0x10EC, 0x8136) {
+        return probe_8101e(b);
+    }
+    if let Some(b) = pci::find(0x10EC, 0x8139) {
+        return probe_8139cp(b, prefer_mmio);
+    }
+    Err("no 10ec:8136 or 10ec:8139 found (bridges walked)")
+}
+
+fn probe_8139cp(b: Bdf, mmio: bool) -> Result<Rtl, &'static str> {
+    let bus = if mmio {
+        set_pci_cmd(b, 0, PCI_CMD_BM);
+        let m = mmio_window(b)?;
+        set_pci_cmd(b, PCI_CMD_MEM, PCI_CMD_BM);
+        Bus::Mmio(m)
+    } else {
+        set_pci_cmd(b, PCI_CMD_IO, PCI_CMD_BM);
+        let bar0 = pci::read32(b, 0x10);
+        if bar0 & 1 == 0 {
+            return Err("rtl8139 BAR0 is not I/O");
+        }
+        Bus::Pio((bar0 & !0x3) as u16)
+    };
+    let mut mac = [0u8; 6];
+    for (i, m) in mac.iter_mut().enumerate() {
+        *m = unsafe { bus.r8(R::RTL8139CP.mac0 + i as u16) };
+    }
+    Ok(Rtl { bus, regs: &R::RTL8139CP, bdf: b, mac, rx_next: 0, rx_cfg: 0x0000_E70A, ver: 0 })
+}
+
+fn probe_8101e(b: Bdf) -> Result<Rtl, &'static str> {
+    set_pci_cmd(b, 0, PCI_CMD_BM | PCI_CMD_IO); // stop any DMA left running by iPXE before anything else
+    let m = mmio_window(b)?;
+    set_pci_cmd(b, PCI_CMD_MEM, PCI_CMD_BM | PCI_CMD_IO);
+    let bus = Bus::Mmio(m);
+    let r = &R::RTL8101E;
+    let txc = unsafe { bus.r32(r.tx_config) };
+    if txc == 0xFFFF_FFFF {
+        return Err("TxConfig reads all-ones (PCI read failed, r8169_main.c:5419)");
+    }
+    let xid = (txc >> 20) & 0xFCF; // r8169_main.c:5422
+    let ver = match xid_version(xid) {
+        Some(v) => v,
+        None => {
+            kprintln!("nic: 10ec:8136 XID {:#05x} is not RTL8101E/8102E/8103E/8105E (VER_07..10, 29, 30): refusing", xid);
+            return Err("unsupported 10ec:8136 chip version");
+        }
+    };
+    kprintln!("nic: 10ec:8136 XID {:#05x} -> r8169 RTL_GIGA_MAC_VER_{:02}", xid, ver);
+    // rtl_init_rxcfg (r8169_main.c:2486-2490 and default 2510): VER_10 FIFO_THRESH|DMA_BURST, VER_07..09 default.
+    let rx_cfg = if ver == 10 { R::RX_FIFO_THRESH | R::RX_DMA_BURST } else { R::RX128_INT_EN | R::RX_DMA_BURST };
+    let mut mac = [0u8; 6];
+    for (i, x) in mac.iter_mut().enumerate() {
+        *x = unsafe { bus.r8(r.mac0 + i as u16) };
+    }
+    Ok(Rtl { bus, regs: r, bdf: b, mac, rx_next: 0, rx_cfg: rx_cfg | R::ACCEPT_BROADCAST | R::ACCEPT_MY_PHYS, ver })
+}
+
+impl Rtl {
+    pub fn name(&self) -> &'static str {
+        self.regs.name
+    }
+
+    fn mdio_write(&self, reg: u32, val: u16) -> Result<(), &'static str> {
+        // r8169_mdio_write, r8169_main.c:1154-1164: flag set, wait for it to clear (25 x 20 us), then 20 us.
+        unsafe { self.bus.w32(self.regs.phyar, R::PHYAR_FLAG | (reg & 0x1F) << 16 | val as u32) };
+        for _ in 0..25 {
+            time::delay_us(20);
+            if unsafe { self.bus.r32(self.regs.phyar) } & R::PHYAR_FLAG == 0 {
+                time::delay_us(20);
+                return Ok(());
+            }
+        }
+        Err("PHYAR write timeout")
+    }
+
+    fn mdio_read(&self, reg: u32) -> Result<u16, &'static str> {
+        // r8169_mdio_read, r8169_main.c:1166-1180: flag clear, wait for it to SET, data in 15:0, then 20 us.
+        unsafe { self.bus.w32(self.regs.phyar, (reg & 0x1F) << 16) };
+        for _ in 0..25 {
+            time::delay_us(20);
+            let v = unsafe { self.bus.r32(self.regs.phyar) };
+            if v & R::PHYAR_FLAG != 0 {
+                time::delay_us(20);
+                return Ok(v as u16);
+            }
+        }
+        Err("PHYAR read timeout")
+    }
+
+    pub fn skip_8105e(&mut self) {
+        if self.ver == 29 || self.ver == 30 {
+            kprintln!("nic: nic=no8105e: skipping rtl_hw_start_8105e (generic 810x path only)");
+            self.ver += 100;
+        }
+    }
+
+    /// rtl_ephy_write / rtl_ephy_read (r8169_main.c:1261-1277): EPHYAR 0x80, flag bit 31, reg 20:16, data 15:0.
+    fn ephy_write(&self, reg: u32, val: u16) -> Result<(), &'static str> {
+        unsafe { self.bus.w32(0x80, 0x8000_0000 | val as u32 | (reg & 0x1F) << 16) };
+        for _ in 0..100 {
+            time::delay_us(10);
+            if unsafe { self.bus.r32(0x80) } & 0x8000_0000 == 0 {
+                time::delay_us(10);
+                return Ok(());
+            }
+        }
+        Err("EPHYAR write timeout")
+    }
+
+    fn ephy_read(&self, reg: u32) -> Result<u16, &'static str> {
+        unsafe { self.bus.w32(0x80, (reg & 0x1F) << 16) };
+        for _ in 0..100 {
+            time::delay_us(10);
+            let v = unsafe { self.bus.r32(0x80) };
+            if v & 0x8000_0000 != 0 {
+                return Ok(v as u16);
+            }
+        }
+        Err("EPHYAR read timeout")
+    }
+
+    /// rtl_hw_start_8105e_1 / _2 (r8169_main.c:3619-3650), VER_29/30 only. Called with Cfg9346 unlocked.
+    fn hw_start_8105e(&self) -> Result<(), &'static str> {
+        const E: [(u32, u16, u16); 8] =
+            [(0x07, 0, 0x4000), (0x19, 0, 0x0200), (0x19, 0, 0x0020), (0x1e, 0, 0x2000), (0x03, 0, 0x0001), (0x19, 0, 0x0100), (0x19, 0, 0x0004), (0x0a, 0, 0x0020)];
+        unsafe {
+            let fe = self.bus.r32(0xF0); // FuncEvent: force LAN exit from ASPM if Rx/Tx not idle; no early tally
+            self.bus.w32(0xF0, (fe | 0x0000_2800) & !0x0001_0000);
+            self.bus.w8(0xD3, self.bus.r8(0xD3) | (1 << 3) | (1 << 2)); // MCU: EN_NDP | EN_OOB_RESET
+            self.bus.w8(0xD0, self.bus.r8(0xD0) | (1 << 6)); // DLLPR: PFM_EN
+        }
+        for (reg, mask, bits) in E {
+            let w = (self.ephy_read(reg)? & !mask) | bits;
+            self.ephy_write(reg, w)?;
+        }
+        unsafe { self.bus.w8(0x54, self.bus.r8(0x54) & !(1 << 1)) }; // Config3: clear Rdy_to_L23 (l2l3 disable)
+        if self.ver == 30 {
+            let w = self.ephy_read(0x1e)? | 0x8000;
+            self.ephy_write(0x1e, w)?;
+        }
+        kprintln!("nic: rtl_hw_start_8105e_{} applied (FuncEvent, MCU, DLLPR, 8 ephy writes, L2/L3 off)", self.ver - 28);
+        Ok(())
+    }
+
+    fn reset(&self) -> Result<(), &'static str> {
+        let r = self.regs;
+        unsafe {
+            self.bus.w8(r.chip_cmd, r.cmd_reset);
+            for _ in 0..1000 {
+                if self.bus.r8(r.chip_cmd) & r.cmd_reset == 0 {
+                    return Ok(());
+                }
+                time::delay_us(100);
+            }
+        }
+        Err("chip reset did not complete in 100 ms")
+    }
+
+    fn program_rings(&self) {
+        let r = self.regs;
+        unsafe {
+            for i in 0..NRX {
+                let d = addr_of_mut!(RX_DESC.0[i]);
+                let mut o = r.desc_own | BUFSZ as u32;
+                if i == NRX - 1 {
+                    o |= r.ring_end;
+                }
+                write_volatile(d, Desc { opts1: o, opts2: 0, addr: addr_of!(RX_BUF.0[i]) as u64 });
+            }
+            write_volatile(addr_of_mut!(TX_DESC.0[0]), Desc { opts1: r.ring_end, opts2: 0, addr: 0 });
+            fence(Ordering::SeqCst);
+            let tx = addr_of!(TX_DESC) as u64;
+            let rx = addr_of!(RX_DESC) as u64;
+            // high dword first (r8169_main.c:2758-2767 "magic spell")
+            self.bus.w32(r.tx_ring + 4, (tx >> 32) as u32);
+            self.bus.w32(r.tx_ring, tx as u32);
+            self.bus.w32(r.rx_ring + 4, (rx >> 32) as u32);
+            self.bus.w32(r.rx_ring, rx as u32);
+        }
+    }
+
+    /// Reset and bring up the NIC. Every Err path leaves bus mastering OFF.
+    pub fn init(&mut self) -> Result<(), &'static str> {
+        if self.regs.device == 0x8136 {
+            self.init_8101e()
+        } else {
+            self.init_8139cp()
+        }
+    }
+
+    fn init_8139cp(&mut self) -> Result<(), &'static str> {
+        let r = self.regs;
+        self.reset()?;
+        unsafe {
+            self.bus.w16(r.cplus_cmd, 0x0003); // C+ mode: CpTxOn | CpRxOn (8139cp only)
+            self.program_rings();
+            self.bus.w16(r.rx_max_size, BUFSZ as u16);
+            self.bus.w16(r.intr_mask, 0); // polled
+        }
+        set_pci_cmd(self.bdf, PCI_CMD_BM, 0);
+        unsafe {
+            self.bus.w8(r.chip_cmd, r.cmd_rx_enb | r.cmd_tx_enb);
+            self.bus.w32(r.tx_config, 0x0300_0700); // IFG normal, max DMA burst
+            self.bus.w32(r.rx_config, self.rx_cfg); // accept broadcast + my phys, unlimited DMA burst
+        }
+        Ok(())
+    }
+
+    /// rtl_hw_start (r8169_main.c:3930-3961) reduced to the generic part, plus a PHY reset like iPXE's
+    /// realtek_phy_reset. NOT done (documented gap): the per-version hw_config tables (rtl_hw_start_8102e_*,
+    /// r8169_main.c:3562-3603: Config1/Config3/ephy writes) and rtl8102e_hw_phy_config. VER_10 has none.
+    fn init_8101e(&mut self) -> Result<(), &'static str> {
+        let r = self.regs;
+        self.reset()?;
+        unsafe {
+            self.bus.w8(r.cfg9346, R::CFG9346_UNLOCK);
+            let cp = self.bus.r16(r.cplus_cmd) & R::CPCMD_MASK & !(R::CPCMD_RXVLAN | R::CPCMD_RXCHKSUM);
+            self.bus.w16(r.cplus_cmd, cp);
+            self.bus.w8(r.max_tx_packet_size, R::TX_PACKET_MAX); // rtl_hw_start_8168 (r8169_main.c:3903)
+            self.bus.w16(r.intr_mitigate, 0);
+            self.bus.w16(r.rx_max_size, BUFSZ as u16); // Linux uses 16 KiB buffers; ours are 1536 B
+            self.program_rings();
+        }
+        if self.ver == 29 || self.ver == 30 {
+            if let Err(e) = self.hw_start_8105e() {
+                unsafe { self.bus.w8(r.cfg9346, R::CFG9346_LOCK) };
+                return Err(e); // bus mastering is still off here
+            }
+        }
+        unsafe {
+            self.bus.w8(r.cfg9346, R::CFG9346_LOCK);
+            self.bus.w16(r.intr_mask, 0);
+            self.bus.w16(r.intr_status, 0xFFFF);
+        }
+        // PHY: BMCR reset, wait for self-clear, then autoneg enable + restart (no 1000BASE-T on this PHY).
+        self.mdio_write(0, 0x8000)?;
+        let t = time::now_ms();
+        while self.mdio_read(0)? & 0x8000 != 0 {
+            if time::now_ms() - t > 500 {
+                return Err("PHY reset did not self-clear in 500 ms");
+            }
+        }
+        self.mdio_write(0, 0x1200)?;
+        set_pci_cmd(self.bdf, PCI_CMD_BM, 0);
+        unsafe {
+            self.bus.w8(r.chip_cmd, r.cmd_tx_enb | r.cmd_rx_enb); // r8169_main.c:3957, before Rx/TxConfig
+            self.bus.w32(r.rx_config, self.rx_cfg);
+            self.bus.w32(r.tx_config, R::TX_DMA_BURST << 8 | R::INTER_FRAME_GAP << 24);
+        }
+        let t = time::now_ms();
+        while unsafe { self.bus.r8(r.phystatus) } & R::LINK_STATUS == 0 && time::now_ms() - t < 5000 {}
+        let st = unsafe { self.bus.r8(r.phystatus) };
+        kprintln!("nic: PHYstatus {:#04x} link {}", st, if st & R::LINK_STATUS != 0 { "up" } else { "DOWN after 5 s" });
+        if st & R::LINK_STATUS == 0 {
+            // Review fix (GLM-5.2 C3): no link -> stop the chip and bus mastering instead of running SSH blind.
+            unsafe { self.bus.w8(r.chip_cmd, 0) };
+            set_pci_cmd(self.bdf, 0, PCI_CMD_BM);
+            return Err("no link after 5 s (Rx/Tx and bus mastering turned off again)");
+        }
+        Ok(())
+    }
+
+    /// Non-blocking: if the next RX descriptor is ours, return (index, frame length without FCS).
+    /// The caller must hand the descriptor back with `rx_release(index)`.
+    pub fn rx_poll(&mut self) -> Option<(usize, usize)> {
+        let r = self.regs;
+        let i = self.rx_next;
+        unsafe {
+            let o = read_volatile(addr_of!(RX_DESC.0[i].opts1));
+            if o & r.desc_own != 0 {
+/// Live check of the reset path, whoever armed it: NO_REBOOT=0, HLT=0, TMR>=4, and the counter
+/// (TCO_RLD reads back the current value on v2) decrements across ~1.3 ticks.
+pub fn verify_live() -> bool {
+    if !armed() {
+        return false;
+    }
+    let b = base();
+    let rcba = pci::read32(pci::b0(31, 0), 0xF0);
+    if rcba & 1 == 0 {
+        return false;
+    }
+    let gcs = unsafe { read_volatile(((rcba & 0xFFFF_C000) + 0x3410) as *const u32) };
+    let (cnt, tmr) = unsafe { (inw(b + 8), inw(b + 0x12) & 0x3FF) };
+    let c0 = unsafe { inw(b) } & 0x3FF;
+    delay_ms(800);
+    let c1 = unsafe { inw(b) } & 0x3FF;
+    let ok = gcs & 0x20 == 0 && cnt & 0x0800 == 0 && tmr >= 4 && c1 != c0;
+    kprintln!(
+        "wdt: verify NO_REBOOT={} HLT={} TMR={} count {}->{} => {}",
+        (gcs >> 5) & 1, (cnt >> 11) & 1, tmr, c0, c1, if ok { "VERIFIED" } else { "NOT VERIFIED" }
+    );
+    ok
+}
+
+/// QEMU `-machine pc` (PIIX3 8086:7000 at 00:01.0) has no TCO; the M0 NIC demo may run unprotected there.
+pub fn is_qemu_pc() -> bool {
+    pci::read32(pci::b0(1, 0), 0) == 0x7000_8086 && rd(addr_of!(tco_result)) == 1
+}
+
+/// The negative control must reach its hang unverified (that is the point); only on q35, never NM10.
+pub fn neg_control_on_q35() -> bool {
+    let on = cfg!(feature = "neg-control") && rd(addr_of!(tco_result)) == 0;
+    if on {
+        kprintln!("wdt: neg-control build on q35: proceeding unverified on purpose");
+    }
+    on
+}
+
+/// Hard reset via the reset control register (spec M2 `reboot`): back to the firmware / Slot A.
+pub fn hard_reset() -> ! {
+    kprintln!("wdt: hard reset via 0xCF9");
+    unsafe {
+        outb(0xCF9, 0x02);
+        outb(0xCF9, 0x06);
+    }
+    loop {
+        unsafe { core::arch::asm!("cli; hlt") };
+    }
+}
+
+/// Attended `wdt=probe`: arm the NM10 TCO ourselves without touching locked bits (SMI_EN.TCO_EN stays as the
+/// BIOS left it): clear GCS.NO_REBOOT (the BIOS leaves it SET on the NC110), clear stale status, TMR=50 ticks
+/// (30 s per stage, reset ~60 s after the last pet), reload, un-halt. Returns true if the readback says armed.
+pub fn arm_probe() -> bool {
+    let lpc = pci::read32(pci::b0(31, 0), 0);
+    let rcba_raw = pci::read32(pci::b0(31, 0), 0xF0);
+    if !(lpc == 0x27BC_8086 || lpc == 0x2918_8086) || pmbase() == 0 || rcba_raw & 1 == 0 {
+        kprintln!("wdt: probe arm: prerequisites fail (LPC {:#010x}, PMBASE {:#x}, RCBA {:#x})", lpc, pmbase(), rcba_raw);
+        return false;
+    }
+    let b = base();
+    let rcba = rcba_raw & 0xFFFF_C000;
+    let gcs_p = (rcba + 0x3410) as *mut u32;
+    unsafe {
+        let g0 = read_volatile(gcs_p);
+        let (cnt0, tmr0, rld0) = (inw(b + 8), inw(b + 0x12) & 0x3FF, inw(b) & 0x3FF);
+        kprintln!("wdt: inherited: GCS {:#x} NO_REBOOT={} TCO1_CNT={:#06x} HLT={} TMR={} RLD={} ({})", g0, (g0 >> 5) & 1, cnt0,
+            (cnt0 >> 11) & 1, tmr0, rld0, if g0 & 0x20 == 0 && cnt0 & 0x800 == 0 { "already armed, by GRUB" } else { "not armed before us" });
+        core::ptr::write_volatile(gcs_p, g0 & !0x20);
+        outw(b + 4, 0x0008); // TCO1_STS.TIMEOUT (RW1C)
+        outw(b + 6, 0x0002); // TCO2_STS.SECOND_TO_STS
+        outw(b + 6, 0x0004); // TCO2_STS.BOOT_STS
+        outw(b + 0x12, (inw(b + 0x12) & !0x3FF) | 50);
+        outw(b, 1);
+        outw(b + 8, inw(b + 8) & !0x0800); // un-halt; bit 12 (lock) written back as read
+        let (g1, cnt, tmr, c0) = (read_volatile(gcs_p), inw(b + 8), inw(b + 0x12) & 0x3FF, inw(b) & 0x3FF);
+        delay_ms(1300);
+        let c1 = inw(b) & 0x3FF;
+        let ok = g1 & 0x20 == 0 && cnt & 0x0800 == 0 && tmr == 50 && c1 != c0;
+        kprintln!("wdt: probe arm: GCS {:#x} -> {:#x} TCO1_CNT={:#06x} TMR={} RLD {}->{} SMI_EN={:#x} => {}",
+            g0, g1, cnt, tmr, c0, c1, inl(pmbase() + 0x30), if ok { "ARMED" } else { "NOT ARMED" });
+        ok
+    }
+}
+
+pub fn pet() {
+    unsafe { outw(base(), 1) };
+}
+
+/// ACPI PM timer (PMBASE+0x08, 3.579545 MHz, 24-bit) based delay; same block on ICH9 and NM10.
+fn pm_timer() -> u32 {
+    unsafe { inl(pmbase() + 8) & 0x00FF_FFFF }
+}
+
+pub fn delay_ms(ms: u32) {
+    let need = ms as u64 * 3_579_545 / 1000;
+    let mut last = pm_timer();
+    let mut acc = 0u64;
+    while acc < need {
+        let now = pm_timer();
+        acc += (now.wrapping_sub(last) & 0x00FF_FFFF) as u64;
+        last = now;
+    }
+}
+
+/// `wdt=pet:N` pets every 500 ms for N s, then stops and hangs. `wdt=hang` hangs at once.
+pub fn rehearse(cmdline: &str) -> bool {
+    let Some(i) = cmdline.find("wdt=") else { return false };
+    let arg = cmdline[i + 4..].split(' ').next().unwrap_or("");
+    if arg == "probe" {
+        return false; // attended net, handled in main (k5 hung here before the NIC: result 5 counts as armed)
+    }
+    if !armed() {
+        kprintln!("wdt: mode {} requested but watchdog not armed", arg);
+        return false;
+    }
+    let secs: u32 = arg.strip_prefix("pet:").and_then(|n| n.parse().ok()).unwrap_or(0);
+    for s in 0..secs {
+        for _ in 0..2 {
+            pet();
+            delay_ms(500);
+
+exec
+/bin/zsh -lc "sed -n '1250,1285p' third_party/linux-v6.12/r8169_main.c; sed -n '2880,2920p' third_party/linux-v6.12/r8169_main.c; sed -n '3610,3660p' third_party/linux-v6.12/r8169_main.c; rg -n 'EPHYAR|FuncEvent|DLLPR|EN_NDP|EN_OOB_RESET|PFM_EN|Rdy_to_L23|Cfg9346|rtl_hw_start_810' third_party/linux-v6.12/r8169_main.c" in ~/nc110-baremetal
+ succeeded in 0ms:
+		return r8168g_mdio_read(tp, location);
+	default:
+		return r8169_mdio_read(tp, location);
+	}
+}
+
+DECLARE_RTL_COND(rtl_ephyar_cond)
+{
+	return RTL_R32(tp, EPHYAR) & EPHYAR_FLAG;
+}
+
+static void rtl_ephy_write(struct rtl8169_private *tp, int reg_addr, int value)
+{
+	RTL_W32(tp, EPHYAR, EPHYAR_WRITE_CMD | (value & EPHYAR_DATA_MASK) |
+		(reg_addr & EPHYAR_REG_MASK) << EPHYAR_REG_SHIFT);
+
+	rtl_loop_wait_low(tp, &rtl_ephyar_cond, 10, 100);
+
+	udelay(10);
+}
+
+static u16 rtl_ephy_read(struct rtl8169_private *tp, int reg_addr)
+{
+	RTL_W32(tp, EPHYAR, (reg_addr & EPHYAR_REG_MASK) << EPHYAR_REG_SHIFT);
+
+	return rtl_loop_wait_high(tp, &rtl_ephyar_cond, 10, 100) ?
+		RTL_R32(tp, EPHYAR) & EPHYAR_DATA_MASK : ~0;
+}
+
+static u32 r8168dp_ocp_read(struct rtl8169_private *tp, u16 reg)
+{
+	RTL_W32(tp, OCPAR, 0x0fu << 12 | (reg & 0x0fff));
+	return rtl_loop_wait_high(tp, &rtl_ocpar_cond, 100, 20) ?
+		RTL_R32(tp, OCPDR) : ~0;
+}
+
+struct ephy_info {
+	unsigned int offset;
+	u16 mask;
+	u16 bits;
+};
+
+static void __rtl_ephy_init(struct rtl8169_private *tp,
+			    const struct ephy_info *e, int len)
+{
+	u16 w;
+
+	while (len-- > 0) {
+		w = (rtl_ephy_read(tp, e->offset) & ~e->mask) | e->bits;
+		rtl_ephy_write(tp, e->offset, w);
+		e++;
+	}
+}
+
+#define rtl_ephy_init(tp, a) __rtl_ephy_init(tp, a, ARRAY_SIZE(a))
+
+static void rtl_disable_clock_request(struct rtl8169_private *tp)
+{
+	pcie_capability_clear_word(tp->pci_dev, PCI_EXP_LNKCTL,
+				   PCI_EXP_LNKCTL_CLKREQ_EN);
+}
+
+static void rtl_enable_clock_request(struct rtl8169_private *tp)
+{
+	pcie_capability_set_word(tp->pci_dev, PCI_EXP_LNKCTL,
+				 PCI_EXP_LNKCTL_CLKREQ_EN);
+}
+
+static void rtl_pcie_state_l2l3_disable(struct rtl8169_private *tp)
+{
+	/* work around an issue when PCI reset occurs during L2/L3 state */
+	RTL_W8(tp, Config3, RTL_R8(tp, Config3) & ~Rdy_to_L23);
+}
+
+static void rtl_enable_exit_l1(struct rtl8169_private *tp)
+{
+	/* Bits control which events trigger ASPM L1 exit:
+		{ 0x03,	0xffff, 0x0599 },
+		{ 0x06,	0xffff, 0xaf25 },
+		{ 0x07,	0xffff, 0x8e68 },
+	};
+
+	rtl_ephy_init(tp, e_info_8401);
+	RTL_W8(tp, Config3, RTL_R8(tp, Config3) & ~Beacon_en);
+}
+
+static void rtl_hw_start_8105e_1(struct rtl8169_private *tp)
+{
+	static const struct ephy_info e_info_8105e_1[] = {
+		{ 0x07,	0, 0x4000 },
+		{ 0x19,	0, 0x0200 },
+		{ 0x19,	0, 0x0020 },
+		{ 0x1e,	0, 0x2000 },
+		{ 0x03,	0, 0x0001 },
+		{ 0x19,	0, 0x0100 },
+		{ 0x19,	0, 0x0004 },
+		{ 0x0a,	0, 0x0020 }
+	};
+
+	/* Force LAN exit from ASPM if Rx/Tx are not idle */
+	RTL_W32(tp, FuncEvent, RTL_R32(tp, FuncEvent) | 0x002800);
+
+	/* Disable Early Tally Counter */
+	RTL_W32(tp, FuncEvent, RTL_R32(tp, FuncEvent) & ~0x010000);
+
+	RTL_W8(tp, MCU, RTL_R8(tp, MCU) | EN_NDP | EN_OOB_RESET);
+	RTL_W8(tp, DLLPR, RTL_R8(tp, DLLPR) | PFM_EN);
+
+	rtl_ephy_init(tp, e_info_8105e_1);
+
+	rtl_pcie_state_l2l3_disable(tp);
+}
+
+static void rtl_hw_start_8105e_2(struct rtl8169_private *tp)
+{
+	rtl_hw_start_8105e_1(tp);
+	rtl_ephy_write(tp, 0x1e, rtl_ephy_read(tp, 0x1e) | 0x8000);
+}
+
+static void rtl_hw_start_8402(struct rtl8169_private *tp)
+{
+	static const struct ephy_info e_info_8402[] = {
+		{ 0x19,	0xffff, 0xff64 },
+		{ 0x1e,	0, 0x4000 }
+	};
+
+	rtl_set_def_aspm_entry_latency(tp);
+
+205:	Cfg9346		= 0x50,
+239:	FuncEvent	= 0xf0,
+240:	FuncEventMask	= 0xf4,
+260:	EPHYAR			= 0x80,
+261:#define	EPHYAR_FLAG			0x80000000
+262:#define	EPHYAR_WRITE_CMD		0x80000000
+263:#define	EPHYAR_REG_MASK			0x1f
+264:#define	EPHYAR_REG_SHIFT		16
+265:#define	EPHYAR_DATA_MASK		0xffff
+266:	DLLPR			= 0xd0,
+267:#define	PFM_EN				(1 << 6)
+278:#define	EN_NDP				(1 << 3)
+279:#define	EN_OOB_RESET			(1 << 2)
+390:	/* Cfg9346Bits */
+391:	Cfg9346_Lock	= 0x00,
+392:	Cfg9346_Unlock	= 0xc0,
+428:	Rdy_to_L23	= (1 << 1),	/* L23 Enable */
+724:		RTL_W8(tp, Cfg9346, Cfg9346_Lock);
+734:		RTL_W8(tp, Cfg9346, Cfg9346_Unlock);
+1258:	return RTL_R32(tp, EPHYAR) & EPHYAR_FLAG;
+1263:	RTL_W32(tp, EPHYAR, EPHYAR_WRITE_CMD | (value & EPHYAR_DATA_MASK) |
+1264:		(reg_addr & EPHYAR_REG_MASK) << EPHYAR_REG_SHIFT);
+1273:	RTL_W32(tp, EPHYAR, (reg_addr & EPHYAR_REG_MASK) << EPHYAR_REG_SHIFT);
+1276:		RTL_R32(tp, EPHYAR) & EPHYAR_DATA_MASK : ~0;
+2915:	RTL_W8(tp, Config3, RTL_R8(tp, Config3) & ~Rdy_to_L23);
+3206:	RTL_W8(tp, DLLPR, RTL_R8(tp, DLLPR) | PFM_EN);
+3227:	RTL_W8(tp, DLLPR, RTL_R8(tp, DLLPR) | PFM_EN);
+3425:	RTL_W8(tp, DLLPR, RTL_R8(tp, DLLPR) & ~PFM_EN);
+3428:	RTL_W8(tp, DLLPR, RTL_R8(tp, DLLPR) & ~TX_10M_PS_EN);
+3476:	RTL_W8(tp, DLLPR, RTL_R8(tp, DLLPR) & ~TX_10M_PS_EN);
+3494:	RTL_W8(tp, DLLPR, RTL_R8(tp, DLLPR) & ~PFM_EN);
+3531:	RTL_W8(tp, DLLPR, RTL_R8(tp, DLLPR) & ~PFM_EN);
+3534:	RTL_W8(tp, DLLPR, RTL_R8(tp, DLLPR) & ~TX_10M_PS_EN);
+3562:static void rtl_hw_start_8102e_1(struct rtl8169_private *tp)
+3591:static void rtl_hw_start_8102e_2(struct rtl8169_private *tp)
+3599:static void rtl_hw_start_8102e_3(struct rtl8169_private *tp)
+3601:	rtl_hw_start_8102e_2(tp);
+3619:static void rtl_hw_start_8105e_1(struct rtl8169_private *tp)
+3633:	RTL_W32(tp, FuncEvent, RTL_R32(tp, FuncEvent) | 0x002800);
+3636:	RTL_W32(tp, FuncEvent, RTL_R32(tp, FuncEvent) & ~0x010000);
+3638:	RTL_W8(tp, MCU, RTL_R8(tp, MCU) | EN_NDP | EN_OOB_RESET);
+3639:	RTL_W8(tp, DLLPR, RTL_R8(tp, DLLPR) | PFM_EN);
+3646:static void rtl_hw_start_8105e_2(struct rtl8169_private *tp)
+3648:	rtl_hw_start_8105e_1(tp);
+3662:	RTL_W32(tp, FuncEvent, RTL_R32(tp, FuncEvent) | 0x002800);
+3680:static void rtl_hw_start_8106(struct rtl8169_private *tp)
+3683:	RTL_W32(tp, FuncEvent, RTL_R32(tp, FuncEvent) | 0x002800);
+3686:	RTL_W8(tp, MCU, RTL_R8(tp, MCU) | EN_NDP | EN_OOB_RESET);
+3687:	RTL_W8(tp, DLLPR, RTL_R8(tp, DLLPR) & ~PFM_EN);
+3826:		[RTL_GIGA_MAC_VER_07] = rtl_hw_start_8102e_1,
+3827:		[RTL_GIGA_MAC_VER_08] = rtl_hw_start_8102e_3,
+3828:		[RTL_GIGA_MAC_VER_09] = rtl_hw_start_8102e_2,
+3843:		[RTL_GIGA_MAC_VER_29] = rtl_hw_start_8105e_1,
+3844:		[RTL_GIGA_MAC_VER_30] = rtl_hw_start_8105e_2,
+3853:		[RTL_GIGA_MAC_VER_39] = rtl_hw_start_8106,
+
+codex
+The NIC port matches the referenced Linux sequence, and its new timeout paths re-lock Cfg9346 before returning with bus mastering still off. The ARM block’s quoting also preserves `$wdt_ok` for GRUB. I’m checking two remaining failure cases: refusal followed by a failed reboot, and `WAIT_N` values that skip the pending-entry cleanup.
+exec
+/bin/zsh -lc "rg --files third_party | rg '(reboot.c|script/execute.c)"'$'"'; nl -ba tools/nc110-boot.sh | sed -n '32,100p'; nl -ba src/wdt.rs | sed -n '145,160p'; sed -n '1,85p' src/main.rs; rg -n 'k18|GRUBSLEEP|k5|k6|k9' grub-test proof --glob '*.log' --glob '*.txt' --glob '*.cfg' | head -60; git status --short; bash -n tools/nc110-boot.sh" in ~/nc110-baremetal
+ succeeded in 0ms:
+    32	B0=$(tail -1 <<<"$st")
+    33	S "grep -q '^menuentry \"$E\"' /boot/grub/grub.cfg" && { echo "entry $E already exists: pick a new tag"; exit 2; }
+    34	ARM=""
+    35	GRUBARM=${GRUBARM-1}   # default ON since 2026-10-18 01:18 (k18); GRUBARM= turns it off
+    36	[ -n "${GRUBARM:-}" ] && ARM='
+    37	  terminal_output console
+    38	  nc110_tco_consts
+    39	  tco_arm
+    40	  if [ "$wdt_ok" != "yes" ]; then echo "nc110-bm: GRUB did NOT arm the TCO, rebooting"; sleep 10; reboot; fi
+    41	  echo "nc110-bm: GRUB armed the TCO (~120 s to reset if nobody pets)"'
+    42	[ -n "${GRUBSLEEP:-}" ] && [ -n "$ARM" ] && ARM="$ARM"'
+    43	  echo "nc110-bm: GRUBSLEEP: sleeping 600 s unpetted, then reboot"
+    44	  sleep 600
+    45	  reboot'
+    46	ENTRY="menuentry \"$E\" {$ARM
+    47	  insmod ext2
+    48	  search --no-floppy --fs-uuid --set=root c0954bc7-86a0-440c-8401-2c3e95549743
+    49	  terminal_output console
+    50	  set gfxpayload=text
+    51	  insmod multiboot
+    52	  echo \"nc110-bm: loading /baremetal/$KN $CL\"
+    53	  multiboot /baremetal/$KN $CL${MODULE:+
+    54	  module /baremetal/nc110-test-client.key}
+    55	  boot
+    56	}"
+    57	T=$(date -u +%Y%m%dT%H%M%SZ); BK=/boot/grub/grub.cfg.bak-nc110bm-$T
+    58	S "cp -p /boot/grub/grub.cfg $BK" || exit 2
+    59	S "[ -e /boot/baremetal/$KN ]" || scp -q -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    60	  -o LogLevel=ERROR -i "$HOME/.ssh/id_ed25519_homelab" "$K" "root@192.168.50.118:/boot/baremetal/$KN" || exit 2
+    61	if [ -n "${MODULE:-}" ]; then
+    62	  [ "$(shasum -a 256 "$MODULE" | cut -c1-64)" = "$TEST_KEY_SHA" ] || { echo "MODULE is not the throwaway test key"; exit 2; }
+    63	  scp -q -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+    64	    -i "$HOME/.ssh/id_ed25519_homelab" "$MODULE" root@192.168.50.118:/boot/baremetal/nc110-test-client.key || exit 2
+    65	fi
+    66	printf '%s\n' "$ENTRY" | S "cat >> /boot/grub/grub.cfg" || { echo "append failed, restoring"; S "cp -p $BK /boot/grub/grub.cfg; sync"; exit 2; }
+    67	ESHA=$(printf '%s\n' "$ENTRY" | shasum -a 256 | cut -c1-64); ELEN=$(printf '%s\n' "$ENTRY" | wc -c | tr -d ' ')
+    68	v=$(S "sync; sha256sum /boot/baremetal/$KN | cut -c1-64; head -c \$(stat -c %s $BK) /boot/grub/grub.cfg | sha256sum | cut -c1-64; sha256sum $BK | cut -c1-64; tail -c $ELEN /boot/grub/grub.cfg | sha256sum | cut -c1-64; echo \$(( \$(stat -c %s /boot/grub/grub.cfg) - \$(stat -c %s $BK) )); grub-script-check /boot/grub/grub.cfg && echo check-ok")
+    69	mapfile -t vv <<<"$v"
+    70	[ "${vv[0]}" = "$(shasum -a 256 "$K" | cut -c1-64)" ] && [ "${vv[1]}" = "${vv[2]}" ] && [ "${vv[3]}" = "$ESHA" ] \
+    71	  && [ "${vv[4]}" = "$ELEN" ] && [ "${vv[5]:-}" = check-ok ] || {
+    72	  echo "verify FAILED, restoring backup"; S "cp -p $BK /boot/grub/grub.cfg; sync"; exit 2; }
+    73	echo "installed $E -> $KN '$CL'"
+    74	mark=$(wc -c <"$LOG")
+    75	S "grub-editenv /boot/grub/grubenv set next_entry='$E' && grub-editenv /boot/grub/grubenv list | grep -qx 'next_entry=$E' && sync" \
+    76	  || { echo "could not set next_entry: STOP"; clear_next; exit 2; }
+    77	S "(sleep 1; reboot) >/dev/null 2>&1 &"
+    78	T0=$(date +%s); echo "reboot at $(date +%T)"; sleep 30
+    79	for n in $(seq ${WAIT_N:-66}); do
+    80	  r=$(S 'cat /proc/sys/kernel/random/boot_id; grub-editenv /boot/grub/grubenv list; cut -d" " -f1 /proc/uptime' 2>/dev/null)
+    81	  if [ -n "$r" ] && [ "$(head -1 <<<"$r")" = "$B0" ] && [ "$n" -ge 6 ]; then   # still the old boot 60 s later
+    82	    echo "reboot did not happen: clearing next_entry, STOP"; clear_next; exit 2
+    83	  fi
+    84	  [ -n "$r" ] && [ "$(head -1 <<<"$r")" != "$B0" ] && {
+    85	      grep -qx saved_entry=0 <<<"$r" && ! grep -q 'next_entry=.' <<<"$r" || { echo "BACK BUT grubenv not default: STOP"; echo "$r"; exit 4; }
+    86	      echo "back after $(( $(date +%s) - T0 )) s, uptime $(tail -1 <<<"$r") s, grubenv default"
+    87	      tail -c +$((mark + 1)) "$LOG" | grep -a -v '^--- ' | awk '!seen[$0]++' | sed 's/^nc110 [0-9] [0-9/]* //'; exit 0; }
+    88	  sleep 5
+    89	done
+    90	echo "NOT BACK within $(( ${WAIT_N:-66} * 5 / 60 + 1 )) min of $(date -d @$T0 +%T 2>/dev/null || echo reboot): STOP, do not retry, needs a power cycle"
+    91	tail -c +$((mark + 1)) "$LOG" | grep -a -v '^--- ' | awk '!seen[$0]++'; exit 3
+   145	    let b = base();
+   146	    let rcba = rcba_raw & 0xFFFF_C000;
+   147	    let gcs_p = (rcba + 0x3410) as *mut u32;
+   148	    unsafe {
+   149	        let g0 = read_volatile(gcs_p);
+   150	        let (cnt0, tmr0, rld0) = (inw(b + 8), inw(b + 0x12) & 0x3FF, inw(b) & 0x3FF);
+   151	        kprintln!("wdt: inherited: GCS {:#x} NO_REBOOT={} TCO1_CNT={:#06x} HLT={} TMR={} RLD={} ({})", g0, (g0 >> 5) & 1, cnt0,
+   152	            (cnt0 >> 11) & 1, tmr0, rld0, if g0 & 0x20 == 0 && cnt0 & 0x800 == 0 { "already armed, by GRUB" } else { "not armed before us" });
+   153	        core::ptr::write_volatile(gcs_p, g0 & !0x20);
+   154	        outw(b + 4, 0x0008); // TCO1_STS.TIMEOUT (RW1C)
+   155	        outw(b + 6, 0x0002); // TCO2_STS.SECOND_TO_STS
+   156	        outw(b + 6, 0x0004); // TCO2_STS.BOOT_STS
+   157	        outw(b + 0x12, (inw(b + 0x12) & !0x3FF) | 50);
+   158	        outw(b, 1);
+   159	        outw(b + 8, inw(b + 8) & !0x0800); // un-halt; bit 12 (lock) written back as read
+   160	        let (g1, cnt, tmr, c0) = (read_volatile(gcs_p), inw(b + 8), inw(b + 0x12) & 0x3FF, inw(b) & 0x3FF);
+#![no_std]
+#![no_main]
+
+use core::arch::{asm, global_asm};
+use core::fmt::Write;
+use core::panic::PanicInfo;
+
+global_asm!(include_str!("boot.s"), options(att_syntax));
+
+mod console;
+#[allow(dead_code)]
+mod dhcp;
+mod kbd;
+mod mb;
+mod net;
+mod nic;
+mod nic_regs;
+mod pci;
+mod port;
+mod rng;
+mod ssh;
+mod term;
+mod time;
+mod udplog;
+mod wdt;
+
+struct SerialLog;
+impl log::Log for SerialLog {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Warn
+    }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            kprintln!("[{}] {}", r.level(), r.args());
+        }
+    }
+    fn flush(&self) {}
+}
+static LOGGER: SerialLog = SerialLog;
+
+#[no_mangle]
+pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
+    console::init();
+    // Attended: arm the TCO before anything else can block (Codex night review MUST-FIX 1). No net -> no run.
+    if cfg!(feature = "attended") && !wdt::arm_probe() {
+        kprintln!("wdt: ATTENDED: could not arm the TCO, refusing to run");
+        wdt::hard_reset();
+    }
+    kprintln!("NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)");
+    kprintln!("multiboot magic={:#010x} info={:#x} -> long mode OK", magic, info);
+    wdt::report();
+    if cfg!(feature = "attended") {
+        kprintln!("wdt: ATTENDED build: TCO armed by us with NO_REBOOT cleared (one-shot boot, Slot A on any reset)");
+    } else if !wdt::is_qemu_pc() && !wdt::verify_live() && !wdt::neg_control_on_q35() {
+        kprintln!("wdt: reset path not verified on this machine, refusing to run");
+        wdt::hard_reset();
+    }
+    // Key module right after the watchdog gate: copy the seed out and wipe the module before anything else.
+    let client_seed = mb::take_client_key(info);
+    mb::parse_memory(info);
+    let cmdline = mb::cmdline(info);
+    kprintln!("cmdline: {}", cmdline);
+    wdt::rehearse(cmdline);
+
+    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
+    kprintln!("time: TSC {} ticks/ms (PIT ch2 calibrated)", time::init());
+
+    match nic::probe(cmdline.contains("nic=mmio")) {
+        Ok(mut n) => {
+            if cmdline.contains("nic=no8105e") {
+                n.skip_8105e(); // A/B switch for the rtl_hw_start_8105e tweaks
+            }
+            kprintln!("nic: {} at {} {} mac={}", n.name(), n.bdf, n.bus, dhcp::Mac(n.mac));
+            match n.init() {
+                Ok(()) if cfg!(feature = "attended") => {
+                    kprintln!("udplog: broadcasting this log to UDP 5514");
+                    udplog::set_nic(&n);
+                    udplog::dump(1);
+                    udplog::dhcp_probe(&mut n);
+                    udplog::dump(2);
+                    if cmdline.contains("wdt=probe") {
+                        wdt::pet();
+                        kprintln!("wdt: HANG now (probe): cli; hlt, nobody pets; expect a reset ~60 s from here");
+                        udplog::dump(3);
+                        loop {
+grub-test/nc110-attended-k5-entry.cfg:1:menuentry "nc110-bm-attended-k5-wdtprobe" {
+grub-test/nc110-grubarm-func.cfg:3:# ("only after a reset at ~2x heartbeat on THIS board") is met by k5/k6/k9 on 2026-10-17: the same register state
+proof/codex-review-hw-night.txt:24:51010da attended: TCO armed (NO_REBOOT cleared) as the net on every boot, petted in all loops; rehearse ignores wdt=probe (k5 hung there); tools/nc110-boot.sh one-command iteration; q35 checks pass
+proof/codex-review-hw-night.txt:324:+        return false; // attended net, handled in main (k5 hung here before the NIC: result 5 counts as armed)
+proof/codex-review-hw-night.txt:657:   200	        return false; // attended net, handled in main (k5 hung here before the NIC: result 5 counts as armed)
+proof/codex-review-hw-night.txt:2157:grub-test/nc110-attended-k5-entry.cfg
+proof/codex-review-hw-night.txt:2166:?? grub-test/nc110-attended-k5-entry.cfg
+proof/codex-review-hw-night.txt:2177:/bin/zsh -lc "rg -n -A48 'static void rtl_hw_start_8105e' third_party/linux-v6.12/r8169_main.c; cat proof/nc110-hw-k7-ssh-udplog.txt; rg -n 'k6|k7|NO_REBOOT|59|probe' README* WORK* NOTES* 2>/dev/null; sed -n '145,168p' src/nic.rs; cat tools/attended-q35.py" in ~/nc110-baremetal
+proof/codex-review-hw-night-followup.txt:14:Follow-up calibrated review. Your previous review is proof/codex-review-hw-night.txt (6/10, MUST-FIX 1-4, SHOULD-FIX 5-6). The fix commit is afd5b2c (git show afd5b2c). Did each MUST-FIX/SHOULD-FIX get fixed without new problems? Note: on the real board k8 (SSH) and k9 (wdt=probe hang -> watchdog reset) both passed after this commit. Tier MUST-FIX/SHOULD-FIX/NIT, brief, end with 0-10 unattended-readiness. Do not edit.
+proof/codex-review-hw-night-followup.txt:18:I’ll compare the fix commit against each prior finding, check for regressions, and factor in the real-board k8 and k9 passes.
+proof/codex-review-hw-night-followup.txt:45:51010da attended: TCO armed (NO_REBOOT cleared) as the net on every boot, petted in all loops; rehearse ignores wdt=probe (k5 hung there); tools/nc110-boot.sh one-command iteration; q35 checks pass
+proof/codex-review-hw-night-followup.txt:345:+        return false; // attended net, handled in main (k5 hung here before the NIC: result 5 counts as armed)
+proof/codex-review-hw-night-followup.txt:678:   200	        return false; // attended net, handled in main (k5 hung here before the NIC: result 5 counts as armed)
+proof/codex-review-hw-night-followup.txt:2178:grub-test/nc110-attended-k5-entry.cfg
+proof/codex-review-hw-night-followup.txt:2187:?? grub-test/nc110-attended-k5-entry.cfg
+proof/codex-review-hw-night-followup.txt:2198:/bin/zsh -lc "rg -n -A48 'static void rtl_hw_start_8105e' third_party/linux-v6.12/r8169_main.c; cat proof/nc110-hw-k7-ssh-udplog.txt; rg -n 'k6|k7|NO_REBOOT|59|probe' README* WORK* NOTES* 2>/dev/null; sed -n '145,168p' src/nic.rs; cat tools/attended-q35.py" in ~/nc110-baremetal
+proof/codex-review-hw-night-followup.txt:2551:?? grub-test/nc110-attended-k5-entry.cfg
+proof/codex-review-hw-night-followup.txt:2658:+51010da attended: TCO armed (NO_REBOOT cleared) as the net on every boot, petted in all loops; rehearse ignores wdt=probe (k5 hung there); tools/nc110-boot.sh one-command iteration; q35 checks pass
+proof/codex-review-hw-night-followup.txt:2958:++        return false; // attended net, handled in main (k5 hung here before the NIC: result 5 counts as armed)
+proof/codex-review-hw-night-followup.txt:3291:+   200	        return false; // attended net, handled in main (k5 hung here before the NIC: result 5 counts as armed)
+proof/codex-review-hw-night-followup.txt:4791:+grub-test/nc110-attended-k5-entry.cfg
+proof/codex-review-hw-night-followup.txt:4800:+?? grub-test/nc110-attended-k5-entry.cfg
+proof/codex-review-hw-night-followup.txt:4811:+/bin/zsh -lc "rg -n -A48 'static void rtl_hw_start_8105e' third_party/linux-v6.12/r8169_main.c; cat proof/nc110-hw-k7-ssh-udplog.txt; rg -n 'k6|k7|NO_REBOOT|59|probe' README* WORK* NOTES* 2>/dev/null; sed -n '145,168p' src/nic.rs; cat tools/attended-q35.py" in ~/nc110-baremetal
+proof/codex-review-hw-night-followup.txt:6423:?? grub-test/nc110-attended-k5-entry.cfg
+proof/codex-review-hw-night-followup.txt:6904:   192	        return false; // attended net, handled in main (k5 hung here before the NIC: result 5 counts as armed)
+proof/codex-review-hw-night-followup.txt:7338:Substantial improvement, but **#1 and #4 are only partially fixed**. Your real-board k8/k9 passes establish working SSH and watchdog recovery after successful arming; they do not exercise the remaining failure paths.
+proof/codex-review-hw-night-followup.txt:7357:Substantial improvement, but **#1 and #4 are only partially fixed**. Your real-board k8/k9 passes establish working SSH and watchdog recovery after successful arming; they do not exercise the remaining failure paths.
+proof/codex-review-overnight2.txt:14:Calibrated adversarial review of commits 8f75737..HEAD (git log --oneline 8f75737..HEAD; git diff 8f75737 HEAD -- src tools grub-test/nc110-grubarm-func.cfg). Context: a bare-metal Rust kernel iterating unattended overnight on a REAL Samsung NC110 (NM10 TCO with TCO_LOCK=1, RTL8105E). New: (1) rtl_hw_start_8105e_1/2 port in src/nic.rs (compare against third_party/linux-v6.12/r8169_main.c:1255-1277, 2886-2915, 3619-3650; check EPHYAR protocol, register offsets 0xF0/0xD3/0xD0/0x54, the Cfg9346 unlock window, error paths leaving bus mastering off), (2) GRUB-side arming: grub-test/nc110-grubarm-func.cfg appended to the live grub.cfg (lock_mode=accept, its gate justification), and GRUBARM/GRUBSLEEP/WAIT_N in tools/nc110-boot.sh (now GRUBARM on by default; does the generated entry ever boot our kernel unarmed? quoting of the ARM block; any path leaving next_entry set), (3) wdt.rs inherited-state log. On hardware: GRUBSLEEP reset ~120 s after arming; k18 kernel inherited GCS 0x440 NO_REBOOT=0 TMR=100. Tier MUST-FIX/SHOULD-FIX/NIT, signal over volume, 'most is sound' valid. Do not edit. End 0-10.
+proof/codex-review-overnight2.txt:22:c4f649e nc110-boot.sh: GRUB arming on by default (k18: kernel inherited GCS 0x440 NO_REBOOT=0 TMR=100 from GRUB)
+proof/codex-review-overnight2.txt:24:110e603 nc110-boot.sh: WAIT_N for long tests (GRUBSLEEP)
+proof/codex-review-overnight2.txt:25:1349375 nc110-boot.sh GRUBARM/GRUBSLEEP options; keep the hand-made k2-k5 entry files
+proof/codex-review-overnight2.txt:26:64deac4 GRUB-side TCO arming for the NC110 (nc110_tco_consts with lock_mode=accept; gate met by k5/k6/k9) + nc110-boot.sh GRUBARM/GRUBSLEEP; q35 rehearsal of the entry shape: GRUB sleep ended by the watchdog 5.1 s after arming (TMR=5)
+proof/codex-review-overnight2.txt:37:+# ("only after a reset at ~2x heartbeat on THIS board") is met by k5/k6/k9 on 2026-10-17: the same register state
+proof/codex-review-overnight2.txt:213:+#   already be in grub.cfg); a refused arm reboots after 10 s. GRUBSLEEP=1 (with GRUBARM): no kernel, GRUB sleeps
+proof/codex-review-overnight2.txt:224:+GRUBARM=${GRUBARM-1}   # default ON since 2026-10-18 01:18 (k18); GRUBARM= turns it off
+proof/codex-review-overnight2.txt:231:+[ -n "${GRUBSLEEP:-}" ] && [ -n "$ARM" ] && ARM="$ARM"'
+proof/codex-review-overnight2.txt:232:+  echo "nc110-bm: GRUBSLEEP: sleeping 600 s unpetted, then reboot"
+proof/codex-review-overnight2.txt:293:#   already be in grub.cfg); a refused arm reboots after 10 s. GRUBSLEEP=1 (with GRUBARM): no kernel, GRUB sleeps
+proof/codex-review-overnight2.txt:322:GRUBARM=${GRUBARM-1}   # default ON since 2026-10-18 01:18 (k18); GRUBARM= turns it off
+proof/codex-review-overnight2.txt:329:[ -n "${GRUBSLEEP:-}" ] && [ -n "$ARM" ] && ARM="$ARM"'
+proof/codex-review-overnight2.txt:330:  echo "nc110-bm: GRUBSLEEP: sleeping 600 s unpetted, then reboot"
+proof/codex-review-overnight2.txt:983:        return false; // attended net, handled in main (k5 hung here before the NIC: result 5 counts as armed)
+?? grub-test/wdt-locked-accept.iso
+?? grub-test/wdt-locked-refuse.iso
+?? proof/codex-review-overnight2.txt
+
+codex
+Most is sound. **No demonstrated MUST-FIX regression** in the normal NC110 path; two SHOULD-FIX failure cases remain.
+
+- **SHOULD-FIX — Validate `WAIT_N` before scheduling the boot.** [nc110-boot.sh:79](~/nc110-baremetal/tools/nc110-boot.sh:79) accepts zero, malformed values, and counts below six. If the reboot request fails, these can bypass the old-boot cleanup at iteration six and exit with `next_entry` still set. Require a decimal integer ≥6 before any remote mutation. The timeout path also cannot establish that `next_entry` was consumed when SSH remains unavailable; its power-cycle instruction should acknowledge that the experiment may still be scheduled.
+
+- **SHOULD-FIX — Make the kernel load structurally conditional on successful arming.** [nc110-boot.sh:40](~/nc110-baremetal/tools/nc110-boot.sh:40) handles refusal with `reboot`, then places the kernel load outside the conditional. With the working GRUB reboot command, refusal never reaches the kernel. But if that command cannot execute, execution can fall through unarmed. Put loading/booting inside the `wdt_ok=yes` branch, as the original M1 entry does. Likewise, generate GRUBSLEEP as a separate branch without a subsequent kernel load. This is failure-path hardening, not evidence that your successful hardware runs booted unarmed.
+
+- **NIT — The inherited-state label overclaims provenance.** [wdt.rs:152](~/nc110-baremetal/src/wdt.rs:152) infers “already armed, by GRUB” from just NO_REBOOT=0 and HLT=0. Those bits neither identify the armer nor prove a valid, decrementing timer. “Inherited enabled state” would be accurate; the raw values are useful and the subsequent verification remains intact.
+
+The substantive checks pass:
+
+- EPHYAR offset, command/flag polarity, register mask/shift, polling budget, and post-write delay match Linux. All eight table operations and VER_30’s extra bit match.
+- `0xF0/0xD3/0xD0/0x54`, access widths, and masks are correct. Combining the two FuncEvent updates preserves their intended final bits; I found no concrete defect from that difference.
+- The tweaks execute inside the Cfg9346 unlock window. EPHY errors re-lock it; bus mastering remains off throughout these and subsequent PHY failure paths.
+- ARM quoting preserves literal `$wdt_ok` through Bash and stdin transport. Default arming is enabled; explicitly setting `GRUBARM=` disables it.
+- The board-specific reset evidence justifies `lock_mode=accept`. Your reported GRUBSLEEP reset directly validates GRUB arming; k18 corroborates inheritance.
+
+Read-only review and `bash -n` completed; no edits or hardware operations.
+
+**Unattended readiness: 8/10.**
+tokens used
+31,455
+Most is sound. **No demonstrated MUST-FIX regression** in the normal NC110 path; two SHOULD-FIX failure cases remain.
+
+- **SHOULD-FIX — Validate `WAIT_N` before scheduling the boot.** [nc110-boot.sh:79](~/nc110-baremetal/tools/nc110-boot.sh:79) accepts zero, malformed values, and counts below six. If the reboot request fails, these can bypass the old-boot cleanup at iteration six and exit with `next_entry` still set. Require a decimal integer ≥6 before any remote mutation. The timeout path also cannot establish that `next_entry` was consumed when SSH remains unavailable; its power-cycle instruction should acknowledge that the experiment may still be scheduled.
+
+- **SHOULD-FIX — Make the kernel load structurally conditional on successful arming.** [nc110-boot.sh:40](~/nc110-baremetal/tools/nc110-boot.sh:40) handles refusal with `reboot`, then places the kernel load outside the conditional. With the working GRUB reboot command, refusal never reaches the kernel. But if that command cannot execute, execution can fall through unarmed. Put loading/booting inside the `wdt_ok=yes` branch, as the original M1 entry does. Likewise, generate GRUBSLEEP as a separate branch without a subsequent kernel load. This is failure-path hardening, not evidence that your successful hardware runs booted unarmed.
+
+- **NIT — The inherited-state label overclaims provenance.** [wdt.rs:152](~/nc110-baremetal/src/wdt.rs:152) infers “already armed, by GRUB” from just NO_REBOOT=0 and HLT=0. Those bits neither identify the armer nor prove a valid, decrementing timer. “Inherited enabled state” would be accurate; the raw values are useful and the subsequent verification remains intact.
+
+The substantive checks pass:
+
+- EPHYAR offset, command/flag polarity, register mask/shift, polling budget, and post-write delay match Linux. All eight table operations and VER_30’s extra bit match.
+- `0xF0/0xD3/0xD0/0x54`, access widths, and masks are correct. Combining the two FuncEvent updates preserves their intended final bits; I found no concrete defect from that difference.
+- The tweaks execute inside the Cfg9346 unlock window. EPHY errors re-lock it; bus mastering remains off throughout these and subsequent PHY failure paths.
+- ARM quoting preserves literal `$wdt_ok` through Bash and stdin transport. Default arming is enabled; explicitly setting `GRUBARM=` disables it.
+- The board-specific reset evidence justifies `lock_mode=accept`. Your reported GRUBSLEEP reset directly validates GRUB arming; k18 corroborates inheritance.
+
+Read-only review and `bash -n` completed; no edits or hardware operations.
+
+**Unattended readiness: 8/10.**

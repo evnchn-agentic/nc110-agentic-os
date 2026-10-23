@@ -1,0 +1,122 @@
+[  0.000s] host: qemu-system-x86_64 -machine q35 -m 128 -display none -vga std -global ICH9-LPC.noreboot=false -action watchdog=reset -serial file:~/nc110-baremetal/proof/.wdt-mut-no-noreboot.serial -qmp unix:~/nc110-baremetal/proof/.qmp.sock,server,wait=off -cdrom /var/folders/l1/7xrlxl717d16rbfvqj272zc40000gn/T/tmp.h9mdM4kYTx/g/m.iso -boot d
+[  0.471s] serial: [H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  0.471s] serial: 
+[  0.471s] serial: 
+grub: mode locked-accept mutant no-noreboot
+[  0.657s] serial: 
+wdt: selftest OK (21 regexp cases + test -o)
+[  0.657s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  0.657s] serial: 
+wdt: before: GCS=20 TCO1_CNT=1800 TCO2_STS=0 (6 = last reset was the watchdog)
+[  0.657s] serial: 
+wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to
+[  0.657s] serial: 
+firmware SMI, reset on 2nd
+[  1.776s] serial: 
+wdt: after: GCS=20 TCO1_CNT=1000 TCO_TMR=5 SMI_EN=2021 count 4 -> 3 locked=yes
+[  1.776s] serial: 
+mode=accept
+[  1.776s] serial: 
+wdt: NO_REBOOT still set
+[  1.776s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[  4.778s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[  5.550s] serial: 
+[H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[  5.550s] serial: 
+[  5.550s] serial: 
+grub: mode locked-accept mutant no-noreboot
+[  5.748s] serial: 
+wdt: selftest OK (21 regexp cases + test -o)
+[  5.748s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[  5.748s] serial: 
+wdt: before: GCS=20 TCO1_CNT=1800 TCO2_STS=0 (6 = last reset was the watchdog)
+[  5.748s] serial: 
+wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to
+[  5.748s] serial: 
+firmware SMI, reset on 2nd
+[  6.795s] serial: 
+wdt: after: GCS=20 TCO1_CNT=1000 TCO_TMR=5 SMI_EN=21 count 4 -> 3 locked=yes
+[  6.795s] serial: 
+mode=accept
+[  6.795s] serial: 
+wdt: NO_REBOOT still set
+[  6.795s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[  9.860s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[ 10.657s] serial: 
+[H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[ 10.657s] serial: 
+[ 10.657s] serial: 
+grub: mode locked-accept mutant no-noreboot
+[ 10.791s] serial: 
+wdt: selftest OK (21 regexp cases + test -o)
+[ 10.791s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[ 10.791s] serial: 
+wdt: before: GCS=20 TCO1_CNT=1800 TCO2_STS=0 (6 = last reset was the watchdog)
+[ 10.791s] serial: 
+wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to
+[ 10.791s] serial: 
+firmware SMI, reset on 2nd
+[ 11.916s] serial: 
+wdt: after: GCS=20 TCO1_CNT=1000 TCO_TMR=5 SMI_EN=21 count 4 -> 3 locked=yes
+[ 11.916s] serial: 
+mode=accept
+[ 11.916s] serial: 
+wdt: NO_REBOOT still set
+[ 11.916s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[ 14.935s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[ 15.726s] serial: 
+[H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[ 15.726s] serial: 
+[ 15.726s] serial: 
+grub: mode locked-accept mutant no-noreboot
+[ 15.926s] serial: 
+wdt: selftest OK (21 regexp cases + test -o)
+[ 15.926s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[ 15.926s] serial: 
+wdt: before: GCS=20 TCO1_CNT=1800 TCO2_STS=0 (6 = last reset was the watchdog)
+[ 15.926s] serial: 
+wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to
+[ 15.926s] serial: 
+firmware SMI, reset on 2nd
+[ 16.971s] serial: 
+wdt: after: GCS=20 TCO1_CNT=1000 TCO_TMR=5 SMI_EN=21 count 4 -> 3 locked=yes
+[ 16.971s] serial: 
+mode=accept
+[ 16.971s] serial: 
+wdt: NO_REBOOT still set
+[ 16.971s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[ 20.039s] qmp: RESET {"guest": true, "reason": "guest-reset"}
+[ 20.846s] serial: 
+[H[J[1;1H[H[J[1;1H  Booting `wdt-arm then multiboot (q35 rehearsal)'
+[ 20.846s] serial: 
+[ 21.042s] serial: 
+grub: mode locked-accept mutant no-noreboot
+[ 21.042s] serial: 
+wdt: selftest OK (21 regexp cases + test -o)
+[ 21.042s] serial: 
+wdt: lpcid=29188086 pmbase=601 rcba=fed1c001
+[ 21.241s] serial: 
+wdt: before: GCS=20 TCO1_CNT=1800 TCO2_STS=0 (6 = last reset was the watchdog)
+[ 21.241s] serial: 
+wdt: TCO_LOCK set, lock_mode=accept: TCO_EN left as read, 1st timeout goes to
+[ 21.241s] serial: 
+firmware SMI, reset on 2nd
+[ 22.308s] serial: 
+wdt: after: GCS=20 TCO1_CNT=1000 TCO_TMR=5 SMI_EN=21 count 4 -> 3 locked=yes
+[ 22.308s] serial: 
+mode=accept
+[ 22.308s] serial: 
+wdt: NO_REBOOT still set
+[ 22.308s] serial: 
+grub: NOT armed, refusing to boot our code, rebooting
+[ 25.046s] host: stop: banners=0 want=2 elapsed=25.0s
+[ 25.060s] host: locked check: 0 'after:' line(s) in the watchdog's boot, TCO_LOCK and TCO_EN still set in all: False
+[ 25.060s] host: VERDICT expect=watchdog: FAIL (start=None hang=None wd=None next=None)

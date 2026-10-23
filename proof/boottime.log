@@ -1,0 +1,10 @@
+2026-10-20 19:02:32 baseline-t5-49b98b1e first_udp=10.3s bmctl_ready=15.0s ping_after=16.3s pong uptime_ms=7728 ip=192.168.50.120
+2026-10-20 19:02:54 baseline-t5-49b98b1e first_udp=10.2s bmctl_ready=14.9s ping_after=17.2s pong uptime_ms=8687 ip=192.168.50.120
+2026-10-20 19:03:20 baseline-t5-49b98b1e first_udp=10.3s bmctl_ready=19.0s ping_after=20.2s pong uptime_ms=11697 ip=192.168.50.120
+2026-10-20 19:22:51 t6-a1e03ac4-quiet first_udp=9.9s bmctl_ready=10.4s ping_after=13.5s pong uptime_ms=5378 ip=192.168.50.120
+2026-10-20 19:23:10 t6-a1e03ac4-quiet first_udp=9.8s bmctl_ready=12.4s ping_after=13.6s pong uptime_ms=5521 ip=192.168.50.120
+2026-10-20 19:23:27 t6-a1e03ac4-quiet first_udp=9.9s bmctl_ready=10.4s ping_after=12.6s pong uptime_ms=4517 ip=192.168.50.120
+2026-10-20 19:57:40 t6-26372673-phykeep first_udp=8.2s bmctl_ready=10.1s ping_after=10.3s pong uptime_ms=2141 ip=192.168.50.120
+2026-10-20 19:57:56 t6-26372673-phykeep first_udp=8.3s bmctl_ready=10.1s ping_after=10.3s pong uptime_ms=2141 ip=192.168.50.120
+2026-10-20 20:10:49 t7-be695204 first_udp=7.3s bmctl_ready=7.9s ping_after=8.1s pong uptime_ms=807 ip=192.168.50.120
+2026-10-20 20:11:02 t7-be695204 first_udp=7.3s bmctl_ready=7.9s ping_after=8.1s pong uptime_ms=780 ip=192.168.50.120

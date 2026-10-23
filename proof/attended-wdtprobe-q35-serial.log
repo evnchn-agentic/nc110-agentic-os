@@ -1,0 +1,11 @@
+[  0.17] NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)
+[  0.17] multiboot magic=0x2badb002 info=0x9500 -> long mode OK
+[  0.17] wdt: armed by boot.s (result=0)
+[  0.17] wdt: TCOBASE=0x660 GCS 0x00000000 -> 0x00000000 NO_REBOOT=0 TCO1_CNT=0x0000 HLT=0 LOCK=0
+[  0.17] wdt: before-clear TCO1_STS=0x0000 TCO2_STS=0x0000 SECOND_TO_STS=0 BOOT_STS=0
+[  0.17] wdt: TCO_TMR=5 ticks x 0.6 s, reset expected after 2nd expiry (~6000 ms)
+[  0.17] wdt: ATTENDED build: no watchdog, the operator is the safety net (power cycle -> Slot A)
+[  1.47] wdt: probe arm: GCS 0x0 -> 0x0 TCO1_CNT=0x0000 TMR=50 RLD 49->47 SMI_EN=0x21 => ARMED
+[  1.47] keymod: no multiboot module
+[  1.47] cmdline: target/attended/x86_64-unknown-none/release/nc110-kernel wdt=probe
+[  1.47] wdt: HANG now: cli; hlt with the timer running, nobody pets

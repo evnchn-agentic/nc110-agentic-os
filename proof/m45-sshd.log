@@ -1,0 +1,110 @@
+debug1: Bind to port 2223 on 127.0.0.1.
+Server listening on 127.0.0.1 port 2223.
+debug1: fd 7 clearing O_NONBLOCK
+debug1: Forked child 13868.
+debug1: rexec start in 7 out 7 newsock 7 config_s 8/9
+debug1: sshd-session version OpenSSH_10.2, LibreSSL 3.3.6
+debug1: network sockets: 8, 8
+Connection from 127.0.0.1 port 51440 on 127.0.0.1 port 2223
+debug1: Local version string SSH-2.0-OpenSSH_10.2
+debug1: Remote protocol version 2.0, remote software version Sunset-0.6.0
+debug1: compat_banner: no match: Sunset-0.6.0
+debug1: mm_answer_state: config len 649
+debug1: sshd-auth version OpenSSH_10.2, LibreSSL 3.3.6 [preauth]
+debug1: list_hostkey_types: ssh-ed25519 [preauth]
+debug1: SSH2_MSG_KEXINIT sent [preauth]
+debug1: SSH2_MSG_KEXINIT received [preauth]
+debug1: kex: algorithm: curve25519-sha256 [preauth]
+debug1: kex: host key algorithm: ssh-ed25519 [preauth]
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none [preauth]
+debug1: kex: server->client cipher: chacha20-poly1305@openssh.com MAC: <implicit> compression: none [preauth]
+debug1: expecting SSH2_MSG_KEX_ECDH_INIT [preauth]
+debug1: SSH2_MSG_KEX_ECDH_INIT received [preauth]
+debug1: mm_answer_sign: hostkey ssh-ed25519 index 0
+debug1: ssh_packet_send2_wrapped: resetting send seqnr 3 [preauth]
+debug1: rekey out after 134217728 blocks [preauth]
+debug1: SSH2_MSG_NEWKEYS sent [preauth]
+debug1: Sending SSH2_MSG_EXT_INFO [preauth]
+debug1: expecting SSH2_MSG_NEWKEYS [preauth]
+debug1: ssh_packet_read_poll2: resetting read seqnr 3 [preauth]
+debug1: SSH2_MSG_NEWKEYS received [preauth]
+debug1: rekey in after 134217728 blocks [preauth]
+debug1: KEX done [preauth]
+debug1: userauth-request for user evnchn service ssh-connection method none [preauth]
+debug1: attempt 0 failures 0 [preauth]
+debug1: authentication methods list 0: publickey
+debug1: authentication methods list 0: publickey [preauth]
+debug1: userauth-request for user evnchn service ssh-connection method publickey [preauth]
+debug1: attempt 1 failures 0 [preauth]
+debug1: userauth_pubkey: publickey test pkalg ssh-ed25519 pkblob ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY [preauth]
+debug1: temporarily_use_uid: 501/20 (e=501/20)
+debug1: restore_uid: (unprivileged)
+debug1: temporarily_use_uid: 501/20 (e=501/20)
+debug1: trying public key file ~/nc110-baremetal/test-keys/authorized_keys
+debug1: fd 9 clearing O_NONBLOCK
+debug1: ~/nc110-baremetal/test-keys/authorized_keys:1: matching key found: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+debug1: ~/nc110-baremetal/test-keys/authorized_keys:1: key options: agent-forwarding port-forwarding pty user-rc x11-forwarding
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+debug1: restore_uid: (unprivileged)
+Postponed publickey for evnchn from 127.0.0.1 port 51440 ssh2 [preauth]
+debug1: userauth-request for user evnchn service ssh-connection method publickey [preauth]
+debug1: attempt 2 failures 0 [preauth]
+debug1: temporarily_use_uid: 501/20 (e=501/20)
+debug1: restore_uid: (unprivileged)
+debug1: temporarily_use_uid: 501/20 (e=501/20)
+debug1: trying public key file ~/nc110-baremetal/test-keys/authorized_keys
+debug1: fd 9 clearing O_NONBLOCK
+debug1: ~/nc110-baremetal/test-keys/authorized_keys:1: matching key found: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+debug1: ~/nc110-baremetal/test-keys/authorized_keys:1: key options: agent-forwarding port-forwarding pty user-rc x11-forwarding
+Accepted key ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY found at ~/nc110-baremetal/test-keys/authorized_keys:1
+debug1: restore_uid: (unprivileged)
+debug1: auth_activate_options: setting new authentication options
+Accepted publickey for evnchn from 127.0.0.1 port 51440 ssh2: ED25519 SHA256:wXK4AEcRYXTR8Y7RWJgOBhNb4L7UYzUDrhfVH9Kl7dY
+debug1: monitor_child_preauth: user evnchn authenticated by privileged process
+debug1: auth_activate_options: setting new authentication options [preauth]
+debug1: monitor_read_log: child log fd closed
+debug1: child_close: enter (forcing)
+BSM audit: bsm_audit_session_setup: setaudit_addr failed: Operation not permitted
+User child is on pid 13890
+debug1: rekey in after 134217728 blocks
+debug1: rekey out after 134217728 blocks
+debug1: ssh_packet_set_postauth: called
+debug1: active: key options: agent-forwarding port-forwarding pty user-rc x11-forwarding
+debug1: Entering interactive session for SSH2.
+debug1: server_init_dispatch
+debug1: server_input_channel_open: ctype session rchan 0 win 1000 max 1000
+debug1: input_session_request
+debug1: channel 0: new session [server-session] (inactive timeout: 0)
+debug1: session_new: session 0
+debug1: session_open: channel 0
+debug1: session_open: session 0: link with channel 0
+debug1: server_input_channel_open: confirm session
+debug1: server_input_channel_req: channel 0 request pty-req reply 0
+debug1: session_by_channel: session 0 channel 0
+debug1: session_input_channel_req: session 0 req pty-req
+debug1: Allocating pty.
+debug1: session_new: session 0
+Attempt to write login records by non-root user (aborting)
+debug1: session_pty_req: session 0 alloc /dev/ttys018
+debug1: server_input_channel_req: channel 0 request shell reply 0
+debug1: session_by_channel: session 0 channel 0
+debug1: session_input_channel_req: session 0 req shell
+Starting session: forced-command (config) '/usr/bin/env -i TERM="$TERM" HOME=/tmp/nc110-m45-home PS1='nc110$ ' /bin/sh -i' on ttys018 for evnchn from 127.0.0.1 port 51440 id 0
+debug1: server_input_channel_req: channel 0 request window-change reply 0
+debug1: session_by_channel: session 0 channel 0
+debug1: session_input_channel_req: session 0 req window-change
+debug1: Setting controlling tty using TIOCSCTTY.
+debug1: Received SIGCHLD.
+debug1: session_by_pid: pid 13891
+debug1: session_exit_message: session 0 channel 0 pid 13891 exit 0
+debug1: session_exit_message: release channel 0
+debug1: session_by_tty: session 0 tty /dev/ttys018
+debug1: session_pty_cleanup2: session 0 release /dev/ttys018
+Attempt to write login records by non-root user (aborting)
+Connection closed by 127.0.0.1 port 51440
+debug1: channel 0: free: server-session, nchannels 1
+Close session: user evnchn from 127.0.0.1 port 51440 id 0
+debug1: do_cleanup
+Transferred: sent 24260, received 9644 bytes
+Closing connection to 127.0.0.1 port 51440
+Received signal 15; terminating.

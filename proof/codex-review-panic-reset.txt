@@ -1,0 +1,1350 @@
+Reading additional input from stdin...
+OpenAI Codex v0.154.0
+--------
+workdir: ~/nc110-baremetal
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a15cda-a6b4-71d0-9a1c-25eb6cb42179
+--------
+user
+Calibrated skeptic review of the STAGED diff (git diff --cached) in this no_std x86_64 Rust kernel for a Samsung NC110 (ICH7/NM10). Change: the panic handler now shows the panic, pets the TCO watchdog for 10 s, then hard-resets via port 0xCF9 (wdt::hard_reset writes 0x02 then 0x06); a nested panic writes 0x06 to 0xCF9 directly. Reason: on this board a TCO reset has twice left it dark (no POST) since a native-resolution display change, while 0xCF9 resets came back. Also a cmdline hook wdt=panic in wdt::rehearse to test it (tools/panic-q35-test.py). Find concrete failures: can a panic now loop forever while petting (so neither reset happens)? Is writing 0x06 alone to 0xCF9 a valid hard reset on ICH7 (vs 0x02 then 0x06)? Can pet()/delay_ms() themselves panic or hang (PM timer), recursing? Does a crash-at-boot now become a fast reboot loop, and is that worse than a dark board given GRUB escapes to recovery Linux on the 6th boot of a day? Is the wdt=panic hook reachable in production with harm? Quote code. MUST-FIX / SHOULD / NIT, then 0-10. 'Most is sound' is valid.
+hook: SessionStart
+hook: SessionStart Completed
+codex
+I’ll read the staged diff and panic/reset call paths, then check the ICH7 reset semantics for concrete failure modes.
+exec
+/bin/zsh -lc "git diff --cached; rg --files -g AGENTS.md -g '*wdt*' -g '*timer*' -g '*panic*' -g '*grub*'" in ~/nc110-baremetal
+ succeeded in 0ms:
+diff --git a/src/main.rs b/src/main.rs
+index 4cd3731..4a10227 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -194,8 +194,21 @@ pub fn ram_overlaps(base: u64, len: u64) -> bool {
+ 
+ #[panic_handler]
+ fn panic(info: &PanicInfo) -> ! {
+-    console::show_log();
+-    let _ = writeln!(console::Console, "PANIC: {}", info);
++    // Restart by ourselves via 0xCF9 instead of waiting for the TCO: on the NC110 a TCO reset has left the board dark
++    // since the native-resolution default (2026-10-21, twice), while 0xCF9 resets still came back. A panic while
++    // panicking (e.g. in the console) goes straight to the reset.
++    static PANICKING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
++    if !PANICKING.swap(true, core::sync::atomic::Ordering::SeqCst) {
++        console::show_log();
++        let _ = writeln!(console::Console, "PANIC: {}", info);
++        let _ = writeln!(console::Console, "restarting in 10 s");
++        for _ in 0..20 {
++            wdt::pet();
++            wdt::delay_ms(500);
++        }
++        wdt::hard_reset();
++    }
++    unsafe { asm!("out dx, al", in("dx") 0xCF9u16, in("al") 0x06u8) };
+     loop {
+         unsafe { asm!("cli; hlt") };
+     }
+diff --git a/src/wdt.rs b/src/wdt.rs
+index 2fc856d..8c3b391 100644
+--- a/src/wdt.rs
++++ b/src/wdt.rs
+@@ -198,6 +198,9 @@ pub fn delay_ms(ms: u32) {
+ pub fn rehearse(cmdline: &str) -> bool {
+     let Some(i) = cmdline.find("wdt=") else { return false };
+     let arg = cmdline[i + 4..].split(' ').next().unwrap_or("");
++    if arg == "panic" {
++        panic!("wdt=panic: test panic"); // the panic handler must restart the board by itself (0xCF9), not wait for the TCO
++    }
+     if arg == "probe" {
+         return false; // attended net, handled in main (k5 hung here before the NIC: result 5 counts as armed)
+     }
+diff --git a/tools/panic-q35-test.py b/tools/panic-q35-test.py
+new file mode 100644
+index 0000000..69ce3b5
+--- /dev/null
++++ b/tools/panic-q35-test.py
+@@ -0,0 +1,29 @@
++#!/usr/bin/env python3
++"""q35 check: a kernel panic restarts the board by itself via 0xCF9 within about 10 s, instead of halting until the TCO
++fires (on the NC110 a TCO reset has left the board dark since the native-resolution default, 2026-10-21). Boots
++cmdline 'bmctl nic=mmio wdt=panic' with -no-reboot, so the reset shows as QEMU exiting. Usage: panic-q35-test.py
++[kernel]. Exit 1 if QEMU is still running 25 s after the panic."""
++import os, subprocess, sys, time
++K = sys.argv[1] if len(sys.argv) > 1 else "target/attended/x86_64-unknown-none/release/nc110-kernel"
++L = f"/tmp/panic-q35-{os.getpid()}.log"
++q = subprocess.Popen(["qemu-system-x86_64", "-machine", "q35", "-m", "128", "-display", "none", "-no-reboot",
++    "-global", "ICH9-LPC.noreboot=false", "-serial", f"file:{L}", "-kernel", K, "-initrd", "test-keys/client.key",
++    "-append", "bmctl nic=mmio wdt=panic", "-netdev", "user,id=n0", "-device", "rtl8139,netdev=n0"])
++log = lambda: open(L, errors="replace").read() if os.path.exists(L) else ""
++t0 = time.time()
++while "PANIC" not in log() and time.time() - t0 < 30 and q.poll() is None:
++    time.sleep(0.2)
++tp = time.time()
++print("panic seen:", "PANIC" in log())
++while q.poll() is None and time.time() - tp < 25:
++    time.sleep(0.2)
++dt = time.time() - tp
++gone = q.poll() is not None
++if not gone:
++    q.kill()
++print(f"qemu {'exited (reset) %.1f s after the panic' % dt if gone else 'still running 25 s after the panic'}")
++for l in log().splitlines():
++    if "PANIC" in l or "restarting" in l or "0xCF9" in l:
++        print("serial:", l.strip())
++ok = "PANIC" in log() and gone
++print("RESULT:", "PASS" if ok else "FAIL"); sys.exit(0 if ok else 1)
+src/wdt.rs
+run-wdt.py
+tools/wdt-mutants.sh
+tools/step1-linux-wdt.sh
+tools/panic-q35-test.py
+proof/attended-wdtprobe-q35-serial.log
+proof/m25-wdt-hang-regression.log
+proof/codex-review-panic-reset.txt
+proof/wdt-grub-badrcba.log
+proof/wdt-hang.log
+proof/wdt-refuse.serial.log
+proof/wdt-grub-locked-accept.trace.txt
+proof/m25-grub-keymod-serial.log
+proof/wdt-pos.log
+proof/wdt-neg.log
+proof/attended-q35-grub-serial.log
+proof/wdt-mut-no-tmr.log
+proof/wdt-grub-locked-accept.log
+proof/wdt-mut-no-unhalt.log
+proof/wdt-mut-no-arm.log
+proof/wdt-grub.log
+proof/wdt-mut-no-noreboot.log
+proof/wdt-mut-accept-default.log
+proof/wdt-grub-locked-refuse.log
+grub-test/wdt.iso
+grub-test/wdt-locked-accept.iso
+grub-test/nc110-grubarm-func.cfg
+grub-test/wdt-locked-refuse.iso
+grub-test/keymod-iso/boot/grub/grub.cfg
+grub-test/fbiso/boot/grub/grub.cfg
+grub-test/wdt-badrcba.iso
+grub-test/iso/boot/grub/grub.cfg
+
+exec
+/bin/zsh -lc "git status --short; nl -ba src/wdt.rs; nl -ba src/main.rs | sed -n '190,400p'; rg -n 'delay_ms|fn pet|show_log|impl.*Write|hard_reset|six|6th|boot_count|bootcount|boots_today|rehearse' src grub-test tools --glob '"'!*.log'"' --glob '"'!*.iso'"'" in ~/nc110-baremetal
+ succeeded in 0ms:
+ M proof/nc110-soak.log
+M  src/main.rs
+M  src/wdt.rs
+A  tools/panic-q35-test.py
+?? proof/acpi/nc110-FACP.dsl
+?? proof/codex-review-agentos-followup.txt
+?? proof/codex-review-agentos-followup2.txt
+?? proof/codex-review-agentos-followup3.txt
+?? proof/codex-review-agentos-followup4.txt
+?? proof/codex-review-agentos.txt
+?? proof/codex-review-panic-reset.txt
+?? proof/review-home-deepseek.txt
+?? tools/nc110-wake.py
+     1	//! TCO watchdog (ICH9 in QEMU q35, NM10 on the NC110; both iTCO v2). boot.s arms it before any
+     2	//! Rust runs; this module reports what boot.s did, pets it, and runs the M0.5 rehearsal modes.
+     3	use crate::port::{inl, inw, outb, outw};
+     4	use crate::{kprintln, pci};
+     5	use core::ptr::{addr_of, read_volatile};
+     6	
+     7	#[cfg(all(feature = "neg-control", feature = "grub-armed"))]
+     8	compile_error!("neg-control is QEMU-only and must never be combined with grub-armed (the hardware artifact)");
+     9	
+    10	/// Negative control (`--features neg-control`, QEMU q35 only; boot.s never self-arms on NM10): boot.s SETS GCS.NO_REBOOT instead of clearing it
+    11	/// (QEMU's GCS powers up 0 with noreboot=false, so merely skipping the clear would prove nothing).
+    12	#[no_mangle]
+    13	static TCO_NEG_CONTROL: u8 = cfg!(feature = "neg-control") as u8;
+    14	
+    15	/// `--features grub-armed`: boot.s does NOT arm; used to test the GRUB iorw/memrw arming sequence.
+    16	#[no_mangle]
+    17	static TCO_GRUB_ARMED: u8 = cfg!(feature = "grub-armed") as u8;
+    18	
+    19	extern "C" {
+    20	    static tco_result: u32;
+    21	    static tco_gcs_pre: u32;
+    22	    static tco_gcs: u32;
+    23	    static tco_base: u32;
+    24	    static tco_sts1_pre: u16;
+    25	    static tco_sts2_pre: u16;
+    26	    static tco_cnt: u16;
+    27	}
+    28	
+    29	fn rd<T: Copy>(p: *const T) -> T {
+    30	    unsafe { read_volatile(p) }
+    31	}
+    32	
+    33	pub fn armed() -> bool {
+    34	    matches!(rd(addr_of!(tco_result)), 0 | 4 | 5)
+    35	}
+    36	
+    37	pub fn pmbase() -> u16 {
+    38	    (pci::read32(pci::b0(31, 0), 0x40) & 0xFF80) as u16
+    39	}
+    40	
+    41	pub fn base() -> u16 {
+    42	    pmbase() + 0x60
+    43	}
+    44	
+    45	pub fn report() {
+    46	    let r = rd(addr_of!(tco_result));
+    47	    let what = match r {
+    48	        0 => "armed by boot.s",
+    49	        1 => "skipped (LPC 00:1f.0 is not ICH9 8086:2918 / NM10 8086:27bc)",
+    50	        2 => "NOT armed: PMBASE unset",
+    51	        3 => "NOT armed: RCBA disabled",
+    52	        4 => "left to GRUB (grub-armed build); live registers follow",
+    53	        5 => "NM10: boot.s does not arm (attended Rust arms it; else GRUB must); live registers follow",
+    54	        _ => "NOT armed: unknown",
+    55	    };
+    56	    kprintln!("wdt: {} (result={})", what, r);
+    57	    if r == 4 || r == 5 {
+    58	        let b = base();
+    59	        let gcs = unsafe { read_volatile(((pci::read32(pci::b0(31, 0), 0xF0) & 0xFFFF_C000) + 0x3410) as *const u32) };
+    60	        let (s1, s2, cnt, tmr) = unsafe { (inw(b + 4), inw(b + 6), inw(b + 8), inw(b + 0x12)) };
+    61	        kprintln!(
+    62	            "wdt: live TCOBASE={:#x} GCS={:#010x} NO_REBOOT={} TCO1_CNT={:#06x} HLT={} TCO1_STS={:#06x} TCO2_STS={:#06x} TCO_TMR={}",
+    63	            b, gcs, (gcs >> 5) & 1, cnt, (cnt >> 11) & 1, s1, s2, tmr & 0x3FF
+    64	        );
+    65	        return;
+    66	    }
+    67	    if r != 0 {
+    68	        return;
+    69	    }
+    70	    let (b, gcs, s1, s2, cnt) = {
+    71	        (rd(addr_of!(tco_base)) as u16, rd(addr_of!(tco_gcs)), rd(addr_of!(tco_sts1_pre)), rd(addr_of!(tco_sts2_pre)), rd(addr_of!(tco_cnt)))
+    72	    };
+    73	    kprintln!(
+    74	        "wdt: TCOBASE={:#x} GCS {:#010x} -> {:#010x} NO_REBOOT={} TCO1_CNT={:#06x} HLT={} LOCK={}",
+    75	        b, rd(addr_of!(tco_gcs_pre)), gcs, (gcs >> 5) & 1, cnt, (cnt >> 11) & 1, (cnt >> 12) & 1
+    76	    );
+    77	    kprintln!(
+    78	        "wdt: before-clear TCO1_STS={:#06x} TCO2_STS={:#06x} SECOND_TO_STS={} BOOT_STS={}",
+    79	        s1, s2, (s2 >> 1) & 1, (s2 >> 2) & 1
+    80	    );
+    81	    let tmr = unsafe { inw(b + 0x12) } & 0x3FF;
+    82	    kprintln!("wdt: TCO_TMR={} ticks x 0.6 s, reset expected after 2nd expiry (~{} ms)", tmr, tmr as u32 * 1200);
+    83	}
+    84	
+    85	/// Live check of the reset path, whoever armed it: NO_REBOOT=0, HLT=0, TMR>=4, and the counter
+    86	/// (TCO_RLD reads back the current value on v2) decrements across ~1.3 ticks.
+    87	pub fn verify_live() -> bool {
+    88	    if !armed() {
+    89	        return false;
+    90	    }
+    91	    let b = base();
+    92	    let rcba = pci::read32(pci::b0(31, 0), 0xF0);
+    93	    if rcba & 1 == 0 {
+    94	        return false;
+    95	    }
+    96	    let gcs = unsafe { read_volatile(((rcba & 0xFFFF_C000) + 0x3410) as *const u32) };
+    97	    let (cnt, tmr) = unsafe { (inw(b + 8), inw(b + 0x12) & 0x3FF) };
+    98	    let c0 = unsafe { inw(b) } & 0x3FF;
+    99	    delay_ms(800);
+   100	    let c1 = unsafe { inw(b) } & 0x3FF;
+   101	    let ok = gcs & 0x20 == 0 && cnt & 0x0800 == 0 && tmr >= 4 && c1 != c0;
+   102	    kprintln!(
+   103	        "wdt: verify NO_REBOOT={} HLT={} TMR={} count {}->{} => {}",
+   104	        (gcs >> 5) & 1, (cnt >> 11) & 1, tmr, c0, c1, if ok { "VERIFIED" } else { "NOT VERIFIED" }
+   105	    );
+   106	    ok
+   107	}
+   108	
+   109	/// QEMU `-machine pc` (PIIX3 8086:7000 at 00:01.0) has no TCO; the M0 NIC demo may run unprotected there.
+   110	pub fn is_qemu_pc() -> bool {
+   111	    pci::read32(pci::b0(1, 0), 0) == 0x7000_8086 && rd(addr_of!(tco_result)) == 1
+   112	}
+   113	
+   114	/// The negative control must reach its hang unverified (that is the point); only on q35, never NM10.
+   115	pub fn neg_control_on_q35() -> bool {
+   116	    let on = cfg!(feature = "neg-control") && rd(addr_of!(tco_result)) == 0;
+   117	    if on {
+   118	        kprintln!("wdt: neg-control build on q35: proceeding unverified on purpose");
+   119	    }
+   120	    on
+   121	}
+   122	
+   123	/// Hard reset via the reset control register (spec M2 `reboot`): back to the firmware / Slot A.
+   124	pub fn hard_reset() -> ! {
+   125	    kprintln!("wdt: hard reset via 0xCF9");
+   126	    unsafe {
+   127	        outb(0xCF9, 0x02);
+   128	        outb(0xCF9, 0x06);
+   129	    }
+   130	    loop {
+   131	        unsafe { core::arch::asm!("cli; hlt") };
+   132	    }
+   133	}
+   134	
+   135	/// Attended `wdt=probe`: arm the NM10 TCO ourselves without touching locked bits (SMI_EN.TCO_EN stays as the
+   136	/// BIOS left it): clear GCS.NO_REBOOT (the BIOS leaves it SET on the NC110), clear stale status, TMR=50 ticks
+   137	/// (30 s per stage, reset ~60 s after the last pet), reload, un-halt. Returns true if the readback says armed.
+   138	pub fn arm_probe() -> bool {
+   139	    let lpc = pci::read32(pci::b0(31, 0), 0);
+   140	    let rcba_raw = pci::read32(pci::b0(31, 0), 0xF0);
+   141	    if !(lpc == 0x27BC_8086 || lpc == 0x2918_8086) || pmbase() == 0 || rcba_raw & 1 == 0 {
+   142	        kprintln!("wdt: probe arm: prerequisites fail (LPC {:#010x}, PMBASE {:#x}, RCBA {:#x})", lpc, pmbase(), rcba_raw);
+   143	        return false;
+   144	    }
+   145	    let b = base();
+   146	    let rcba = rcba_raw & 0xFFFF_C000;
+   147	    let gcs_p = (rcba + 0x3410) as *mut u32;
+   148	    unsafe {
+   149	        let g0 = read_volatile(gcs_p);
+   150	        let (cnt0, tmr0, rld0) = (inw(b + 8), inw(b + 0x12) & 0x3FF, inw(b) & 0x3FF);
+   151	        kprintln!("wdt: inherited: GCS {:#x} NO_REBOOT={} TCO1_CNT={:#06x} HLT={} TMR={} RLD={} ({})", g0, (g0 >> 5) & 1, cnt0,
+   152	            (cnt0 >> 11) & 1, tmr0, rld0, if g0 & 0x20 == 0 && cnt0 & 0x800 == 0 { "inherited enabled: NO_REBOOT clear, timer running" } else { "inherited not enabled" });
+   153	        core::ptr::write_volatile(gcs_p, g0 & !0x20);
+   154	        outw(b + 4, 0x0008); // TCO1_STS.TIMEOUT (RW1C)
+   155	        outw(b + 6, 0x0002); // TCO2_STS.SECOND_TO_STS
+   156	        outw(b + 6, 0x0004); // TCO2_STS.BOOT_STS
+   157	        outw(b + 0x12, (inw(b + 0x12) & !0x3FF) | 50);
+   158	        outw(b, 1);
+   159	        outw(b + 8, inw(b + 8) & !0x0800); // un-halt; bit 12 (lock) written back as read
+   160	        let (g1, cnt, tmr, c0) = (read_volatile(gcs_p), inw(b + 8), inw(b + 0x12) & 0x3FF, inw(b) & 0x3FF);
+   161	        // The count drops every 0.6 s: poll for the first change (boot time) instead of a fixed 1.3 s, same bound.
+   162	        let mut c1 = c0;
+   163	        for _ in 0..130 {
+   164	            delay_ms(10);
+   165	            c1 = inw(b) & 0x3FF;
+   166	            if c1 != c0 {
+   167	                break;
+   168	            }
+   169	        }
+   170	        let ok = g1 & 0x20 == 0 && cnt & 0x0800 == 0 && tmr == 50 && c1 != c0;
+   171	        kprintln!("wdt: probe arm: GCS {:#x} -> {:#x} TCO1_CNT={:#06x} TMR={} RLD {}->{} SMI_EN={:#x} => {}",
+   172	            g0, g1, cnt, tmr, c0, c1, inl(pmbase() + 0x30), if ok { "ARMED" } else { "NOT ARMED" });
+   173	        ok
+   174	    }
+   175	}
+   176	
+   177	pub fn pet() {
+   178	    unsafe { outw(base(), 1) };
+   179	}
+   180	
+   181	/// ACPI PM timer (PMBASE+0x08, 3.579545 MHz, 24-bit) based delay; same block on ICH9 and NM10.
+   182	fn pm_timer() -> u32 {
+   183	    unsafe { inl(pmbase() + 8) & 0x00FF_FFFF }
+   184	}
+   185	
+   186	pub fn delay_ms(ms: u32) {
+   187	    let need = ms as u64 * 3_579_545 / 1000;
+   188	    let mut last = pm_timer();
+   189	    let mut acc = 0u64;
+   190	    while acc < need {
+   191	        let now = pm_timer();
+   192	        acc += (now.wrapping_sub(last) & 0x00FF_FFFF) as u64;
+   193	        last = now;
+   194	    }
+   195	}
+   196	
+   197	/// `wdt=pet:N` pets every 500 ms for N s, then stops and hangs. `wdt=hang` hangs at once.
+   198	pub fn rehearse(cmdline: &str) -> bool {
+   199	    let Some(i) = cmdline.find("wdt=") else { return false };
+   200	    let arg = cmdline[i + 4..].split(' ').next().unwrap_or("");
+   201	    if arg == "panic" {
+   202	        panic!("wdt=panic: test panic"); // the panic handler must restart the board by itself (0xCF9), not wait for the TCO
+   203	    }
+   204	    if arg == "probe" {
+   205	        return false; // attended net, handled in main (k5 hung here before the NIC: result 5 counts as armed)
+   206	    }
+   207	    if !armed() {
+   208	        kprintln!("wdt: mode {} requested but watchdog not armed", arg);
+   209	        return false;
+   210	    }
+   211	    let secs: u32 = arg.strip_prefix("pet:").and_then(|n| n.parse().ok()).unwrap_or(0);
+   212	    for s in 0..secs {
+   213	        for _ in 0..2 {
+   214	            pet();
+   215	            delay_ms(500);
+   216	        }
+   217	        kprintln!("wdt: alive t={}s (petting every 500 ms)", s + 1);
+   218	    }
+   219	    kprintln!("wdt: HANG now: cli; hlt with the timer running, nobody pets");
+   220	    loop {
+   221	        unsafe { core::arch::asm!("cli; hlt") };
+   222	    }
+   223	}
+   190	
+   191	pub fn ram_overlaps(base: u64, len: u64) -> bool {
+   192	    mb::ram_overlaps(base, len)
+   193	}
+   194	
+   195	#[panic_handler]
+   196	fn panic(info: &PanicInfo) -> ! {
+   197	    // Restart by ourselves via 0xCF9 instead of waiting for the TCO: on the NC110 a TCO reset has left the board dark
+   198	    // since the native-resolution default (2026-10-21, twice), while 0xCF9 resets still came back. A panic while
+   199	    // panicking (e.g. in the console) goes straight to the reset.
+   200	    static PANICKING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+   201	    if !PANICKING.swap(true, core::sync::atomic::Ordering::SeqCst) {
+   202	        console::show_log();
+   203	        let _ = writeln!(console::Console, "PANIC: {}", info);
+   204	        let _ = writeln!(console::Console, "restarting in 10 s");
+   205	        for _ in 0..20 {
+   206	            wdt::pet();
+   207	            wdt::delay_ms(500);
+   208	        }
+   209	        wdt::hard_reset();
+   210	    }
+   211	    unsafe { asm!("out dx, al", in("dx") 0xCF9u16, in("al") 0x06u8) };
+   212	    loop {
+   213	        unsafe { asm!("cli; hlt") };
+   214	    }
+   215	}
+src/gma.rs:80:    crate::wdt::delay_ms(40);
+src/gma.rs:84:    crate::wdt::delay_ms(40);
+src/gma.rs:94:    crate::wdt::delay_ms(50);
+src/gma.rs:145:    crate::wdt::delay_ms(40);
+src/gma.rs:149:    crate::wdt::delay_ms(40);
+src/udplog.rs:52:            wdt::delay_ms(50);
+src/hda.rs:45:            wdt::delay_ms(0);
+src/hda.rs:104:        wdt::delay_ms(1);
+src/hda.rs:111:        wdt::delay_ms(1);
+src/hda.rs:113:    wdt::delay_ms(10);
+src/hda.rs:376:        wdt::delay_ms(5);
+src/hda.rs:407:            wdt::delay_ms(1);
+src/sleep.rs:117:                wdt::delay_ms(10);
+src/sleep.rs:162:    wdt::hard_reset()
+src/loader.rs:318:        crate::wdt::hard_reset();
+src/loader.rs:322:        crate::wdt::hard_reset();
+src/main.rs:56:        wdt::hard_reset();
+src/main.rs:68:        wdt::hard_reset();
+src/main.rs:81:        console::show_log();
+src/main.rs:84:    wdt::rehearse(cmdline);
+src/main.rs:132:    let mut no_net = false; // no Ethernet link: restart fast, so the day's 6th boot (recovery Linux, WiFi) comes soon
+src/main.rs:182:            wdt::delay_ms(1000);
+src/main.rs:184:        wdt::hard_reset();
+src/main.rs:202:        console::show_log();
+src/main.rs:207:            wdt::delay_ms(500);
+src/main.rs:209:        wdt::hard_reset();
+src/usb.rs:72:                wdt::delay_ms(10);
+src/usb.rs:83:        wdt::delay_ms(1);
+src/usb.rs:92:    wdt::delay_ms(20);
+src/usb.rs:137:                wdt::delay_ms(1);
+src/usb.rs:190:        wdt::delay_ms(50);
+src/usb.rs:197:            wdt::delay_ms(1);
+src/usb.rs:214:        wdt::delay_ms(100); // ports re-detect their devices after the global reset
+src/usb.rs:223:            wdt::delay_ms(50);
+src/usb.rs:225:            wdt::delay_ms(10);
+src/usb.rs:228:                wdt::delay_ms(10);
+src/usb.rs:252:            wdt::delay_ms(5);
+src/usb.rs:340:                wdt::delay_ms(1);
+src/ssh.rs:469:                    wdt::hard_reset();
+src/ssh.rs:562:            wdt::hard_reset();
+src/ssh.rs:624:                        console::show_log();
+src/ssh.rs:642:                    wdt::hard_reset();
+tools/nc110-install-agentos.sh:6:# Entry behaviour (template t4): a per-RTC-day boot budget in grubenv (the 6th agent-OS boot of a day, or a malformed
+tools/nc110-install-agentos.sh:37:    echo \"nc110-agentos $H: 6th agent-OS boot today (or a malformed counter), escaping to Slot A Linux\"
+src/console.rs:6://! the RAM capture (bmctl `log`, udplog) and comes back on screen with `show_log` (cmdline `verbose`, panics).
+src/console.rs:258:pub fn show_log() {
+src/console.rs:527:impl fmt::Write for Console {
+src/wdt.rs:99:    delay_ms(800);
+src/wdt.rs:124:pub fn hard_reset() -> ! {
+src/wdt.rs:164:            delay_ms(10);
+src/wdt.rs:177:pub fn pet() {
+src/wdt.rs:186:pub fn delay_ms(ms: u32) {
+src/wdt.rs:198:pub fn rehearse(cmdline: &str) -> bool {
+src/wdt.rs:215:            delay_ms(500);
+tools/term_test.rs:319:fn soft_and_hard_reset() {
+src/bmctl.rs:324:            Act::Reboot => wdt::hard_reset(),
+src/bmctl.rs:692:impl Writer<'_> {
+src/bmctl.rs:699:impl core::fmt::Write for Writer<'_> {
+
+web search: 
+web search: Intel ICH7 datasheet CF9 RST_CNT SYS_RST RST_CPU 0 to 1 hard reset
+exec
+/bin/zsh -lc "sed -n '1,195p' src/main.rs; sed -n '240,280p' src/console.rs; sed -n '480,570p' src/console.rs; cat src/pci.rs src/port.rs; sed -n '1,100p' tools/nc110-install-agentos.sh; rg -n 'sti|wdt::pet|while|loop' src/console.rs src/serial.rs src/idt.rs Cargo.toml; rg --files | rg 'ICH7|ich7|NM10|nm10|datasheet|AGENTS'" in ~/nc110-baremetal
+ exited 1 in 0ms:
+#![no_std]
+#![no_main]
+
+use core::arch::{asm, global_asm};
+use core::fmt::Write;
+use core::panic::PanicInfo;
+
+global_asm!(include_str!("boot.s"), options(att_syntax));
+
+mod acpi;
+mod console;
+mod ec;
+mod font;
+mod gma;
+mod hda;
+#[allow(dead_code)]
+mod dhcp;
+mod kbd;
+mod mb;
+mod net;
+mod nic;
+mod nic_regs;
+mod pci;
+mod port;
+mod rng;
+mod sleep;
+mod ssh;
+mod bmctl;
+mod loader;
+mod term;
+mod time;
+mod usb;
+mod udplog;
+mod wdt;
+
+struct SerialLog;
+impl log::Log for SerialLog {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Warn
+    }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            kprintln!("[{}] {}", r.level(), r.args());
+        }
+    }
+    fn flush(&self) {}
+}
+static LOGGER: SerialLog = SerialLog;
+
+#[no_mangle]
+pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
+    console::init();
+    // Attended: arm the TCO before anything else can block (Codex night review MUST-FIX 1). No net -> no run.
+    if cfg!(feature = "attended") && !wdt::arm_probe() {
+        kprintln!("wdt: ATTENDED: could not arm the TCO, refusing to run");
+        wdt::hard_reset();
+    }
+    kprintln!("NC110 bare-metal M3: hello from our own x86_64 kernel (Rust, no_std)");
+    if let Some(b) = option_env!("NC110_BUILD") {
+        kprintln!("build: {}", b);
+    }
+    kprintln!("multiboot magic={:#010x} info={:#x} -> long mode OK", magic, info);
+    wdt::report();
+    if cfg!(feature = "attended") {
+        kprintln!("wdt: ATTENDED build: TCO armed by us with NO_REBOOT cleared (any reset -> GRUB default = the agent OS; crash loop -> Slot A)");
+    } else if !wdt::is_qemu_pc() && !wdt::verify_live() && !wdt::neg_control_on_q35() {
+        kprintln!("wdt: reset path not verified on this machine, refusing to run");
+        wdt::hard_reset();
+    }
+    // Key module right after the watchdog gate: copy the seed out and wipe the module before anything else.
+    let client_seed = mb::take_client_key(info);
+    mb::parse_memory(info);
+    if let Some(fb) = mb::framebuffer(info) {
+        let ok = console::use_framebuffer(fb);
+        kprintln!("fb: {}x{} pitch {} {} bpp at {:#x} rgb(pos,size) {:?}: {}", fb.w, fb.h, fb.pitch, fb.bytes * 8, fb.addr, fb.rgb,
+            if ok { "native-resolution console" } else { "NOT usable, staying on VGA text" });
+    }
+    let cmdline = mb::cmdline(info);
+    kprintln!("cmdline: {}", cmdline);
+    if cmdline.split(' ').any(|w| w == "verbose") {
+        console::show_log();
+    }
+    console::status("starting");
+    wdt::rehearse(cmdline);
+
+    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
+    kprintln!("time: TSC {} ticks/ms (PIT ch2 calibrated); {} ms since CPU reset", time::init(), time::since_reset_ms());
+    // GRUB t7 passes the TSC at its entry start and just before `multiboot`: split firmware / GRUB / our early boot.
+    if let Some((g0, g1)) = cmdline.split(' ').find_map(|w| w.strip_prefix("grubtsc=")).and_then(|v| {
+        let mut it = v.split(',').map(|x| u64::from_str_radix(x.trim_start_matches("0x"), 16).ok());
+        Some((it.next()??, it.next()??))
+    }) {
+        let (a, b, k) = (time::tsc_to_ms(g0), time::tsc_to_ms(g1), time::since_reset_ms());
+        kprintln!("boot: firmware + GRUB core {} ms, GRUB entry {} ms, multiboot load + our start {} ms", a, b.saturating_sub(a), k.saturating_sub(b));
+    }
+
+    // Mic capture is on by default in the attended agent OS (`nohda` turns it off); `hdadump` also logs every widget.
+    if cfg!(feature = "attended") && !cmdline.split(' ').any(|w| w == "nohda") {
+        hda::probe(cmdline.split(' ').any(|w| w == "hdadump"));
+    }
+    if cmdline.split(' ').any(|w| w == "gmadump") {
+        gma::dump();
+    }
+    // Native 1024x600 is the agent OS default (evnchn card 850); `nogma` keeps the VBIOS text mode. native_fb falls back
+    // to the VBIOS VGA mode by itself when its checks fail (no LVDS 1024x600 on pipe B, FIFO underrun after the switch).
+    let native = cfg!(feature = "attended") && !cmdline.split(' ').any(|w| w == "nogma") || cmdline.split(' ').any(|w| w == "gmafb");
+    if !native && cfg!(feature = "attended") {
+        gma::restore_vga_if_needed();
+    }
+    if native {
+        if let Some(fb) = gma::native_fb() {
+            let ok = console::use_framebuffer(fb);
+            kprintln!("gma: console on the native framebuffer: {}", ok);
+            if !ok {
+                gma::undo_native();
+            }
+        }
+    }
+    if let Some(f) = cmdline.split(' ').find_map(|w| w.strip_prefix("font=")) {
+        if let Some((_, font)) = console::FONTS.iter().find(|(n, _)| *n == f) {
+            console::set_font(font);
+        }
+    }
+    {
+        console::splash(); // the framebuffer (if any) starts blank: draw the boot screen at its grid
+        console::status("starting");
+        kprintln!("console: {}x{} cells", console::cols(), console::rows());
+    }
+    if cmdline.split(' ').any(|w| w == "phyreset") {
+        nic::force_phy_reset();
+    }
+    let mut no_net = false; // no Ethernet link: restart fast, so the day's 6th boot (recovery Linux, WiFi) comes soon
+    match nic::probe(cmdline.contains("nic=mmio")) {
+        Ok(mut n) => {
+            if cmdline.contains("nic=no8105e") {
+                n.skip_8105e(); // A/B switch for the rtl_hw_start_8105e tweaks
+            }
+            kprintln!("nic: {} at {} {} mac={}", n.name(), n.bdf, n.bus, dhcp::Mac(n.mac));
+            match n.init() {
+                Ok(()) if cfg!(feature = "attended") => {
+                    kprintln!("udplog: broadcasting this log to UDP 5514");
+                    udplog::set_nic(&n);
+                    udplog::dump(1);
+                    console::status("network");
+                    if cmdline.contains("wdt=probe") {
+                        wdt::pet();
+                        kprintln!("wdt: HANG now (probe): cli; hlt, nobody pets; expect a reset ~60 s from here");
+                        udplog::dump(3);
+                        loop {
+                            unsafe { asm!("cli; hlt") };
+                        }
+                    }
+                    if let (Some(_), true, true) = (client_seed, cmdline.contains("bmctl"), cmdline.split(' ').any(|w| w == "ssh")) {
+                        ssh::run(n, client_seed, cmdline.contains("rng=dump"), Some(info));
+                    } else if let (Some(seed), true) = (client_seed, cmdline.contains("bmctl")) {
+                        bmctl::run(n, seed, info);
+                    } else if client_seed.is_some() {
+                        ssh::run(n, client_seed, cmdline.contains("rng=dump"), None);
+                    }
+                    kprintln!("attended: final log round, then reset");
+                    udplog::dump(4);
+                }
+                Ok(()) => ssh::run(n, client_seed, cmdline.contains("rng=dump"), None),
+                Err(e) => {
+                    kprintln!("nic: init failed: {} (bus mastering left off)", e);
+                    no_net = true;
+                }
+            }
+        }
+        Err(e) => {
+            kprintln!("nic: {}", e);
+            no_net = true;
+        }
+    }
+    kprintln!("DONE");
+    if cfg!(feature = "attended") {
+        let wait = if no_net { 5 } else { 60 };
+        kprintln!("attended: hard reset via 0xCF9 in {} s", wait);
+        console::status(if no_net { "no network cable: restarting (after a few tries: Linux with WiFi)" } else { "restarting" });
+        for _ in 0..wait {
+            wdt::pet();
+            wdt::delay_ms(1000);
+        }
+        wdt::hard_reset();
+    }
+    loop {
+        unsafe { asm!("cli; hlt") };
+    }
+}
+
+pub fn ram_overlaps(base: u64, len: u64) -> bool {
+    mb::ram_overlaps(base, len)
+}
+
+#[panic_handler]
+    unsafe {
+        (*core::ptr::addr_of!(FB))?;
+        let cur = FONTS.iter().position(|(_, f)| core::ptr::eq(*f, FONT)).unwrap_or(0);
+        set_font(FONTS[(cur + 1) % FONTS.len()].1);
+        Some((COLS, ROWS))
+    }
+}
+
+static mut ROW: usize = 0;
+static mut COL: usize = 0;
+/// Log lines also go to the screen (verbose / panic). Off for the splash and the SSH terminal.
+static mut VGA_LOG: bool = false;
+
+pub fn vga_log_off() {
+    unsafe { VGA_LOG = false };
+}
+
+/// Blank the screen in the log colours, replay the last lines of the capture, then keep logging to it.
+pub fn show_log() {
+    unsafe {
+        fill(ATTR);
+        ROW = 0;
+        COL = 0;
+        let c = captured();
+        let mut st = c.len();
+        for _ in 0..rows() - 1 {
+            match c[..st.saturating_sub(1)].iter().rposition(|&b| b == b'\n') {
+                Some(i) => st = i + 1,
+                None => {
+                    st = 0;
+                    break;
+                }
+            }
+        }
+        for &b in &c[st..] {
+            vga_putc(b);
+        }
+        VGA_LOG = true;
+    }
+}
+
+    unsafe {
+        // Bounded: a wedged or absent UART must never keep a failure path from reaching its 0xCF9 reset.
+        for _ in 0..100_000 {
+            if inb(COM1 + 5) & 0x20 != 0 {
+                outb(COM1, b);
+                return;
+            }
+        }
+    }
+}
+
+fn vga_putc(b: u8) {
+    unsafe {
+        if b == b'\n' {
+            COL = 0;
+            ROW += 1;
+        } else {
+            cell(ROW * cols() + COL, ATTR | b as u16);
+            COL += 1;
+            if COL == cols() {
+                COL = 0;
+                ROW += 1;
+            }
+        }
+        if ROW == rows() {
+            for i in 0..cols() * (rows() - 1) {
+                cell(i, cell_get(i + cols()));
+            }
+            for i in 0..cols() {
+                cell((rows() - 1) * cols() + i, ATTR | b' ' as u16);
+            }
+            ROW = rows() - 1;
+        }
+    }
+}
+
+/// RAM copy of everything printed (first 8 KB), so the attended build can ship its log over UDP.
+static mut CAP: [u8; 8192] = [0; 8192];
+static mut CAP_LEN: usize = 0;
+
+pub fn captured() -> &'static [u8] {
+    unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(CAP) as *const u8, CAP_LEN) }
+}
+
+static mut AT_LINE_START: bool = true;
+
+pub struct Console;
+impl fmt::Write for Console {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if unsafe { AT_LINE_START } && crate::time::ready() && !s.is_empty() && !s.starts_with(['\r', '\n']) {
+            unsafe { AT_LINE_START = false };
+            let t = crate::time::now_ms();
+            write!(self, "[{:3}.{:03}] ", t / 1000, t % 1000)?;
+        }
+        for &b in s.as_bytes() {
+            if b == b'\n' {
+                serial_putc(b'\r');
+            }
+            serial_putc(b);
+            unsafe {
+                if CAP_LEN < 8192 {
+                    (*core::ptr::addr_of_mut!(CAP))[CAP_LEN] = b;
+                    CAP_LEN += 1;
+                }
+            }
+            if unsafe { VGA_LOG } {
+                vga_putc(b);
+            }
+            if b == b'\n' {
+                unsafe { AT_LINE_START = true };
+            }
+        }
+        Ok(())
+    }
+}
+
+#[macro_export]
+macro_rules! kprintln {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = writeln!($crate::console::Console, $($arg)*);
+    }};
+}
+
+#[macro_export]
+macro_rules! kprint {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = write!($crate::console::Console, $($arg)*);
+    }};
+}
+//! PCI config mechanism #1 (0xCF8/0xCFC), with a bridge walk (M2.5: the NC110's RTL8101E is expected to sit
+//! behind a PCIe root port, i.e. on a secondary bus). The walk only READS config space. The one config write
+//! in this kernel goes to the matched NIC function (command register), see nic.rs.
+use crate::port::{inl, outl};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Bdf {
+    pub bus: u8,
+    pub dev: u8,
+    pub func: u8,
+}
+
+impl core::fmt::Display for Bdf {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(f, "{:02x}:{:02x}.{}", self.bus, self.dev, self.func)
+    }
+}
+
+fn addr(b: Bdf, off: u8) -> u32 {
+    0x8000_0000 | (b.bus as u32) << 16 | (b.dev as u32) << 11 | (b.func as u32) << 8 | (off as u32 & 0xFC)
+}
+
+pub fn read32(b: Bdf, off: u8) -> u32 {
+    unsafe {
+        outl(0xCF8, addr(b, off));
+        inl(0xCFC)
+    }
+}
+
+pub fn write32(b: Bdf, off: u8, v: u32) {
+    unsafe {
+        outl(0xCF8, addr(b, off));
+        outl(0xCFC, v);
+    }
+}
+
+/// Visit every present function: bus 0 first, then the secondary bus of every type-1 (bridge) header,
+/// depth first. `visit` returns true to stop. Bounded: at most 32 buses visited, depth 8.
+pub fn walk(visit: &mut dyn FnMut(Bdf, u32) -> bool) -> bool {
+    let mut seen = [false; 256];
+    let mut budget = 32;
+    walk_bus(0, 0, &mut seen, &mut budget, visit)
+}
+
+fn walk_bus(bus: u8, depth: u32, seen: &mut [bool; 256], budget: &mut u32, visit: &mut dyn FnMut(Bdf, u32) -> bool) -> bool {
+    if seen[bus as usize] || depth > 8 || *budget == 0 {
+        return false;
+    }
+    seen[bus as usize] = true;
+    *budget -= 1;
+    for dev in 0..32u8 {
+        let f0 = Bdf { bus, dev, func: 0 };
+        if read32(f0, 0) & 0xFFFF == 0xFFFF {
+            continue;
+        }
+        let multi = (read32(f0, 0x0C) >> 16) & 0x80 != 0;
+        for func in 0..if multi { 8u8 } else { 1 } {
+            let b = Bdf { bus, dev, func };
+            let id = read32(b, 0);
+            if id & 0xFFFF == 0xFFFF {
+                continue;
+            }
+            if visit(b, id) {
+                return true;
+            }
+            let htype = (read32(b, 0x0C) >> 16) & 0x7F;
+            if htype == 1 {
+                let sec = ((read32(b, 0x18) >> 8) & 0xFF) as u8;
+                if sec != 0 && sec != bus && walk_bus(sec, depth + 1, seen, budget, visit) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// First function matching vendor:device anywhere in the walked hierarchy.
+pub fn find(vendor: u16, device: u16) -> Option<Bdf> {
+    let want = (device as u32) << 16 | vendor as u32;
+    let mut hit = None;
+    walk(&mut |b, id| {
+        if id == want {
+            hit = Some(b);
+            true
+        } else {
+            false
+        }
+    });
+    hit
+}
+
+/// (base, is_64bit) of the first MEMORY BAR of a type-0 function (mirrors r8169's "first MMIO region",
+/// r8169_main.c:5408). Read-only: no BAR sizing writes.
+pub fn first_mem_bar(b: Bdf) -> Option<(u64, bool)> {
+    let mut i = 0u8;
+    while i < 6 {
+        let off = 0x10 + 4 * i;
+        let lo = read32(b, off);
+        if lo != 0 && lo & 1 == 0 { // 0 = unimplemented slot (RTL8102E BAR1), not a memory BAR at 0
+            let ty = (lo >> 1) & 3;
+            let base = (lo & !0xF) as u64;
+            if ty == 2 {
+                if i == 5 {
+                    return None;
+                }
+                let hi = read32(b, off + 4) as u64;
+                return Some((base | hi << 32, true));
+            }
+            return Some((base, false));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Memory BAR bases of every mass-storage function (class 0x01: IDE/SATA/AHCI). Read-only; used so the NIC's
+/// MMIO window is refused if it is anywhere near the disk controller's.
+pub fn storage_mem_bars(out: &mut [u64; 16]) -> usize {
+    let mut n = 0;
+    walk(&mut |b, _| {
+        let class = read32(b, 0x08) >> 24;
+        let htype = (read32(b, 0x0C) >> 16) & 0x7F;
+        if class == 0x01 && htype == 0 {
+            let mut i = 0u8;
+            while i < 6 {
+                let lo = read32(b, 0x10 + 4 * i);
+                if lo & 1 == 0 {
+                    let mut base = (lo & !0xF) as u64;
+                    if (lo >> 1) & 3 == 2 && i < 5 {
+                        base |= (read32(b, 0x10 + 4 * (i + 1)) as u64) << 32;
+                        i += 1;
+                    }
+                    if base != 0 && n < out.len() {
+                        out[n] = base;
+                        n += 1;
+                    }
+                }
+                i += 1;
+            }
+        }
+        false
+    });
+    n
+}
+
+pub const fn b0(dev: u8, func: u8) -> Bdf {
+    Bdf { bus: 0, dev, func }
+}
+use core::arch::asm;
+
+pub unsafe fn outb(p: u16, v: u8) { asm!("out dx, al", in("dx") p, in("al") v, options(nostack, preserves_flags)); }
+pub unsafe fn outw(p: u16, v: u16) { asm!("out dx, ax", in("dx") p, in("ax") v, options(nostack, preserves_flags)); }
+pub unsafe fn outl(p: u16, v: u32) { asm!("out dx, eax", in("dx") p, in("eax") v, options(nostack, preserves_flags)); }
+pub unsafe fn inb(p: u16) -> u8 { let v: u8; asm!("in al, dx", out("al") v, in("dx") p, options(nostack, preserves_flags)); v }
+pub unsafe fn inw(p: u16) -> u16 { let v: u16; asm!("in ax, dx", out("ax") v, in("dx") p, options(nostack, preserves_flags)); v }
+pub unsafe fn inl(p: u16) -> u32 { let v: u32; asm!("in eax, dx", out("eax") v, in("dx") p, options(nostack, preserves_flags)); v }
+
+pub fn rdtsc() -> u64 {
+    let (lo, hi): (u32, u32);
+    unsafe { asm!("rdtsc", out("eax") lo, out("edx") hi, options(nostack, nomem)) };
+    ((hi as u64) << 32) | lo as u64
+}
+#!/usr/bin/env bash
+# Install a kernel as an agent-OS version on the NC110 (run while Slot A Linux is up). Adds ONE new entry
+# "nc110-bm-agentos-<sha8>" (never edits an existing one), copies /baremetal/k-agentos-<sha8>.elf and the agent-OS
+# key module (~/.nc110/agentos.key -> /baremetal/nc110-agentos.key). Does NOT change the default: that is
+#   tools/nc110-install-agentos.sh --set-default <sha8>     (backs up grubenv first)
+# Entry behaviour (template t4): a per-RTC-day boot budget in grubenv (the 6th agent-OS boot of a day, or a malformed
+# counter, boots Slot A Linux instead), then GRUB arms the TCO (nc110_tco_consts, lock_mode=accept), then multiboot +
+# module + boot. Every GRUB-side failure (grubenv not writable, arming refused, kernel/module missing) calls
+# nc110_linux_now2 (grub-test/nc110-linux-now2.cfg): stock Slot A, with a 10-min agent lease,
+# Linux in the SAME boot, leaving the breadcrumb nc110_fallback=<sha8|loop-date> in grubenv when it can (read from Linux). Manual fallback any time: hold Shift through POST -> GRUB menu -> "Alpine NC110 ...".
+set -u
+cd "$(dirname "$0")/.."
+S() { ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o LogLevel=ERROR -i "$HOME/.ssh/id_ed25519_homelab" root@192.168.50.118 "$@"; }
+SC() { scp -q -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+  -i "$HOME/.ssh/id_ed25519_homelab" "$@"; }
+gen_entry() {  # $1 sha8 -> the exact menuentry text (also printed by --print-entry for the q35 rehearsal)
+  local H=$1 E="nc110-bm-agentos-t9-$1" KN="k-agentos-$1.elf"   # t9: t7 for kernels whose header asks for video (gfxpayload=text keeps VGA text: this VBIOS has no 1024x600, t8 got 800x600); t7: TSC stamps; t6: quiet; t5: recovery Linux
+  ENTRY="menuentry \"$E\" {
+  set color_normal=black/black
+  insmod rdmsr
+  rdmsr 0x10 -v nc110_tsc0
+  insmod ext2
+  search --no-floppy --fs-uuid --set=root c0954bc7-86a0-440c-8401-2c3e95549743
+  insmod datehook
+  insmod regexp
+  set nc110_now=\"\${YEAR}-\${MONTH}-\${DAY}\"
+  if [ \"\$nc110_hour\" != \"\$nc110_now\" ]; then
+    set nc110_hour=\"\$nc110_now\"
+    set nc110_boots=\"\"
+  fi
+  set nc110_boots=\"\${nc110_boots}x\"
+  if regexp '^x{1,5}\$' \"\$nc110_boots\"; then
+    true
+  else
+    set color_normal=light-gray/black
+    echo \"nc110-agentos $H: 6th agent-OS boot today (or a malformed counter), escaping to Slot A Linux\"
+    set nc110_boots=\"\"
+    set nc110_fallback=\"loop-\$nc110_now\"
+    save_env nc110_hour nc110_boots nc110_fallback
+    nc110_linux_now2
+    set color_normal=light-gray/black
+    echo \"nc110-agentos $H: Slot A Linux failed to load, trying the agent OS anyway\"
+  fi
+  if save_env nc110_hour nc110_boots; then
+    true
+  else
+    set color_normal=light-gray/black
+    echo \"nc110-agentos $H: grubenv not writable, Slot A Linux now\"
+    nc110_linux_now2
+  fi
+  terminal_output console
+  set gfxpayload=text
+  insmod multiboot
+  nc110_tco_consts
+  tco_arm
+  if [ \"\$wdt_ok\" = \"yes\" ]; then
+    rdmsr 0x10 -v nc110_tsc1
+    if multiboot /baremetal/$KN bmctl grubtsc=\${nc110_tsc0},\${nc110_tsc1}; then
+      if module /baremetal/nc110-agentos.key; then
+        boot
+      fi
+    fi
+    set color_normal=light-gray/black
+    echo \"nc110-agentos $H: kernel or key module failed to load\"
+  else
+    set color_normal=light-gray/black
+    echo \"nc110-agentos $H: GRUB did NOT arm the TCO\"
+  fi
+  set nc110_fallback=$H
+  save_env nc110_fallback
+  nc110_linux_now2
+}"
+}
+if [ "${1:-}" = "--print-entry" ]; then
+  gen_entry "$(shasum -a 256 "$2" | cut -c1-8)"; printf '%s\n' "$ENTRY"; exit 0
+fi
+# Slot A = root on /dev/sda2; under the agent-OS route's custom kernel (no initrd) /proc/mounts says /dev/root
+st=$(S 'hostname; r=$(awk "\$2==\"/\"{print \$1}" /proc/mounts); [ "$r" = /dev/root ] && grep -q "root=/dev/sda2" /proc/cmdline && r=/dev/sda2; echo $r') \
+  || { echo "Slot A not reachable"; exit 2; }
+grep -qx nc110 <<<"$st" && grep -qx /dev/sda2 <<<"$st" || { echo "not on Slot A: STOP"; echo "$st"; exit 2; }
+T=$(date -u +%Y%m%dT%H%M%SZ)
+if [ "${1:-}" = "--lease-service" ]; then  # (re)install Slot A's lease service, verified, local service enabled
+  SC tools/slot-a/nc110-lease.start root@192.168.50.118:/etc/local.d/nc110-lease.start || exit 2
+  v=$(S "rc-update add local default >/dev/null 2>&1; chmod 755 /etc/local.d/nc110-lease.start && sha256sum /etc/local.d/nc110-lease.start | cut -c1-64; rc-update show default | grep -cw local")
+  [ "$(head -1 <<<"$v")" = "$(shasum -a 256 tools/slot-a/nc110-lease.start | cut -c1-64)" ] && [ "$(tail -1 <<<"$v")" = 1 ] \
+    || { echo "lease service install NOT verified: $v"; exit 2; }
+  echo "lease service installed and verified (local service enabled)"; exit 0
+fi
+if [ "${1:-}" = "--set-default" ]; then
+  E=$(S "grep -o '^menuentry \"nc110-bm-agentos-t[0-9][0-9]*-$2\"' /boot/grub/grub.cfg | tail -1 | cut -d'\"' -f2")
+  [ -n "$E" ] || { echo "no agent-OS entry for $2"; exit 2; }
+  S "cp -p /boot/grub/grubenv /boot/grub/grubenv.bak-agentos-$T && grub-editenv /boot/grub/grubenv set saved_entry='$E' && sync && grub-editenv /boot/grub/grubenv list"
+  exit $?
+fi
+K=${1:?kernel path}; KEY=$HOME/.nc110/agentos.key
+[ "$(wc -c <"$KEY" | tr -d " ")" = 72 ] || { echo "agent-OS key missing/bad"; exit 2; }
+H=$(shasum -a 256 "$K" | cut -c1-8); E="nc110-bm-agentos-t9-$H"; KN=k-agentos-$H.elf
+S "grep -q '^menuentry \"$E\"' /boot/grub/grub.cfg" && { echo "$E already installed"; exit 0; }
+S "grep -q '^function nc110_tco_consts' /boot/grub/grub.cfg" || { echo "GRUB arming function missing"; exit 2; }
+rg: src/serial.rs: No such file or directory (os error 2)
+rg: src/idt.rs: No such file or directory (os error 2)
+src/console.rs:5://! The screen shows a quiet splash (title, one status line, a footer bar) by default; the log still goes to COM1,
+src/console.rs:343:/// One centred status line under the logo (ignored while the log or the SSH terminal owns the screen).
+src/console.rs:423:/// cannot erase it while it is set (Codex review). None removes it and shows the real cells again.
+
+web search: 
+web search: Intel ICH7 datasheet 307013 RST_CNT "sample" ...
+codex
+The panic loop can pet at most 20 times. A stuck PM timer can prevent the CF9 reset, but it also stops further petting, leaving the TCO as fallback. The QEMU test has a separate gap: it treats any exit after “PANIC” as a successful reset. I’m checking the nested-panic CF9 write against the chipset datasheet.
+web search: 
+web search: https://www.mouser.com/pdfdocs/82NM10datasheet.pdf
+exec
+/bin/zsh -lc "rg -n '\\bsti\\b|\\bcli\\b|TCO_TMR|\\"'$50|'"\\"'$30'"' src/boot.s; cat Cargo.toml; nl -ba tools/panic-q35-test.py; sed -n '1,120p' src/time.rs; rg -n 'panic-q35|panic.*reset' proof --glob '*.log'" in ~/nc110-baremetal
+ exited 1 in 0ms:
+28:    cli
+37:       clear stale TCO status, program TCO_TMR, reload, clear TCO1_CNT.TCO_TMR_HLT (RMW only). */
+101:    lea 0x12(%ecx), %edx            /* TCO_TMR: keep 15:10, ticks of 0.6 s in 9:0 */
+109:    lea 8(%ecx), %edx               /* TCO1_CNT: clear TCO_TMR_HLT (bit 11), RMW, never touch TCO_LOCK */
+183:3:  cli
+231:    cli
+[package]
+name = "nc110-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+neg-control = []
+grub-armed = []
+attended = []  # NC110 with evnchn at the machine: no watchdog gate (the TCO hangs this board instead of resetting it), 0xCF9 reset after 60 s
+badpin = []  # negative control: flip one bit of the pinned host key
+badjitter = []  # negative control: constant TSC in the jitter source, startup health test must refuse SSH
+
+[dependencies]
+# M2: pinned exact versions (Cargo.lock is committed too).
+sunset = { version = "=0.6.0", default-features = false }
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-tcp", "socket-dhcpv4", "socket-udp"] }
+getrandom = { version = "0.4", default-features = false }
+log = "0.4"
+heapless = { version = "=0.9.3", default-features = false }  # M3: sunset::Pty.term is a heapless::String
+sha2 = { version = "=0.11.1", default-features = false }
+chacha20 = { version = "=0.9.1", default-features = false }  # bmctl AEAD (RFC 8439), same versions sunset already pulls in
+poly1305 = { version = "=0.9.1", default-features = false }
+
+[[bin]]
+name = "nc110-kernel"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+     1	#!/usr/bin/env python3
+     2	"""q35 check: a kernel panic restarts the board by itself via 0xCF9 within about 10 s, instead of halting until the TCO
+     3	fires (on the NC110 a TCO reset has left the board dark since the native-resolution default, 2026-10-21). Boots
+     4	cmdline 'bmctl nic=mmio wdt=panic' with -no-reboot, so the reset shows as QEMU exiting. Usage: panic-q35-test.py
+     5	[kernel]. Exit 1 if QEMU is still running 25 s after the panic."""
+     6	import os, subprocess, sys, time
+     7	K = sys.argv[1] if len(sys.argv) > 1 else "target/attended/x86_64-unknown-none/release/nc110-kernel"
+     8	L = f"/tmp/panic-q35-{os.getpid()}.log"
+     9	q = subprocess.Popen(["qemu-system-x86_64", "-machine", "q35", "-m", "128", "-display", "none", "-no-reboot",
+    10	    "-global", "ICH9-LPC.noreboot=false", "-serial", f"file:{L}", "-kernel", K, "-initrd", "test-keys/client.key",
+    11	    "-append", "bmctl nic=mmio wdt=panic", "-netdev", "user,id=n0", "-device", "rtl8139,netdev=n0"])
+    12	log = lambda: open(L, errors="replace").read() if os.path.exists(L) else ""
+    13	t0 = time.time()
+    14	while "PANIC" not in log() and time.time() - t0 < 30 and q.poll() is None:
+    15	    time.sleep(0.2)
+    16	tp = time.time()
+    17	print("panic seen:", "PANIC" in log())
+    18	while q.poll() is None and time.time() - tp < 25:
+    19	    time.sleep(0.2)
+    20	dt = time.time() - tp
+    21	gone = q.poll() is not None
+    22	if not gone:
+    23	    q.kill()
+    24	print(f"qemu {'exited (reset) %.1f s after the panic' % dt if gone else 'still running 25 s after the panic'}")
+    25	for l in log().splitlines():
+    26	    if "PANIC" in l or "restarting" in l or "0xCF9" in l:
+    27	        print("serial:", l.strip())
+    28	ok = "PANIC" in log() and gone
+    29	print("RESULT:", "PASS" if ok else "FAIL"); sys.exit(0 if ok else 1)
+//! Monotonic milliseconds from the TSC, calibrated once against PIT channel 2 (gate via port 0x61).
+use crate::port::{inb, outb, rdtsc};
+
+static mut TSC_PER_MS: u64 = 1_000_000; // fallback guess (1 GHz) if calibration fails
+static mut T0: u64 = 0;
+
+pub fn init() -> u64 {
+    unsafe {
+        // PIT ch2, mode 0, lobyte/hibyte, count for 10 ms at 1.193182 MHz.
+        const COUNT: u16 = 11932;
+        let g = inb(0x61);
+        outb(0x61, (g & 0xFD) | 0x01); // gate on, speaker off
+        outb(0x43, 0b1011_0000);
+        outb(0x42, COUNT as u8);
+        outb(0x42, (COUNT >> 8) as u8);
+        // Re-trigger: toggle gate low->high so mode 0 starts counting now.
+        let g = inb(0x61);
+        outb(0x61, g & 0xFE);
+        outb(0x61, g | 0x01);
+        let a = rdtsc();
+        let mut spins: u64 = 0;
+        while inb(0x61) & 0x20 == 0 && spins < 200_000_000 {
+            spins += 1;
+        }
+        let b = rdtsc();
+        if spins < 200_000_000 && b > a {
+            TSC_PER_MS = ((b - a) / 10).max(1);
+        }
+        T0 = rdtsc();
+        TSC_PER_MS
+    }
+}
+
+/// ms the TSC had counted when `init` ran: time since the last CPU reset (firmware + GRUB + our early boot),
+/// since a hard reset zeroes the TSC; after an in-RAM chain-load it also includes the previous kernel's run.
+pub fn since_reset_ms() -> u64 {
+    unsafe { T0 / TSC_PER_MS }
+}
+
+pub fn tsc_to_ms(t: u64) -> u64 {
+    unsafe { t / TSC_PER_MS }
+}
+
+pub fn ready() -> bool {
+    unsafe { T0 != 0 }
+}
+
+pub fn now_ms() -> i64 {
+    unsafe { ((rdtsc() - T0) / TSC_PER_MS) as i64 }
+}
+
+/// Busy-wait at least `us` microseconds (TSC, after init()).
+pub fn delay_us(us: u64) {
+    unsafe {
+        let t = rdtsc();
+        let n = us * TSC_PER_MS / 1000 + 1;
+        while rdtsc().wrapping_sub(t) < n {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// CMOS RTC hours and minutes (the NC110's RTC keeps local time: Linux there labels HKT as UTC). Waits out an update in
+/// progress (bounded), handles BCD and 12-hour formats. None if the RTC never settles.
+pub fn rtc_hm() -> Option<(u8, u8)> {
+    use crate::port::{inb, outb};
+    let rd = |r: u8| unsafe {
+        outb(0x70, r);
+        inb(0x71)
+    };
+    for _ in 0..1000 {
+        if rd(0x0A) & 0x80 == 0 {
+            let (m, h, b) = (rd(0x02), rd(0x04), rd(0x0B));
+            let bcd = |v: u8| if b & 0x04 == 0 { (v & 0x0F) + (v >> 4) * 10 } else { v };
+            let pm = h & 0x80 != 0;
+            let mut hh = bcd(h & 0x7F);
+            if b & 0x02 == 0 {
+                hh = hh % 12 + if pm { 12 } else { 0 };
+            }
+            return Some((hh, bcd(m)));
+        }
+    }
+    None
+}
+
+web search: 
+web search: https://www.intel.com/Assets/PDF/datasheet/307013.pdf
+web search: 
+web search: "ICH7" "Reset CPU (RST_CPU)" "samples" ...
+web search: 
+web search: 
+web search: 
+web search: 'Reset CPU (RST_CPU)'
+exec
+/bin/zsh -lc "sed -n '94,110p' src/boot.s; rg -n '\\bsti\\b' src; git diff --cached --check" in ~/nc110-baremetal
+ succeeded in 0ms:
+    mov $0x0008, %ax                /* TCO1_STS: clear TIMEOUT (RW1C) */
+    outw %ax, %dx
+    lea 6(%ecx), %edx
+    mov $0x0002, %ax                /* TCO2_STS: clear SECOND_TO_STS first, then BOOT_STS (RW1C) */
+    outw %ax, %dx
+    mov $0x0004, %ax
+    outw %ax, %dx
+    lea 0x12(%ecx), %edx            /* TCO_TMR: keep 15:10, ticks of 0.6 s in 9:0 */
+    inw %dx, %ax
+    and $0xFC00, %ax
+    or $TCO_TICKS, %ax
+    outw %ax, %dx
+    mov %ecx, %edx                  /* TCO_RLD: any write reloads */
+    mov $1, %ax
+    outw %ax, %dx
+    lea 8(%ecx), %edx               /* TCO1_CNT: clear TCO_TMR_HLT (bit 11), RMW, never touch TCO_LOCK */
+    inw %dx, %ax
+
+codex
+Most is sound. **No demonstrated MUST-FIX in the kernel change.** Two SHOULDs concern failure-path robustness and test accuracy.
+
+**MUST-FIX: none.**
+
+**SHOULD**
+
+1. **Bound the panic delay independently of the PM timer.** [main.rs:205](~/nc110-baremetal/src/main.rs:205) does:
+   ```rust
+   for _ in 0..20 {
+       wdt::pet();
+       wdt::delay_ms(500);
+   }
+   wdt::hard_reset();
+   ```
+   But [wdt.rs:190](~/nc110-baremetal/src/wdt.rs:190) waits without a bound:
+   ```rust
+   while acc < need {
+       let now = pm_timer();
+       acc += (now.wrapping_sub(last) & 0x00FF_FFFF) as u64;
+       last = now;
+   }
+   ```
+   A frozen or inaccessible PM timer returning a constant leaves `acc` unchanged forever. **This does not pet forever:** it stalls inside one delay, so the armed TCO eventually expires. However, that returns you to the reset mechanism observed to leave this board dark. Before watchdog arming, it could hang indefinitely. A panic-specific polling bound that falls through to CF9 would close this gap. This is conditional hardening, not evidence that the NC110’s PM timer currently fails.
+
+2. **The QEMU test can falsely certify a reset.** [panic-q35-test.py:28](~/nc110-baremetal/tools/panic-q35-test.py:28):
+   ```python
+   ok = "PANIC" in log() and gone
+   ```
+   Any QEMU exit after that text passes—including a QEMU error or a triple-fault reset immediately after printing. There is no lower timing bound, successful-exit check, or reset-cause check. Require the expected panic text, successful exit, and a reasonable timing window; use QEMU reset tracing to distinguish CF9 from other reset causes. Printing “exited (reset)” currently overstates the evidence.
+
+**NIT**
+
+Use the same raw `0x02; 0x06` sequence in the nested path, preferably through a logging-free reset helper. This removes dependence on the previous `RST_CPU` bit and keeps the two paths consistent. **I would not characterize the existing `0x06` as invalid.**
+
+The specific concerns:
+
+- **Infinite loop while petting? No ordinary control-flow path.** There are at most 20 pets. Neither `delay_ms()` nor the console pets internally. `PANICKING.swap(true, …)` makes another Rust panic bypass formatting and the countdown. A stall can prevent CF9, but cannot sustain watchdog feeding.
+
+- **Is `0x06` alone a hard reset? Yes, provided `RST_CPU` was zero.** It sets `SYS_RST=1` and raises `RST_CPU`; `FULL_RST=0` requests a hard reset without power cycling. Both Intel’s [ICH7 datasheet, §10.7.5](https://studylib.net/doc/18311038/intel%C2%AE-i-o-controller-hub-7--ich7--family-external-design) and [NM10 datasheet, §13.7.5, p.404](https://www.mouser.com/pdfdocs/82NM10datasheet.pdf#page=404) describe that edge-triggered behavior and default register value zero. `0x02` first guarantees the low-to-high edge. I found no reachable preceding kernel write that leaves bit 2 high and then enters this nested-panic path.
+
+- **Can `pet()` or `delay_ms(500)` panic? No evident arithmetic or indexing panic.** `pet()` is `outw(base(), 1)`. PMBASE is masked to `0xFF80`, so adding `0x60` or `8` fits `u16`. The delay’s `u64` arithmetic is safely bounded for 500 ms; subtraction explicitly wraps. The credible issue is the unbounded hardware poll above. A hardware exception is not necessarily a Rust panic and is not covered by `PANICKING`.
+
+- **Crash-at-boot reboot loop? Yes, intentionally faster recovery.** The [GRUB entry generator](~/nc110-baremetal/tools/nc110-install-agentos.sh:31) appends `"x"` and accepts only `'^x{1,5}$'`, otherwise calling `nc110_linux_now2`. With the stated deployed recovery setup, five failed kernel boots followed by Linux is preferable to a board that never reaches POST. The ten-second display window also preserves some diagnostic opportunity.
+
+- **Production hook reachable? Yes, through the boot command line.** `wdt::rehearse(cmdline)` is unconditional, and `arg == "panic"` deliberately panics before its `armed()` check. An accidentally deployed `wdt=panic` causes repeated resets until recovery. The production entry currently passes `bmctl grubtsc=…`, not this option; this is not a network-exposed trigger. Existing rehearsal modes already permit command-line-induced hangs.
+
+Static review only; no QEMU or hardware run. `git diff --cached --check` passed.
+
+**8/10 — sound board-specific recovery change, with a conditional delay weakness and an overly permissive test.**
+tokens used
+56,594
+Most is sound. **No demonstrated MUST-FIX in the kernel change.** Two SHOULDs concern failure-path robustness and test accuracy.
+
+**MUST-FIX: none.**
+
+**SHOULD**
+
+1. **Bound the panic delay independently of the PM timer.** [main.rs:205](~/nc110-baremetal/src/main.rs:205) does:
+   ```rust
+   for _ in 0..20 {
+       wdt::pet();
+       wdt::delay_ms(500);
+   }
+   wdt::hard_reset();
+   ```
+   But [wdt.rs:190](~/nc110-baremetal/src/wdt.rs:190) waits without a bound:
+   ```rust
+   while acc < need {
+       let now = pm_timer();
+       acc += (now.wrapping_sub(last) & 0x00FF_FFFF) as u64;
+       last = now;
+   }
+   ```
+   A frozen or inaccessible PM timer returning a constant leaves `acc` unchanged forever. **This does not pet forever:** it stalls inside one delay, so the armed TCO eventually expires. However, that returns you to the reset mechanism observed to leave this board dark. Before watchdog arming, it could hang indefinitely. A panic-specific polling bound that falls through to CF9 would close this gap. This is conditional hardening, not evidence that the NC110’s PM timer currently fails.
+
+2. **The QEMU test can falsely certify a reset.** [panic-q35-test.py:28](~/nc110-baremetal/tools/panic-q35-test.py:28):
+   ```python
+   ok = "PANIC" in log() and gone
+   ```
+   Any QEMU exit after that text passes—including a QEMU error or a triple-fault reset immediately after printing. There is no lower timing bound, successful-exit check, or reset-cause check. Require the expected panic text, successful exit, and a reasonable timing window; use QEMU reset tracing to distinguish CF9 from other reset causes. Printing “exited (reset)” currently overstates the evidence.
+
+**NIT**
+
+Use the same raw `0x02; 0x06` sequence in the nested path, preferably through a logging-free reset helper. This removes dependence on the previous `RST_CPU` bit and keeps the two paths consistent. **I would not characterize the existing `0x06` as invalid.**
+
+The specific concerns:
+
+- **Infinite loop while petting? No ordinary control-flow path.** There are at most 20 pets. Neither `delay_ms()` nor the console pets internally. `PANICKING.swap(true, …)` makes another Rust panic bypass formatting and the countdown. A stall can prevent CF9, but cannot sustain watchdog feeding.
+
+- **Is `0x06` alone a hard reset? Yes, provided `RST_CPU` was zero.** It sets `SYS_RST=1` and raises `RST_CPU`; `FULL_RST=0` requests a hard reset without power cycling. Both Intel’s [ICH7 datasheet, §10.7.5](https://studylib.net/doc/18311038/intel%C2%AE-i-o-controller-hub-7--ich7--family-external-design) and [NM10 datasheet, §13.7.5, p.404](https://www.mouser.com/pdfdocs/82NM10datasheet.pdf#page=404) describe that edge-triggered behavior and default register value zero. `0x02` first guarantees the low-to-high edge. I found no reachable preceding kernel write that leaves bit 2 high and then enters this nested-panic path.
+
+- **Can `pet()` or `delay_ms(500)` panic? No evident arithmetic or indexing panic.** `pet()` is `outw(base(), 1)`. PMBASE is masked to `0xFF80`, so adding `0x60` or `8` fits `u16`. The delay’s `u64` arithmetic is safely bounded for 500 ms; subtraction explicitly wraps. The credible issue is the unbounded hardware poll above. A hardware exception is not necessarily a Rust panic and is not covered by `PANICKING`.
+
+- **Crash-at-boot reboot loop? Yes, intentionally faster recovery.** The [GRUB entry generator](~/nc110-baremetal/tools/nc110-install-agentos.sh:31) appends `"x"` and accepts only `'^x{1,5}$'`, otherwise calling `nc110_linux_now2`. With the stated deployed recovery setup, five failed kernel boots followed by Linux is preferable to a board that never reaches POST. The ten-second display window also preserves some diagnostic opportunity.
+
+- **Production hook reachable? Yes, through the boot command line.** `wdt::rehearse(cmdline)` is unconditional, and `arg == "panic"` deliberately panics before its `armed()` check. An accidentally deployed `wdt=panic` causes repeated resets until recovery. The production entry currently passes `bmctl grubtsc=…`, not this option; this is not a network-exposed trigger. Existing rehearsal modes already permit command-line-induced hangs.
+
+Static review only; no QEMU or hardware run. `git diff --cached --check` passed.
+
+**8/10 — sound board-specific recovery change, with a conditional delay weakness and an overly permissive test.**
