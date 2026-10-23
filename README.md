@@ -1,8 +1,8 @@
 # NC110 agentic OS
 
-![The NC110 running its graphics mode: a textured tunnel at 60 fps, every pixel computed by the CPU](proof/looks/gfx-cam-tunnel-60fps.jpg)
+![NC110 agentic OS: home screen, the show-and-tell screen, the 60 fps tunnel and plasma](proof/looks/nc110-hero-qemu.gif)
 
-*The real netbook (camera photo): graphics mode (home key G) at 60 fps, no GPU and no OS underneath.*
+*Emulator capture (QEMU q35, 1024x600) of the same build the netbook boots (b8dae10, byte-identical kernel). Boot time, power and frame rate shown here are the emulator's; on the real netbook the effects run at 60 fps. Photos of the real hardware: [proof/looks/](proof/looks/).*
 
 A bare-metal operating system for a 2011 Samsung NC110 netbook (Atom N570, GMA 3150, Intel Centrino 130 WiFi), written in
 Rust with no OS underneath. It was built in six days (2026-10-17 to 10-22) by AI coding agents (Claude Code, with Codex as
