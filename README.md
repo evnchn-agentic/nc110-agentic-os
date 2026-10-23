@@ -1,5 +1,9 @@
 # NC110 agentic OS
 
+![The NC110 running its graphics mode: a textured tunnel at 60 fps, every pixel computed by the CPU](proof/looks/gfx-cam-tunnel-60fps.jpg)
+
+*The real netbook (camera photo): graphics mode (home key G) at 60 fps, no GPU and no OS underneath.*
+
 A bare-metal operating system for a 2011 Samsung NC110 netbook (Atom N570, GMA 3150, Intel Centrino 130 WiFi), written in
 Rust with no OS underneath. It was built in six days (2026-10-17 to 10-22) by AI coding agents (Claude Code, with Codex as
 an independent reviewer), with one person steering and approving each step on the real machine.
