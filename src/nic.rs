@@ -576,30 +576,14 @@ impl Rtl {
             self.bus.w32(r.rx_config, self.rx_cfg);
             self.bus.w32(r.tx_config, R::TX_DMA_BURST << 8 | R::INTER_FRAME_GAP << 24);
         }
-        let wait_link = |ms: i64| {
-            let (t, mut shown) = (time::now_ms(), -1);
-            while unsafe { self.bus.r8(r.phystatus) } & R::LINK_STATUS == 0 && time::now_ms() - t < ms {
-                let left = (ms - (time::now_ms() - t) + 999) / 1000;
-                if left != shown {
-                    shown = left;
-                    crate::console::status_fmt(format_args!("network: waiting for a cable, {} s", left));
-                }
-            }
-            unsafe { self.bus.r8(r.phystatus) }
-        };
-        let mut st = wait_link(if keep { 1000 } else { 5000 });
+        // No waiting here: autonegotiation (~2 s) runs in the PHY while the home screen comes up; bmctl::run's
+        // poll starts DHCP when the link appears, and net.rs sends nothing while it is down.
+        let st = unsafe { self.bus.r8(r.phystatus) };
         if keep && st & R::LINK_STATUS == 0 {
-            kprintln!("nic: no link 1 s after keeping the PHY: resetting it after all");
+            kprintln!("nic: link lost at the chip reset: resetting the PHY after all");
             self.phy_reset()?;
-            st = wait_link(5000);
         }
-        kprintln!("nic: PHYstatus {:#04x} link {}", st, if st & R::LINK_STATUS != 0 { "up" } else { "DOWN after 5 s" });
-        if st & R::LINK_STATUS == 0 {
-            // No cable is not an error (LinuxJam: boot to the offline home screen, WiFi from W). bmctl::run checks
-            // link_up() and adds no DHCP; udplog skips a dead link. A cable plugged in later needs a reboot.
-            kprintln!("nic: no link: continuing offline");
-            crate::console::status("no cable: starting offline (WiFi: W)");
-        }
+        kprintln!("nic: PHYstatus {:#04x} link {} at init", st, if st & R::LINK_STATUS != 0 { "up" } else { "not up yet" });
         Ok(())
     }
 
@@ -648,6 +632,16 @@ pub fn link_up(bus: Bus, r: &Regs) -> bool {
     r.phystatus == 0 || unsafe { bus.r8(r.phystatus) } & R::LINK_STATUS != 0
 }
 
+/// After a link comes back: re-enable TX if the NIC has meanwhile released the descriptor it was holding.
+pub fn tx_recover(r: &Regs) {
+    unsafe {
+        if TX_WEDGED && read_volatile(addr_of!(TX_DESC.0[0].opts1)) & r.desc_own == 0 {
+            TX_WEDGED = false;
+            kprintln!("nic: TX descriptor back, TX re-enabled");
+        }
+    }
+}
+
 /// Set once a TX descriptor fails to come back (OWN still set after the deadline). From then on the
 /// TX DMA buffer and descriptor are treated as owned by the NIC forever: nothing is written to them.
 static mut TX_WEDGED: bool = false;
@@ -659,6 +653,11 @@ pub fn tx_with<R2>(bus: Bus, r: &Regs, len: usize, fill: impl FnOnce(&mut [u8]) 
     let len = len.min(BUFSZ);
     unsafe {
         let d = addr_of_mut!(TX_DESC.0[0]);
+        if !link_up(bus, r) {
+            // no link: never hand the NIC a frame it may keep forever; dropped, and TX stays usable
+            let scratch = &mut *core::ptr::addr_of_mut!(TX_SCRATCH);
+            return fill(&mut scratch[..len]);
+        }
         if TX_WEDGED || read_volatile(addr_of!((*d).opts1)) & r.desc_own != 0 {
             TX_WEDGED = true;
             // Frame is built into scratch and dropped: the NIC may still be DMAing the real buffer.

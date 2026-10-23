@@ -588,6 +588,13 @@ pub fn home(ctl: &mut bmctl::Ctl, iface: &mut Interface, dev: &mut Nic, sockets:
             HOME_AT_MS = time::since_reset_ms();
         }
     }
+    if let Some((ssid, pmk)) = unsafe { SAVED_WIFI.take() } {
+        auto_wifi(ctl, iface, dev, sockets, udp_h, &ssid, &pmk); // once per boot, after home is already on screen
+        unsafe { SAVED_WIFI = Some((ssid, pmk)) };
+        if crate::iwl::online() {
+            console::status(&wifi_status()); // a failure message stays up instead
+        }
+    }
     let (mut log_view, mut n_sess) = (false, 0u16);
     let mut chooser: Option<usize> = None; // the host chooser is open, with this row selected
     let (mut last_input, mut blanked) = (time::now_ms(), false); // panel off after 5 min without a key or touch
@@ -596,6 +603,7 @@ pub fn home(ctl: &mut bmctl::Ctl, iface: &mut Interface, dev: &mut Nic, sockets:
     loop {
         wdt::pet();
         crate::net::rx_budget(Some(32)); // bounded ingress per poll so bmctl's deadline checks always run
+        bmctl::wired_step(ctl, iface, dev, sockets);
         let polled = iface.poll(now(), dev, sockets);
         if let Some(a) = ctl.step(sockets.get_mut::<udp::Socket>(udp_h), time::now_ms()) {
             if !ctl.act(a, Some(&dev.0)) {
@@ -970,6 +978,7 @@ fn demo(ctl: &mut bmctl::Ctl, iface: &mut Interface, dev: &mut Nic, sockets: &mu
     loop {
         wdt::pet();
         crate::net::rx_budget(Some(32));
+        bmctl::wired_step(ctl, iface, dev, sockets);
         let polled = iface.poll(now(), dev, sockets);
         if let Some(a) = ctl.step(sockets.get_mut::<udp::Socket>(udp_h), time::now_ms()) {
             if !ctl.act(a, Some(&dev.0)) {
@@ -1077,6 +1086,7 @@ fn gfx_screen(ctl: &mut bmctl::Ctl, iface: &mut Interface, dev: &mut Nic, socket
     let ok = loop {
         wdt::pet();
         crate::net::rx_budget(Some(32));
+        bmctl::wired_step(ctl, iface, dev, sockets);
         iface.poll(now(), dev, sockets);
         if let Some(a) = ctl.step(sockets.get_mut::<udp::Socket>(udp_h), time::now_ms()) {
             if !ctl.act(a, Some(&dev.0)) {
@@ -1201,11 +1211,62 @@ fn wifi_status() -> heapless::String<64> {
     s
 }
 
+/// The saved WiFi network from the boot config module (`wifi <ssid> <pmk hex>`): joined once after home is up, and
+/// W joins it without asking for the passphrase.
+pub static mut SAVED_WIFI: Option<(heapless::String<32>, [u8; 32])> = None;
+
+/// Join the saved network in the background of the home screen, with progress on the status line. Keys typed
+/// meanwhile are handed back to the home loop afterwards.
+fn auto_wifi(ctl: &mut bmctl::Ctl, iface: &mut Interface, dev: &mut Nic, sockets: &mut SocketSet, udp_h: SocketHandle, ssid: &str, pmk: &[u8; 32]) {
+    let mut l = heapless::String::<96>::new();
+    let mut say = |l: &mut heapless::String<96>, a: core::fmt::Arguments| {
+        l.clear();
+        let _ = core::fmt::write(l, a);
+        kprintln!("auto wifi: {}", l);
+        console::status(l);
+    };
+    if crate::iwl::online() {
+        return;
+    }
+    say(&mut l, format_args!("WiFi: starting the radio for {}", ssid));
+    if let Err(e) = crate::iwl::bring_up() {
+        return say(&mut l, format_args!("WiFi: {} (W to retry)", e));
+    }
+    say(&mut l, format_args!("WiFi: looking for {}", ssid));
+    if crate::iwl::scan_start().is_err() {
+        return say(&mut l, format_args!("WiFi: scan refused (W to retry)"));
+    }
+    let (mut k, mut typed) = ([0u8; 16], heapless::Vec::<u8, 64>::new());
+    let t0 = time::now_ms();
+    while crate::iwl::scanning() && time::now_ms() - t0 < 5000 {
+        let Some(n) = wifi_pass(ctl, iface, dev, sockets, udp_h, &mut k) else { return };
+        let _ = typed.extend_from_slice(&k[..n.min(64 - typed.len())]);
+    }
+    let mut nets = heapless::Vec::new();
+    crate::iwl::networks(&mut nets);
+    if !nets.iter().any(|(s, ..)| s.as_str() == ssid) {
+        kbd::inject(&typed);
+        return say(&mut l, format_args!("WiFi: {} not heard (W to retry)", ssid));
+    }
+    say(&mut l, format_args!("WiFi: joining {}", ssid));
+    if let Err(e) = crate::iwl::join_with(ssid, pmk) {
+        kbd::inject(&typed);
+        return say(&mut l, format_args!("WiFi: {} (W to retry)", e));
+    }
+    say(&mut l, format_args!("WiFi: joined {}, getting an address", ssid));
+    if crate::iwl::dhcp_wait(8000).is_some() && crate::wg::configured() {
+        say(&mut l, format_args!("WiFi: joined {}, starting the home tunnel", ssid));
+        let _ = crate::wg::bring_up();
+    }
+    kbd::inject(&typed);
+}
+
 /// Keys and bmctl while a WiFi step waits (the bmctl step also drains the radio). Returns the typed bytes; None =
 /// bmctl's idle bound fired.
 fn wifi_pass(ctl: &mut bmctl::Ctl, iface: &mut Interface, dev: &mut Nic, sockets: &mut SocketSet, udp_h: SocketHandle, k: &mut [u8; 16]) -> Option<usize> {
     wdt::pet();
     crate::net::rx_budget(Some(32));
+    bmctl::wired_step(ctl, iface, dev, sockets);
     iface.poll(now(), dev, sockets);
     if let Some(a) = ctl.step(sockets.get_mut::<udp::Socket>(udp_h), time::now_ms()) {
         if !ctl.act(a, Some(&dev.0)) {
@@ -1292,7 +1353,8 @@ fn wifi_screen(ctl: &mut bmctl::Ctl, iface: &mut Interface, dev: &mut Nic, socke
     };
     let (ssid, _, _, secured) = nets[pick].clone();
     let mut pass: heapless::String<64> = heapless::String::new();
-    if secured {
+    let saved = unsafe { (*core::ptr::addr_of!(SAVED_WIFI)).as_ref() }.filter(|(s, _)| *s == ssid).map(|(_, p)| *p);
+    if secured && saved.is_none() {
         let mut redraw = true;
         loop {
             if redraw {
@@ -1325,7 +1387,7 @@ fn wifi_screen(ctl: &mut bmctl::Ctl, iface: &mut Interface, dev: &mut Nic, socke
     let mut l = heapless::String::<96>::new();
     let _ = core::fmt::write(&mut l, format_args!("WiFi: joining {}", ssid.as_str()));
     console::status(&l);
-    let pmk = if secured { crate::wpa::psk(pass.as_bytes(), ssid.as_bytes()) } else { [0; 32] };
+    let pmk = saved.unwrap_or_else(|| if secured { crate::wpa::psk(pass.as_bytes(), ssid.as_bytes()) } else { [0; 32] });
     pass.clear();
     if let Err(e) = crate::iwl::join_with(ssid.as_str(), &pmk) {
         l.clear();

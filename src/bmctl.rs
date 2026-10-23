@@ -33,7 +33,7 @@ use chacha20::ChaCha20;
 use poly1305::universal_hash::{KeyInit, UniversalHash};
 use poly1305::Poly1305;
 use sha2::{Digest, Sha256};
-use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::socket::{dhcpv4, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
@@ -285,47 +285,56 @@ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
     let dhcp_h = sockets.add(dhcpv4::Socket::new());
     let udp_h = sockets.add(socket());
     let tcp_h = sockets.add(crate::ssh::tcp_socket());
-    let t0 = time::now_ms();
-    let mut ip = None;
-    let link = dev.0.link_up();
-    if !link {
-        let _ = sockets.remove(dhcp_h); // no cable: no DHCP Discovers into a dead port
+    // No wait for the cable or a lease: home comes up now, `wired_step` (home loop) applies the lease when it arrives.
+    // The 10-minute idle reset is off unless the cmdline asks for one (idle=), so a booth netbook never restarts itself.
+    unsafe { WIRED = Some((dhcp_h, false)) };
+    let ip = Ipv4Address::UNSPECIFIED;
+    let signkey = sunset::SignKey::Ed25519(sunset::ed25519_dalek::SigningKey::from_bytes(&seed));
+    let lport = 49152 + (u16::from_le_bytes([rs[0], rs[1]]) % 16000);
+    let Some(mut ctl) = Ctl::new(&dev.0, seed, info, ip, sockets.get_mut::<udp::Socket>(udp_h)) else { return };
+    if !crate::mb::cmdline(info).split(' ').any(|w| w.starts_with("idle=")) {
+        ctl.idle_ms = i64::MAX / 4;
+        kprintln!("bmctl: idle reset off (no idle= on the cmdline)");
     }
-    let mut shown = -1;
-    while link && ip.is_none() && time::now_ms() - t0 < 15_000 {
-        wdt::pet();
-        let left = (15_999 - (time::now_ms() - t0)) / 1000;
-        if left != shown {
-            shown = left;
-            console::status_fmt(format_args!("network: asking for an address (DHCP), {} s", left));
-        }
-        crate::net::rx_budget(Some(32));
-        iface.poll(now(), &mut dev, &mut sockets);
-        if let Some(dhcpv4::Event::Configured(c)) = sockets.get_mut::<dhcpv4::Socket>(dhcp_h).poll() {
+    crate::ssh::home(&mut ctl, &mut iface, &mut dev, &mut sockets, udp_h, tcp_h, &signkey, lport);
+}
+
+static mut WIRED: Option<(SocketHandle, bool)> = None; // (DHCP socket, link seen up at the last step)
+
+/// Wired network in the background, called from the home loop: on a link edge restart DHCP (so a cable plugged in
+/// later gets an address at once), and apply or drop the lease.
+pub fn wired_step(ctl: &mut Ctl, iface: &mut Interface, dev: &Nic, sockets: &mut SocketSet) {
+    let Some((h, was)) = (unsafe { WIRED }) else { return };
+    let up = dev.0.link_up();
+    if up != was {
+        unsafe { WIRED = Some((h, up)) };
+        kprintln!("bmctl: wired link {}", if up { "up: DHCP" } else { "down" });
+        sockets.get_mut::<dhcpv4::Socket>(h).reset();
+    }
+    if up {
+        crate::nic::tx_recover(dev.0.regs); // every pass: the NIC may release a held descriptor later
+    }
+    match sockets.get_mut::<dhcpv4::Socket>(h).poll() {
+        Some(dhcpv4::Event::Configured(c)) => {
             iface.update_ip_addrs(|a| {
                 a.clear();
                 let _ = a.push(IpCidr::Ipv4(c.address));
             });
+            iface.routes_mut().remove_default_ipv4_route();
             if let Some(gw) = c.router {
                 let _ = iface.routes_mut().add_default_ipv4_route(gw);
             }
-            ip = Some(c.address.address());
+            ctl.ip = c.address.address();
+            kprintln!("bmctl: wired lease {} router {:?}", c.address, c.router);
         }
+        Some(dhcpv4::Event::Deconfigured) if !ctl.ip.is_unspecified() => {
+            iface.update_ip_addrs(|a| a.clear());
+            iface.routes_mut().remove_default_ipv4_route();
+            ctl.ip = Ipv4Address::UNSPECIFIED;
+            kprintln!("bmctl: wired lease lost");
+        }
+        _ => {}
     }
-    // No wired lease (no cable, e.g. away from home): run the home screen anyway, offline. WiFi (W) is then the
-    // network; bmctl cannot be reached, so its 10-minute idle reset is off.
-    let offline = ip.is_none();
-    if offline {
-        kprintln!("bmctl: no wired lease (no cable, or none in 15 s) -> offline home screen (WiFi from the W key)");
-    }
-    let ip = ip.unwrap_or(Ipv4Address::UNSPECIFIED);
-    let signkey = sunset::SignKey::Ed25519(sunset::ed25519_dalek::SigningKey::from_bytes(&seed));
-    let lport = 49152 + (u16::from_le_bytes([rs[0], rs[1]]) % 16000);
-    let Some(mut ctl) = Ctl::new(&dev.0, seed, info, ip, sockets.get_mut::<udp::Socket>(udp_h)) else { return };
-    if offline {
-        ctl.idle_ms = i64::MAX / 4;
-    }
-    crate::ssh::home(&mut ctl, &mut iface, &mut dev, &mut sockets, udp_h, tcp_h, &signkey, lport);
 }
 
 impl Ctl {
@@ -856,7 +865,8 @@ fn parse_host<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<crate::ssh::
     Ok(t)
 }
 
-/// The boot config module's lines: `host <0-7> <name> <ip> <port> <user> <pin>` and `wg set ...` (bmctl syntax).
+/// The boot config module's lines: `host <0-7> <name> <ip> <port> <user> <pin>`, `wifi <ssid> <pmk hex>` and
+/// `wg set ...` (bmctl syntax).
 /// Results go to the log; the lines themselves are never printed (the wg line carries the private key).
 pub fn boot_config(text: &str) {
     struct Log;
@@ -880,6 +890,19 @@ pub fn boot_config(text: &str) {
                     Err(e) => kprintln!("cfgmod: line {}: host: {}", n + 1, e),
                 },
                 _ => kprintln!("cfgmod: line {}: host index", n + 1),
+            },
+            Some("wifi") => match (it.next(), it.next().filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))) {
+                (Some(ssid), Some(hex)) if ssid.len() <= 32 => {
+                    let mut pmk = [0u8; 32];
+                    let ok = (0..32).all(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map(|b| pmk[i] = b).is_ok());
+                    if ok {
+                        kprintln!("cfgmod: line {}: wifi {} (saved, joined after home is up)", n + 1, ssid);
+                        unsafe { crate::ssh::SAVED_WIFI = Some((heapless::String::try_from(ssid).unwrap_or_default(), pmk)) };
+                    } else {
+                        kprintln!("cfgmod: line {}: wifi: pmk not hex", n + 1);
+                    }
+                }
+                _ => kprintln!("cfgmod: line {}: wifi <ssid> <pmk: 64 hex>", n + 1),
             },
             Some("wg") => {
                 crate::kprint!("cfgmod: line {}: wg: ", n + 1);

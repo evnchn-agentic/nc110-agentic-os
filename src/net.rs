@@ -73,6 +73,9 @@ impl Device for Nic {
     }
 
     fn transmit(&mut self, _t: Instant) -> Option<Tx> {
+        if !self.0.link_up() {
+            return None; // a frame sent with no link can keep its descriptor forever and wedge wired TX (nic::tx_with)
+        }
         Some(Tx { bus: self.0.bus, regs: self.0.regs })
     }
 

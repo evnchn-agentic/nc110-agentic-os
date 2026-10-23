@@ -41,6 +41,10 @@ fn send(data: &[u8]) {
 
 /// Send the whole captured log, 1000-byte chunks, each prefixed "nc110 <round> <i>/<n> ".
 pub fn dump(round: u8) {
+    match unsafe { *core::ptr::addr_of!(LOGNIC) } {
+        Some((bus, regs, _)) if nic::link_up(bus, regs) => {}
+        _ => return, // nothing would go out: skip the 100 ms per chunk of pacing (it delayed the home screen)
+    }
     let log = console::captured();
     let total = log.len().div_ceil(1000).max(1);
     for (i, c) in log.chunks(1000).enumerate() {
