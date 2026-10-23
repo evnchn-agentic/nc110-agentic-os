@@ -577,6 +577,7 @@ pub fn tcp_socket() -> tcp::Socket<'static> {
 /// bound (the caller resets); reboot and chain-load never return.
 pub fn home(ctl: &mut bmctl::Ctl, iface: &mut Interface, dev: &mut Nic, sockets: &mut SocketSet, udp_h: SocketHandle,
             tcp_h: SocketHandle, signkey: &SignKey, lport: u16) {
+    console::status("starting keyboard and touchpad");
     kbd::init();
     console::splash();
     console::status("ready");

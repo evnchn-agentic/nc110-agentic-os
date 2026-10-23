@@ -577,8 +577,14 @@ impl Rtl {
             self.bus.w32(r.tx_config, R::TX_DMA_BURST << 8 | R::INTER_FRAME_GAP << 24);
         }
         let wait_link = |ms: i64| {
-            let t = time::now_ms();
-            while unsafe { self.bus.r8(r.phystatus) } & R::LINK_STATUS == 0 && time::now_ms() - t < ms {}
+            let (t, mut shown) = (time::now_ms(), -1);
+            while unsafe { self.bus.r8(r.phystatus) } & R::LINK_STATUS == 0 && time::now_ms() - t < ms {
+                let left = (ms - (time::now_ms() - t) + 999) / 1000;
+                if left != shown {
+                    shown = left;
+                    crate::console::status_fmt(format_args!("network: waiting for a cable, {} s", left));
+                }
+            }
             unsafe { self.bus.r8(r.phystatus) }
         };
         let mut st = wait_link(if keep { 1000 } else { 5000 });
@@ -592,6 +598,7 @@ impl Rtl {
             // No cable is not an error (LinuxJam: boot to the offline home screen, WiFi from W). bmctl::run checks
             // link_up() and adds no DHCP; udplog skips a dead link. A cable plugged in later needs a reboot.
             kprintln!("nic: no link: continuing offline");
+            crate::console::status("no cable: starting offline (WiFi: W)");
         }
         Ok(())
     }

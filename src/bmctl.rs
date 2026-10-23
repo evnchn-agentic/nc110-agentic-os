@@ -291,8 +291,14 @@ pub fn run(nic: Rtl, seed: [u8; 32], info: u64) {
     if !link {
         let _ = sockets.remove(dhcp_h); // no cable: no DHCP Discovers into a dead port
     }
+    let mut shown = -1;
     while link && ip.is_none() && time::now_ms() - t0 < 15_000 {
         wdt::pet();
+        let left = (15_999 - (time::now_ms() - t0)) / 1000;
+        if left != shown {
+            shown = left;
+            console::status_fmt(format_args!("network: asking for an address (DHCP), {} s", left));
+        }
         crate::net::rx_budget(Some(32));
         iface.poll(now(), &mut dev, &mut sockets);
         if let Some(dhcpv4::Event::Configured(c)) = sockets.get_mut::<dhcpv4::Socket>(dhcp_h).poll() {

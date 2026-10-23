@@ -156,6 +156,7 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
         nic::force_phy_reset();
     }
     let mut no_net = false; // no Ethernet link: restart fast, so the day's 6th boot (recovery Linux, WiFi) comes soon
+    console::status("network: starting the Ethernet chip");
     match nic::probe(cmdline.contains("nic=mmio")) {
         Ok(mut n) => {
             if cmdline.contains("nic=no8105e") {
@@ -167,7 +168,6 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
                     kprintln!("udplog: broadcasting this log to UDP 5514");
                     udplog::set_nic(&n);
                     udplog::dump(1);
-                    console::status("network");
                     if cmdline.contains("wdt=probe") {
                         wdt::pet();
                         kprintln!("wdt: HANG now (probe): cli; hlt, nobody pets; expect a reset ~60 s from here");

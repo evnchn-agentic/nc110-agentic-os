@@ -416,6 +416,13 @@ pub fn splash() {
     footer(b"", b"");
 }
 
+/// `status` with formatting, e.g. a countdown while a boot stage waits.
+pub fn status_fmt(a: core::fmt::Arguments) {
+    let mut s = heapless::String::<64>::new();
+    let _ = core::fmt::write(&mut s, a);
+    status(&s);
+}
+
 /// One centred status line under the logo (ignored while the log or the SSH terminal owns the screen).
 pub fn status(s: &str) {
     if unsafe { VGA_LOG } || !splash_shown() {
