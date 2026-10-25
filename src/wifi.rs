@@ -7,6 +7,9 @@ use core::fmt::Write;
 
 /// The firmware file, embedded (fw/ is local only: Intel's redistributable linux-firmware blob, not in git).
 static FW: &[u8] = include_bytes!("../fw/iwlwifi-6000g2b-6.ucode");
+// A saved error page or a compressed copy would otherwise build fine and only fail on the netbook.
+const _: () = assert!(FW.len() > 88 && FW[4] == b'I' && FW[5] == b'W' && FW[6] == b'L' && FW[7] == b'\n',
+    "fw/iwlwifi-6000g2b-6.ucode is not iwlwifi firmware: download it again and check its SHA-256 (README)");
 
 pub const CSR_HW_IF_CONFIG: u32 = 0x000;
 pub const CSR_INT: u32 = 0x008;
