@@ -44,8 +44,9 @@ try next and approve anything risky. This repository is a record of that loop, i
 Two inputs are not in the repository and are needed once: the WiFi firmware (Intel's, from linux-firmware) and a set
 of throwaway test keys.
 
-Besides Rust (rustup) you need a C linker and QEMU: on Debian or Ubuntu `apt install gcc qemu-system-x86 python3
-openssh-client curl`, on macOS `xcode-select --install` and `brew install qemu`.
+Besides Rust (rustup) you need a C linker and QEMU:
+on Debian or Ubuntu `apt install gcc qemu-system-x86 python3 openssh-client curl`,
+on macOS `xcode-select --install` and `brew install qemu`.
 
 ```
 rustup target add x86_64-unknown-none        # tested with stable Rust 1.96
