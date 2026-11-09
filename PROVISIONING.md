@@ -37,7 +37,7 @@ dedicated key module (`~/.nc110/agentos.key` on the Mac, not in the repo). `bmct
   an external power switch (and the battery out).
 
 ## Tests
-`tools/bmctl-q35-test.sh`, `tools/loader-q35-test.sh`, `python3 tools/entropy-est.py --selftest`. Hardware proofs:
+`tools/bmctl-q35-test.sh`, `tools/loader-q35-test.sh`, `tools/wg-interop.sh` (wg.rs against Linux WireGuard in a container), `python3 tools/entropy-est.py --selftest`. Hardware proofs:
 `proof/nc110-nolinux-demo.log`, `proof/nc110-agentos-default.md`.
 
 ## Parked (evnchn 2026-10-19 10:15, until the .179 quota resets Fri 12:00)
