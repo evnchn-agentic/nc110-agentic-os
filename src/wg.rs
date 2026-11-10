@@ -406,7 +406,9 @@ pub fn poll() {
             send_udp(&m);
         }
     }
-    if keys().is_some() && t - unsafe { LAST_TX } > KEEPALIVE_MS {
+    // Nothing heard under these keys yet: the peer may never have got our confirmation (a lost frame), and it will
+    // not send under them until it does. Repeat it every second until the peer answers (tools/wg-interop.sh).
+    if keys().is_some_and(|k| t - unsafe { LAST_TX } > if k.bits == 0 { 1_000 } else { KEEPALIVE_MS }) {
         send_data(&[]);
     }
 }
